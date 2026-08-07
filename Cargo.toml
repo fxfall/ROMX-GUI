@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/romx-core"]
+members = ["crates/romx-core", "crates/romx-cli"]

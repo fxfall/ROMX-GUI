@@ -1,0 +1,18 @@
+[package]
+name = "romx-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line interface for ROMX containers and RetroArch playlists"
+license = "MIT"
+
+[[bin]]
+name = "romx"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+romx-core = { path = "../romx-core" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
