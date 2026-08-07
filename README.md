@@ -12,12 +12,13 @@ Cross-platform ROMX desktop application workspace.
 
 The core exposes byte-oriented functions for GUI and CLI callers:
 
-- `pack_bytes` / `pack_to_path`: create a ROMX container from an unchanged ROM, JSON metadata, and optional PNG bytes.
+- `pack_bytes` / `pack_to_path`: create a ROMX container from an unchanged ROM, JSON metadata, and optional PNG bytes. They always regenerate metadata `crc32` from the original ROM.
+- `pack_bytes_with_crc32` / `pack_to_path_with_crc32`: the same operations with an explicit eight-digit CRC32 lookup override; footer SHA-256 still covers the actual ROM.
 - `read_bytes` / `read_path`: parse and validate footer, regions, metadata, cover, and hashes.
 - `extract_to_dir`: write the embedded payload, metadata, and cover to a directory.
 - `required_metadata`: create the four required metadata fields for a GUI form.
 - `classify_gb_payload`: apply the `0xC0`/`0x80` Game Boy CGB-flag policy.
-- `crc32`: calculate the RetroArch/database lookup key; footer SHA-256 remains the integrity check.
+- `crc32` / `normalize_crc32`: calculate or validate the RetroArch/database lookup key; footer SHA-256 remains the integrity check.
 - `plan_lpl_import`: resolve every LPL item to its ROM and optional thumbnail without copying large payloads; intended for GUI import previews.
 - `import_lpl`: convert an LPL and its ROM/thumbnail tree to sequential ROMX files plus a manifest.
 - `export_lpl`: extract a ROMX directory to a RetroArch-compatible ROM, thumbnail, and playlist tree.
@@ -54,6 +55,8 @@ Pack, inspect, verify, and extract a ROMX file:
 
 ```bash
 ./target/release/romx pack game.gba metadata.json --cover cover.png --output game.gbax
+# Optional database identity override; otherwise CRC32 is regenerated from game.gba.
+./target/release/romx pack game.gba metadata.json --crc32 0123abcd --output game.gbax
 ./target/release/romx inspect game.gbax
 ./target/release/romx verify game.gbax
 ./target/release/romx extract game.gbax --output extracted
@@ -67,6 +70,10 @@ Import and export RetroArch playlists:
   --rom-root /Volumes/DATA/rom \
   --cover-root /Volumes/DATA/rom/retroarch/thumbnails \
   --output /Volumes/DATA/romx-gui/test-output/00-GB
+
+# Optional: force one database CRC32 identity for all imported entries.
+./target/release/romx import-lpl playlist.lpl --rom-dir /path/to/roms \
+  --crc32 0123abcd --output romx-out
 
 ./target/release/romx export-lpl \
   /Volumes/DATA/romx-gui/test-output/00-GB \

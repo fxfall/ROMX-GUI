@@ -92,3 +92,27 @@ fn plan_can_skip_missing_entries_without_renumbering_outputs() {
     assert_eq!(report.skipped, 1);
     assert!(output.join("000002.gbx").is_file());
 }
+
+#[test]
+fn lpl_import_accepts_an_explicit_crc32_override() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("game.gba"), b"real-rom-bytes").unwrap();
+    let lpl_path = root.path().join("02-GBA.lpl");
+    fs::write(
+        &lpl_path,
+        serde_json::to_vec(&json!({
+            "items": [{"path": "/game.gba", "label": "Game"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let options = ImportLplOptions {
+        force_rom_dir: Some(root.path().to_owned()),
+        crc32_override: Some("DEADBEEF".into()),
+        ..Default::default()
+    };
+    let output = root.path().join("output");
+    let report = import_lpl(&lpl_path, &output, &options).unwrap();
+    let document = read_path(&report.output_files[0]).unwrap();
+    assert_eq!(document.metadata.as_ref().unwrap()["crc32"], "deadbeef");
+}

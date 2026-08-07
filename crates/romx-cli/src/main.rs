@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use romx_core::{
-    export_lpl, extract_to_dir, import_lpl, pack_to_path, read_path, ExportLplOptions,
+    export_lpl, extract_to_dir, import_lpl, pack_to_path_with_crc32, read_path, ExportLplOptions,
     ImportLplOptions,
 };
 use serde_json::json;
@@ -47,6 +47,9 @@ struct PackArgs {
     /// Optional PNG cover.
     #[arg(long)]
     cover: Option<PathBuf>,
+    /// Override the metadata CRC32 lookup key (8 hexadecimal characters).
+    #[arg(long)]
+    crc32: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -83,6 +86,9 @@ struct ImportLplArgs {
     /// Skip entries whose ROM file is missing.
     #[arg(long)]
     skip_missing: bool,
+    /// Override the metadata CRC32 lookup key for every imported ROM.
+    #[arg(long)]
+    crc32: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -125,11 +131,12 @@ fn hex(bytes: &[u8]) -> String {
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Pack(args) => {
-            pack_to_path(
+            pack_to_path_with_crc32(
                 &args.rom,
                 Some(&args.metadata),
                 args.cover.as_deref(),
                 &args.output,
+                args.crc32.as_deref(),
             )?;
             println!("packed ROMX: {}", args.output.display());
         }
@@ -169,6 +176,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 force_cover_dir: args.cover_dir,
                 cover_set: args.cover_set,
                 skip_missing: args.skip_missing,
+                crc32_override: args.crc32,
             };
             let report = import_lpl(&args.lpl, &args.output, &options)?;
             println!(

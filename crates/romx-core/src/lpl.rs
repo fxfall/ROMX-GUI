@@ -1,4 +1,7 @@
-use crate::{classify_gb_payload, crc32, pack_bytes, read_path, required_metadata, sha256, RomxError, PNG_SIGNATURE};
+use crate::{
+    classify_gb_payload, crc32, normalize_crc32, pack_bytes_with_crc32, read_path,
+    required_metadata, sha256, RomxError, PNG_SIGNATURE,
+};
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +19,9 @@ pub struct ImportLplOptions {
     pub force_cover_dir: Option<PathBuf>,
     pub cover_set: String,
     pub skip_missing: bool,
+    /// Optional database lookup CRC32 to store in every imported metadata
+    /// object. Without it, each ROM's original bytes are hashed.
+    pub crc32_override: Option<String>,
 }
 
 impl Default for ImportLplOptions {
@@ -27,6 +33,7 @@ impl Default for ImportLplOptions {
             force_cover_dir: None,
             cover_set: "Named_Snaps".into(),
             skip_missing: false,
+            crc32_override: None,
         }
     }
 }
@@ -122,8 +129,11 @@ fn value_label(value: Option<&Value>, fallback: &str) -> String {
 }
 
 fn platform_for(payload_format: &str, playlist_name: &str) -> &'static str {
-    if matches!(payload_format, "gb" | "gbc") {
-        return payload_format;
+    if payload_format == "gb" {
+        return "gb";
+    }
+    if payload_format == "gbc" {
+        return "gbc";
     }
     let name = playlist_name.to_lowercase();
     for (marker, platform) in [
@@ -302,10 +312,6 @@ pub fn import_lpl(
     for item in &plan.items {
         let rom = fs::read(&item.rom_path)?;
         let mut metadata = required_metadata(&item.label, &item.platform, &item.payload_format);
-        metadata
-            .as_object_mut()
-            .expect("required metadata is an object")
-            .insert("crc32".into(), Value::String(crc32(&rom)));
         let cover = item.cover_path.as_deref().map(fs::read).transpose()?;
         if let Some(cover_bytes) = &cover {
             let mut description = Map::new();
@@ -320,7 +326,12 @@ pub fn import_lpl(
                 .expect("required metadata is an object")
                 .insert("cover".into(), Value::Object(description));
         }
-        let bytes = pack_bytes(&rom, Some(&metadata), cover.as_deref())?;
+        let bytes = pack_bytes_with_crc32(
+            &rom,
+            Some(&metadata),
+            cover.as_deref(),
+            options.crc32_override.as_deref(),
+        )?;
         let output_path = output_dir.join(format!("{:06}.{}x", item.index, item.payload_format));
         fs::write(&output_path, bytes)?;
         output_files.push(output_path);
@@ -459,12 +470,19 @@ pub fn export_lpl(
             )?;
         }
         let item_path = format!("{}/{}", prefix.trim_end_matches('/'), filename);
+        let lookup_crc = document
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("crc32"))
+            .and_then(Value::as_str)
+            .and_then(|value| normalize_crc32(value).ok())
+            .unwrap_or_else(|| crc32(&document.rom));
         items.push(json!({
             "path": item_path,
             "label": label,
             "core_path": "DETECT",
             "core_name": "DETECT",
-            "crc32": format!("{}|crc", crc32(&document.rom)),
+            "crc32": format!("{}|crc", lookup_crc),
             "db_name": "",
         }));
     }

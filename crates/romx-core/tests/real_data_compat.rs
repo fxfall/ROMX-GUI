@@ -4,7 +4,9 @@
 //! several gigabytes. Run it explicitly with:
 //! `cargo test -p romx-core --test real_data_compat -- --ignored --nocapture`
 
-use romx_core::{import_lpl, plan_lpl_import, read_path, required_metadata, ImportLplOptions};
+use romx_core::{
+    crc32, import_lpl, plan_lpl_import, read_path, required_metadata, ImportLplOptions,
+};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -110,7 +112,9 @@ fn python_reference_directories_resolve_and_roundtrip() {
         );
         let python_packed = read_path(&python_output).unwrap();
         assert_eq!(python_packed.rom, packed.rom);
-        assert_eq!(python_packed.metadata, Some(metadata));
+        let mut expected_metadata = metadata;
+        expected_metadata["crc32"] = Value::String(crc32(&python_packed.rom));
+        assert_eq!(python_packed.metadata, Some(expected_metadata));
         assert_eq!(python_packed.cover, packed.cover);
     }
 

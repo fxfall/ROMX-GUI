@@ -1,5 +1,9 @@
-use romx_core::{classify_gb_payload, pack_bytes, read_bytes, FLAG_BODY_SHA256, FLAG_COVER, FLAG_METADATA};
+use romx_core::{
+    classify_gb_payload, crc32, pack_bytes, pack_bytes_with_crc32, read_bytes, FLAG_BODY_SHA256,
+    FLAG_COVER, FLAG_METADATA,
+};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 #[test]
 fn roundtrip_preserves_rom_metadata_and_png() {
@@ -15,11 +19,29 @@ fn roundtrip_preserves_rom_metadata_and_png() {
     let document = read_bytes(&bytes).unwrap();
     assert_eq!(document.rom, rom);
     assert_eq!(document.metadata.as_ref().unwrap()["label"], "Example");
+    assert_eq!(document.metadata.as_ref().unwrap()["crc32"], crc32(rom));
     assert_eq!(document.cover.as_ref().unwrap(), cover);
     assert_eq!(
         document.footer.flags & (FLAG_METADATA | FLAG_COVER | FLAG_BODY_SHA256),
         FLAG_METADATA | FLAG_COVER | FLAG_BODY_SHA256
     );
+}
+
+#[test]
+fn custom_crc32_overrides_lookup_key_but_not_footer_integrity() {
+    let rom = b"example-rom";
+    let metadata = json!({
+        "schema_version": "1.0",
+        "label": "Example",
+        "platform": "gba",
+        "payload_format": "gba",
+        "crc32": "deadbeef"
+    });
+    let bytes = pack_bytes_with_crc32(rom, Some(&metadata), None, Some("A1B2C3D4")).unwrap();
+    let document = read_bytes(&bytes).unwrap();
+    assert_eq!(document.metadata.as_ref().unwrap()["crc32"], "a1b2c3d4");
+    let expected_hash: [u8; 32] = Sha256::digest(rom).into();
+    assert_eq!(document.footer.rom_sha256, expected_hash);
 }
 
 #[test]
@@ -44,7 +66,7 @@ fn allows_cover_without_metadata() {
 fn cgb_flag_policy_is_explicit() {
     let mut rom = vec![0u8; 0x144];
     rom[0x143] = 0xC0;
-    assert_eq!(classify_gb_payload(&rom, Some("gb" )).unwrap(), "gbc");
+    assert_eq!(classify_gb_payload(&rom, Some("gb")).unwrap(), "gbc");
     rom[0x143] = 0x80;
     assert_eq!(classify_gb_payload(&rom, Some("gb")).unwrap(), "gb");
     assert_eq!(classify_gb_payload(&rom, Some("gbc")).unwrap(), "gbc");

@@ -91,26 +91,53 @@ pub fn crc32(value: &[u8]) -> String {
     format!("{:08x}", crc ^ 0xffff_ffff)
 }
 
+/// Normalize an explicitly supplied CRC32 lookup key.
+///
+/// CRC32 is represented in ROMX metadata as exactly eight hexadecimal
+/// characters.  Uppercase input is accepted at the API/CLI boundary and is
+/// stored in the canonical lowercase form.
+pub fn normalize_crc32(value: &str) -> Result<String, RomxError> {
+    if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(RomxError::Invalid(
+            "CRC32 override must be exactly 8 hexadecimal characters".into(),
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
 /// Classify a Game Boy payload using the CGB flag at ROM header offset 0x143.
 ///
 /// 0xC0 means GBC-only and always wins. 0x80 means dual GB/GBC compatibility;
 /// in that case the caller must provide the already validated ROMX
 /// `payload_format` so the format is not guessed from the header.
-pub fn classify_gb_payload(rom: &[u8], payload_format: Option<&str>) -> Result<&'static str, RomxError> {
+pub fn classify_gb_payload(
+    rom: &[u8],
+    payload_format: Option<&str>,
+) -> Result<&'static str, RomxError> {
     if rom.len() <= 0x143 {
-        return Err(RomxError::Invalid("GB ROM is too small to contain CGB flag".into()));
+        return match payload_format {
+            Some("gb") => Ok("gb"),
+            Some("gbc") => Ok("gbc"),
+            _ => Err(RomxError::Invalid(
+                "GB ROM is too small to classify without payload_format gb or gbc".into(),
+            )),
+        };
     }
     match rom[0x143] {
         0xC0 => Ok("gbc"),
         0x80 => match payload_format {
             Some("gb") => Ok("gb"),
             Some("gbc") => Ok("gbc"),
-            _ => Err(RomxError::Invalid("dual GB/GBC ROM requires payload_format gb or gbc".into())),
+            _ => Err(RomxError::Invalid(
+                "dual GB/GBC ROM requires payload_format gb or gbc".into(),
+            )),
         },
         _ => match payload_format {
             Some("gb") => Ok("gb"),
             Some("gbc") => Ok("gbc"),
-            _ => Err(RomxError::Invalid("GB ROM requires payload_format gb or gbc".into())),
+            _ => Err(RomxError::Invalid(
+                "GB ROM requires payload_format gb or gbc".into(),
+            )),
         },
     }
 }
@@ -297,15 +324,47 @@ pub fn pack_bytes(
     metadata: Option<&Value>,
     cover: Option<&[u8]>,
 ) -> Result<Vec<u8>, RomxError> {
+    pack_bytes_with_crc32(rom, metadata, cover, None)
+}
+
+/// Pack a ROMX container, optionally overriding the metadata CRC32 lookup key.
+///
+/// By default the key is always regenerated from the unchanged ROM bytes.  An
+/// explicit override is useful when matching a database that intentionally
+/// publishes a different CRC32 identity.  The footer SHA-256 is never
+/// overridden and always describes the actual ROM payload.
+pub fn pack_bytes_with_crc32(
+    rom: &[u8],
+    metadata: Option<&Value>,
+    cover: Option<&[u8]>,
+    crc32_override: Option<&str>,
+) -> Result<Vec<u8>, RomxError> {
     if rom.is_empty() {
         return Err(RomxError::Invalid("ROM payload must not be empty".into()));
     }
-    let metadata_bytes = if let Some(value) = metadata {
-        validate_metadata(value)?;
-        Some(serde_json::to_vec(value)?)
+    let metadata_value = if let Some(value) = metadata {
+        let mut value = value.clone();
+        validate_metadata(&value)?;
+        let lookup_crc = crc32_override
+            .map(normalize_crc32)
+            .transpose()?
+            .unwrap_or_else(|| crc32(rom));
+        value
+            .as_object_mut()
+            .expect("validated metadata is an object")
+            .insert("crc32".into(), Value::String(lookup_crc));
+        Some(value)
+    } else if crc32_override.is_some() {
+        return Err(RomxError::Invalid(
+            "custom CRC32 requires a metadata object".into(),
+        ));
     } else {
         None
     };
+    let metadata_bytes = metadata_value
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()?;
     if let Some(cover_bytes) = cover {
         if !cover_bytes.starts_with(PNG_SIGNATURE) {
             return Err(RomxError::Invalid("cover is not a PNG".into()));
@@ -370,6 +429,16 @@ pub fn pack_to_path(
     cover_path: Option<&Path>,
     output_path: &Path,
 ) -> Result<(), RomxError> {
+    pack_to_path_with_crc32(rom_path, metadata_path, cover_path, output_path, None)
+}
+
+pub fn pack_to_path_with_crc32(
+    rom_path: &Path,
+    metadata_path: Option<&Path>,
+    cover_path: Option<&Path>,
+    output_path: &Path,
+    crc32_override: Option<&str>,
+) -> Result<(), RomxError> {
     let rom = fs::read(rom_path)?;
     let metadata = if let Some(path) = metadata_path {
         Some(serde_json::from_slice::<Value>(&fs::read(path)?)?)
@@ -381,7 +450,7 @@ pub fn pack_to_path(
     } else {
         None
     };
-    let bytes = pack_bytes(&rom, metadata.as_ref(), cover.as_deref())?;
+    let bytes = pack_bytes_with_crc32(&rom, metadata.as_ref(), cover.as_deref(), crc32_override)?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
