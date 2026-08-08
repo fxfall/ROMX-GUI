@@ -10,6 +10,7 @@ const SUPPORTED_FORMATS: &[&str] = &[
     "gb", "gbc", "gba", "nes", "fds", "sfc", "smc", "nds", "3ds", "cci", "cia", "md", "gen", "smd",
     "bin",
 ];
+const COVER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
 
 #[derive(Debug, Clone)]
 pub struct ImportLplOptions {
@@ -221,10 +222,7 @@ fn cover_from_lpl(
     options: &ImportLplOptions,
 ) -> Option<PathBuf> {
     if let Some(directory) = &options.force_cover_dir {
-        return first_file(
-            directory.join(format!("{}.png", file_stem(rom_path))),
-            directory.join(format!("{label}.png")),
-        );
+        return first_cover_file(directory, &[file_stem(rom_path), label.to_owned()]);
     }
     for key in ["cover_path", "thumbnail_path", "cover", "thumbnail"] {
         if let Some(Value::String(value)) = item.get(key) {
@@ -245,10 +243,7 @@ fn cover_from_lpl(
             .join(playlist)
             .join(&options.cover_set)
     };
-    first_file(
-        directory.join(format!("{}.png", file_stem(rom_path))),
-        directory.join(format!("{label}.png")),
-    )
+    first_cover_file(&directory, &[file_stem(rom_path), label.to_owned()])
 }
 
 fn value_label(value: Option<&Value>, fallback: &str) -> String {
@@ -303,14 +298,16 @@ fn virtual_relative_path(value: &str) -> PathBuf {
     PathBuf::from(value.trim_start_matches('/'))
 }
 
-fn first_file(primary: PathBuf, fallback: PathBuf) -> Option<PathBuf> {
-    if primary.is_file() {
-        Some(primary)
-    } else if fallback.is_file() {
-        Some(fallback)
-    } else {
-        None
+fn first_cover_file(directory: &Path, stems: &[String]) -> Option<PathBuf> {
+    for stem in stems {
+        for extension in COVER_EXTENSIONS {
+            let candidate = directory.join(format!("{stem}.{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
     }
+    None
 }
 
 fn file_stem(path: &Path) -> String {
