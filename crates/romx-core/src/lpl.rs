@@ -1,6 +1,6 @@
 use crate::{
-    classify_gb_payload, crc32, normalize_crc32, pack_bytes_with_crc32, read_path,
-    required_metadata, sha256, RomxError, PNG_SIGNATURE,
+    classify_gb_payload, crc32, normalize_cover_path, normalize_crc32, pack_bytes_with_options,
+    read_path, required_metadata, sha256, RomxError, PNG_SIGNATURE,
 };
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -19,9 +19,14 @@ pub struct ImportLplOptions {
     pub force_cover_dir: Option<PathBuf>,
     pub cover_set: String,
     pub skip_missing: bool,
+    /// Write generated ROMX and manifest files with a `.tmp` suffix so a
+    /// caller can atomically commit each output after validation.
+    pub temporary_output: bool,
     /// Optional database lookup CRC32 to store in every imported metadata
     /// object. Without it, each ROM's original bytes are hashed.
     pub crc32_override: Option<String>,
+    /// Optional exact output resolution for imported covers.
+    pub cover_target: Option<(u32, u32)>,
 }
 
 impl Default for ImportLplOptions {
@@ -33,7 +38,9 @@ impl Default for ImportLplOptions {
             force_cover_dir: None,
             cover_set: "Named_Snaps".into(),
             skip_missing: false,
+            temporary_output: false,
             crc32_override: None,
+            cover_target: None,
         }
     }
 }
@@ -360,6 +367,10 @@ pub fn plan_lpl_import(
             .unwrap_or_default()
             .to_lowercase();
         if !SUPPORTED_FORMATS.contains(&payload_format.as_str()) {
+            if options.skip_missing {
+                skipped += 1;
+                continue;
+            }
             return Err(RomxError::Invalid(format!(
                 "unsupported ROM extension in LPL item {index}: {}",
                 rom_path
@@ -369,8 +380,24 @@ pub fn plan_lpl_import(
             )));
         }
         if matches!(payload_format.as_str(), "gb" | "gbc") {
-            let rom = fs::read(&rom_path)?;
-            payload_format = classify_gb_payload(&rom, Some(&payload_format))?.to_owned();
+            let rom = match fs::read(&rom_path) {
+                Ok(rom) => rom,
+                Err(error) if options.skip_missing => {
+                    skipped += 1;
+                    let _ = error;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            payload_format = match classify_gb_payload(&rom, Some(&payload_format)) {
+                Ok(format) => format.to_owned(),
+                Err(error) if options.skip_missing => {
+                    skipped += 1;
+                    let _ = error;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         }
         let stem = file_stem(&rom_path);
         let label = value_label(item.get("label"), &stem);
@@ -422,57 +449,182 @@ pub fn import_lpl(
     output_dir: &Path,
     options: &ImportLplOptions,
 ) -> Result<ImportLplReport, RomxError> {
+    import_lpl_with_progress(
+        lpl_path,
+        output_dir,
+        options,
+        false,
+        |_current, _total, _imported, _skipped| {},
+        || false,
+    )
+}
+
+/// Import an LPL while reporting item progress and allowing the caller to
+/// cancel. When `continue_on_error` is true, an item that cannot be packed is
+/// counted as skipped and the remaining items continue to be processed.
+pub fn import_lpl_with_progress<F, C>(
+    lpl_path: &Path,
+    output_dir: &Path,
+    options: &ImportLplOptions,
+    continue_on_error: bool,
+    progress: F,
+    is_cancelled: C,
+) -> Result<ImportLplReport, RomxError>
+where
+    F: FnMut(usize, usize, usize, usize),
+    C: FnMut() -> bool,
+{
+    import_lpl_with_error_handling(
+        lpl_path,
+        output_dir,
+        options,
+        progress,
+        is_cancelled,
+        |_index, _error| continue_on_error,
+    )
+}
+
+/// Import an LPL with progress, cancellation, and per-item error handling.
+/// The error callback returns `true` to skip the failed item and continue, or
+/// `false` to stop immediately. This allows a GUI to ask the user what to do
+/// when an item fails without coupling the core to any UI toolkit.
+pub fn import_lpl_with_error_handling<F, C, E>(
+    lpl_path: &Path,
+    output_dir: &Path,
+    options: &ImportLplOptions,
+    progress: F,
+    is_cancelled: C,
+    on_error: E,
+) -> Result<ImportLplReport, RomxError>
+where
+    F: FnMut(usize, usize, usize, usize),
+    C: FnMut() -> bool,
+    E: FnMut(usize, &RomxError) -> bool,
+{
+    import_lpl_with_output_handling(
+        lpl_path,
+        output_dir,
+        options,
+        progress,
+        is_cancelled,
+        on_error,
+        |path| Ok(Some(path.to_owned())),
+    )
+}
+
+/// Import an LPL and invoke `on_output` immediately after each ROMX (or
+/// temporary ROMX) has been completely written. The callback runs on the
+/// importing thread, so callers can atomically commit, rename, or remove the
+/// just-created file before the next item is processed. Return `Some(path)`
+/// for a committed output path or `None` when the item was intentionally
+/// skipped (for example, after an output collision prompt).
+pub fn import_lpl_with_output_handling<F, C, E, O>(
+    lpl_path: &Path,
+    output_dir: &Path,
+    options: &ImportLplOptions,
+    mut progress: F,
+    mut is_cancelled: C,
+    mut on_error: E,
+    mut on_output: O,
+) -> Result<ImportLplReport, RomxError>
+where
+    F: FnMut(usize, usize, usize, usize),
+    C: FnMut() -> bool,
+    E: FnMut(usize, &RomxError) -> bool,
+    O: FnMut(&Path) -> Result<Option<PathBuf>, RomxError>,
+{
     let plan = plan_lpl_import(lpl_path, options)?;
     fs::create_dir_all(output_dir)?;
     let mut output_files = Vec::with_capacity(plan.items.len());
+    let mut skipped = plan.skipped;
+    progress(0, plan.total_items, 0, skipped);
 
     for item in &plan.items {
-        let rom = fs::read(&item.rom_path)?;
-        let mut metadata = required_metadata(&item.label, &item.platform, &item.payload_format);
-        if let Some(identity) = lpl_identity(item.retroarch.get("source_crc32")) {
-            if identity.0 == "serial" {
+        if is_cancelled() {
+            return Err(RomxError::Cancelled);
+        }
+        let result = (|| -> Result<Option<PathBuf>, RomxError> {
+            let rom = fs::read(&item.rom_path)?;
+            let mut metadata = required_metadata(&item.label, &item.platform, &item.payload_format);
+            if let Some(identity) = lpl_identity(item.retroarch.get("source_crc32")) {
+                if identity.0 == "serial" {
+                    metadata
+                        .as_object_mut()
+                        .expect("required metadata is an object")
+                        .insert("serial".into(), Value::String(identity.1));
+                }
+            }
+            if item
+                .retroarch
+                .as_object()
+                .is_some_and(|object| !object.is_empty())
+            {
                 metadata
                     .as_object_mut()
                     .expect("required metadata is an object")
-                    .insert("serial".into(), Value::String(identity.1));
+                    .insert("x-retroarch".into(), item.retroarch.clone());
             }
-        }
-        if item
-            .retroarch
-            .as_object()
-            .is_some_and(|object| !object.is_empty())
-        {
-            metadata
-                .as_object_mut()
-                .expect("required metadata is an object")
-                .insert("x-retroarch".into(), item.retroarch.clone());
-        }
-        let cover = item.cover_path.as_deref().map(fs::read).transpose()?;
-        if let Some(cover_bytes) = &cover {
-            let mut description = Map::new();
-            description.insert("mime_type".into(), Value::String("image/png".into()));
-            if let Some((width, height)) = png_dimensions(cover_bytes) {
-                description.insert("width".into(), Value::from(width));
-                description.insert("height".into(), Value::from(height));
-                description.insert("sha256".into(), Value::String(hex(&sha256(cover_bytes))));
+            let cover = item
+                .cover_path
+                .as_deref()
+                .map(|path| normalize_cover_path(path, options.cover_target))
+                .transpose()?;
+            if let Some(cover_bytes) = &cover {
+                let mut description = Map::new();
+                description.insert("mime_type".into(), Value::String("image/png".into()));
+                if let Some((width, height)) = png_dimensions(cover_bytes) {
+                    description.insert("width".into(), Value::from(width));
+                    description.insert("height".into(), Value::from(height));
+                    description.insert("sha256".into(), Value::String(hex(&sha256(cover_bytes))));
+                }
+                metadata
+                    .as_object_mut()
+                    .expect("required metadata is an object")
+                    .insert("cover".into(), Value::Object(description));
             }
-            metadata
-                .as_object_mut()
-                .expect("required metadata is an object")
-                .insert("cover".into(), Value::Object(description));
+            let bytes = pack_bytes_with_options(
+                &rom,
+                Some(&metadata),
+                cover.as_deref(),
+                options.crc32_override.as_deref(),
+                None,
+            )?;
+            let stem = item
+                .rom_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(safe_filename)
+                .unwrap_or_else(|| "untitled".into());
+            let filename = format!("{stem}.{}x", item.payload_format);
+            let filename = if options.temporary_output {
+                format!("{filename}.tmp")
+            } else {
+                filename
+            };
+            let output_path = output_dir.join(filename);
+            fs::write(&output_path, bytes)?;
+            on_output(&output_path)
+        })();
+        match result {
+            Ok(Some(output_path)) => {
+                output_files.push(output_path);
+                progress(item.index, plan.total_items, output_files.len(), skipped);
+            }
+            Ok(None) => progress(item.index, plan.total_items, output_files.len(), skipped),
+            Err(error) if on_error(item.index, &error) => {
+                skipped += 1;
+                progress(item.index, plan.total_items, output_files.len(), skipped);
+                continue;
+            }
+            Err(error) => return Err(error),
         }
-        let bytes = pack_bytes_with_crc32(
-            &rom,
-            Some(&metadata),
-            cover.as_deref(),
-            options.crc32_override.as_deref(),
-        )?;
-        let output_path = output_dir.join(format!("{:06}.{}x", item.index, item.payload_format));
-        fs::write(&output_path, bytes)?;
-        output_files.push(output_path);
     }
 
-    let manifest_path = output_dir.join("manifest.json");
+    let manifest_path = output_dir.join(if options.temporary_output {
+        "manifest.json.tmp"
+    } else {
+        "manifest.json"
+    });
     let lpl_document = read_lpl_document(lpl_path)?;
     let settings = lpl_document
         .as_object()
@@ -503,7 +655,7 @@ pub fn import_lpl(
     Ok(ImportLplReport {
         total_items: plan.total_items,
         imported: output_files.len(),
-        skipped: plan.skipped,
+        skipped,
         output_files,
         manifest_path,
     })

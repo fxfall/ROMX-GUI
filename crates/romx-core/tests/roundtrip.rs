@@ -1,9 +1,11 @@
+use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgb};
 use romx_core::{
-    classify_gb_payload, crc32, pack_bytes, pack_bytes_with_crc32, read_bytes, FLAG_BODY_SHA256,
-    FLAG_COVER, FLAG_METADATA,
+    classify_gb_payload, crc32, normalize_cover_bytes, pack_bytes, pack_bytes_with_crc32,
+    read_bytes, FLAG_BODY_SHA256, FLAG_COVER, FLAG_METADATA,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::io::Cursor;
 
 #[test]
 fn roundtrip_preserves_rom_metadata_and_png() {
@@ -42,6 +44,29 @@ fn custom_crc32_overrides_lookup_key_but_not_footer_integrity() {
     assert_eq!(document.metadata.as_ref().unwrap()["crc32"], "a1b2c3d4");
     let expected_hash: [u8; 32] = Sha256::digest(rom).into();
     assert_eq!(document.footer.rom_sha256, expected_hash);
+}
+
+#[test]
+fn cover_png_is_preserved_without_target_and_other_formats_are_png_converted() {
+    let source = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(2, 1, Rgb([255, 0, 0])));
+    let mut jpeg = Cursor::new(Vec::new());
+    source.write_to(&mut jpeg, ImageFormat::Jpeg).unwrap();
+    let converted = normalize_cover_bytes(jpeg.get_ref(), None).unwrap();
+    assert!(converted.starts_with(romx_core::PNG_SIGNATURE));
+    assert_eq!(
+        image::load_from_memory(&converted).unwrap().dimensions(),
+        (2, 1)
+    );
+
+    let mut png = Cursor::new(Vec::new());
+    source.write_to(&mut png, ImageFormat::Png).unwrap();
+    let original = png.into_inner();
+    assert_eq!(normalize_cover_bytes(&original, None).unwrap(), original);
+    let resized = normalize_cover_bytes(&original, Some((8, 6))).unwrap();
+    assert_eq!(
+        image::load_from_memory(&resized).unwrap().dimensions(),
+        (8, 6)
+    );
 }
 
 #[test]

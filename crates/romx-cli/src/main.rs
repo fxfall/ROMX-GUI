@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use romx_core::{
-    export_lpl, extract_to_dir, import_lpl, pack_to_path_with_crc32, read_path, ExportLplOptions,
+    export_lpl, extract_to_dir, import_lpl, pack_to_path_with_options, read_path, ExportLplOptions,
     ImportLplOptions,
 };
 use serde_json::json;
@@ -44,9 +44,12 @@ struct PackArgs {
     /// Output ROMX path.
     #[arg(short, long)]
     output: PathBuf,
-    /// Optional PNG cover.
+    /// Optional PNG/JPEG/WebP/GIF/BMP cover.
     #[arg(long)]
     cover: Option<PathBuf>,
+    /// Normalize the cover to an exact WIDTHxHEIGHT PNG.
+    #[arg(long)]
+    cover_size: Option<String>,
     /// Override the metadata CRC32 lookup key (8 hexadecimal characters).
     #[arg(long)]
     crc32: Option<String>,
@@ -71,7 +74,7 @@ struct ImportLplArgs {
     /// Root used to map virtual paths such as /roms/00-GB/1.gb.
     #[arg(long)]
     rom_root: Option<PathBuf>,
-    /// RetroArch thumbnails root.
+    /// RetroArch thumbnails root (PNG/JPEG/WebP/GIF/BMP are accepted).
     #[arg(long)]
     cover_root: Option<PathBuf>,
     /// Ignore the LPL directory and find ROMs by basename in this directory.
@@ -89,6 +92,9 @@ struct ImportLplArgs {
     /// Override the metadata CRC32 lookup key for every imported ROM.
     #[arg(long)]
     crc32: Option<String>,
+    /// Normalize imported covers to an exact WIDTHxHEIGHT PNG.
+    #[arg(long)]
+    cover_size: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -128,15 +134,32 @@ fn hex(bytes: &[u8]) -> String {
     output
 }
 
+fn parse_cover_size(value: Option<&str>) -> Result<Option<(u32, u32)>, Box<dyn Error>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let (width, height) = value
+        .split_once(['x', 'X'])
+        .ok_or("cover size must use WIDTHxHEIGHT")?;
+    let width = width.parse::<u32>()?;
+    let height = height.parse::<u32>()?;
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        return Err("cover size must be between 1x1 and 8192x8192".into());
+    }
+    Ok(Some((width, height)))
+}
+
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Pack(args) => {
-            pack_to_path_with_crc32(
+            let cover_size = parse_cover_size(args.cover_size.as_deref())?;
+            pack_to_path_with_options(
                 &args.rom,
                 Some(&args.metadata),
                 args.cover.as_deref(),
                 &args.output,
                 args.crc32.as_deref(),
+                cover_size,
             )?;
             println!("packed ROMX: {}", args.output.display());
         }
@@ -177,6 +200,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 cover_set: args.cover_set,
                 skip_missing: args.skip_missing,
                 crc32_override: args.crc32,
+                temporary_output: false,
+                cover_target: parse_cover_size(args.cover_size.as_deref())?,
             };
             let report = import_lpl(&args.lpl, &args.output, &options)?;
             println!(

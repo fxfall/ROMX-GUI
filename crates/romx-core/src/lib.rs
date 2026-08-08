@@ -9,13 +9,15 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 mod lpl;
 
 pub use lpl::{
-    export_lpl, import_lpl, plan_lpl_import, ExportLplOptions, ExportLplReport, ImportLplOptions,
+    export_lpl, import_lpl, import_lpl_with_error_handling, import_lpl_with_output_handling,
+    import_lpl_with_progress, plan_lpl_import, ExportLplOptions, ExportLplReport, ImportLplOptions,
     ImportLplPlan, ImportLplReport, PlannedLplItem,
 };
 
@@ -35,6 +37,10 @@ pub enum RomxError {
     Json(#[from] serde_json::Error),
     #[error("invalid ROMX: {0}")]
     Invalid(String),
+    #[error("image processing error: {0}")]
+    Image(#[from] image::ImageError),
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +109,44 @@ pub fn normalize_crc32(value: &str) -> Result<String, RomxError> {
         ));
     }
     Ok(value.to_ascii_lowercase())
+}
+
+/// Convert a supported cover image to PNG.
+///
+/// With no target size, an existing PNG is returned byte-for-byte unchanged;
+/// other supported formats are decoded at their original dimensions and
+/// encoded as PNG. When a target is supplied, every format is resized exactly
+/// to that width and height before PNG encoding. Animated GIFs use their first
+/// frame, matching the single-cover ROMX model.
+pub fn normalize_cover_bytes(
+    value: &[u8],
+    target: Option<(u32, u32)>,
+) -> Result<Vec<u8>, RomxError> {
+    if value.is_empty() {
+        return Err(RomxError::Invalid("cover image must not be empty".into()));
+    }
+    if let Some((width, height)) = target {
+        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+            return Err(RomxError::Invalid(
+                "cover resolution must be between 1 and 8192 pixels".into(),
+            ));
+        }
+    } else if value.starts_with(PNG_SIGNATURE) {
+        return Ok(value.to_vec());
+    }
+    let image = image::load_from_memory(value)?;
+    let image = target
+        .map(|(width, height)| {
+            image.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
+        })
+        .unwrap_or(image);
+    let mut output = Cursor::new(Vec::new());
+    image.write_to(&mut output, image::ImageFormat::Png)?;
+    Ok(output.into_inner())
+}
+
+pub fn normalize_cover_path(path: &Path, target: Option<(u32, u32)>) -> Result<Vec<u8>, RomxError> {
+    normalize_cover_bytes(&fs::read(path)?, target)
 }
 
 /// Classify a Game Boy payload using the CGB flag at ROM header offset 0x143.
@@ -324,7 +368,7 @@ pub fn pack_bytes(
     metadata: Option<&Value>,
     cover: Option<&[u8]>,
 ) -> Result<Vec<u8>, RomxError> {
-    pack_bytes_with_crc32(rom, metadata, cover, None)
+    pack_bytes_with_options(rom, metadata, cover, None, None)
 }
 
 /// Pack a ROMX container, optionally overriding the metadata CRC32 lookup key.
@@ -338,6 +382,17 @@ pub fn pack_bytes_with_crc32(
     metadata: Option<&Value>,
     cover: Option<&[u8]>,
     crc32_override: Option<&str>,
+) -> Result<Vec<u8>, RomxError> {
+    pack_bytes_with_options(rom, metadata, cover, crc32_override, None)
+}
+
+/// Pack a ROMX container with optional CRC32 and cover normalization options.
+pub fn pack_bytes_with_options(
+    rom: &[u8],
+    metadata: Option<&Value>,
+    cover: Option<&[u8]>,
+    crc32_override: Option<&str>,
+    cover_target: Option<(u32, u32)>,
 ) -> Result<Vec<u8>, RomxError> {
     if rom.is_empty() {
         return Err(RomxError::Invalid("ROM payload must not be empty".into()));
@@ -365,7 +420,10 @@ pub fn pack_bytes_with_crc32(
         .as_ref()
         .map(serde_json::to_vec)
         .transpose()?;
-    if let Some(cover_bytes) = cover {
+    let cover_bytes = cover
+        .map(|value| normalize_cover_bytes(value, cover_target))
+        .transpose()?;
+    if let Some(cover_bytes) = cover_bytes.as_deref() {
         if !cover_bytes.starts_with(PNG_SIGNATURE) {
             return Err(RomxError::Invalid("cover is not a PNG".into()));
         }
@@ -381,7 +439,7 @@ pub fn pack_bytes_with_crc32(
             .unwrap_or(0),
         size: metadata_bytes.as_ref().map(|v| v.len() as u64).unwrap_or(0),
     };
-    let cover_offset = if cover.is_some() {
+    let cover_offset = if cover_bytes.is_some() {
         if metadata_region.size > 0 {
             metadata_region.offset + metadata_region.size
         } else {
@@ -392,7 +450,7 @@ pub fn pack_bytes_with_crc32(
     };
     let cover_region = Region {
         offset: cover_offset,
-        size: cover.map(|v| v.len() as u64).unwrap_or(0),
+        size: cover_bytes.as_ref().map(|v| v.len() as u64).unwrap_or(0),
     };
     let mut body =
         Vec::with_capacity(rom.len() + metadata_region.size as usize + cover_region.size as usize);
@@ -400,7 +458,7 @@ pub fn pack_bytes_with_crc32(
     if let Some(bytes) = &metadata_bytes {
         body.extend_from_slice(bytes);
     }
-    if let Some(bytes) = cover {
+    if let Some(bytes) = cover_bytes.as_deref() {
         body.extend_from_slice(bytes);
     }
     let mut flags = FLAG_BODY_SHA256;
@@ -429,7 +487,7 @@ pub fn pack_to_path(
     cover_path: Option<&Path>,
     output_path: &Path,
 ) -> Result<(), RomxError> {
-    pack_to_path_with_crc32(rom_path, metadata_path, cover_path, output_path, None)
+    pack_to_path_with_options(rom_path, metadata_path, cover_path, output_path, None, None)
 }
 
 pub fn pack_to_path_with_crc32(
@@ -439,6 +497,24 @@ pub fn pack_to_path_with_crc32(
     output_path: &Path,
     crc32_override: Option<&str>,
 ) -> Result<(), RomxError> {
+    pack_to_path_with_options(
+        rom_path,
+        metadata_path,
+        cover_path,
+        output_path,
+        crc32_override,
+        None,
+    )
+}
+
+pub fn pack_to_path_with_options(
+    rom_path: &Path,
+    metadata_path: Option<&Path>,
+    cover_path: Option<&Path>,
+    output_path: &Path,
+    crc32_override: Option<&str>,
+    cover_target: Option<(u32, u32)>,
+) -> Result<(), RomxError> {
     let rom = fs::read(rom_path)?;
     let metadata = if let Some(path) = metadata_path {
         Some(serde_json::from_slice::<Value>(&fs::read(path)?)?)
@@ -446,11 +522,17 @@ pub fn pack_to_path_with_crc32(
         None
     };
     let cover = if let Some(path) = cover_path {
-        Some(fs::read(path)?)
+        Some(normalize_cover_path(path, cover_target)?)
     } else {
         None
     };
-    let bytes = pack_bytes_with_crc32(&rom, metadata.as_ref(), cover.as_deref(), crc32_override)?;
+    let bytes = pack_bytes_with_options(
+        &rom,
+        metadata.as_ref(),
+        cover.as_deref(),
+        crc32_override,
+        None,
+    )?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
