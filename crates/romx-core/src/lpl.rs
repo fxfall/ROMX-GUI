@@ -138,6 +138,23 @@ fn resolve_lpl_path(lpl_path: &Path, value: &str) -> PathBuf {
     }
 }
 
+fn resolve_lpl_rom_path(lpl_path: &Path, value: &str) -> PathBuf {
+    if value.starts_with("/roms/") {
+        // <content-root>/retroarch/playlists/<name>.lpl -> <content-root>/roms/...
+        if let Some(content_root) = lpl_path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+        {
+            let candidate = content_root.join(virtual_relative_path(value));
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    resolve_lpl_path(lpl_path, value)
+}
+
 fn lpl_identity(value: Option<&Value>) -> Option<(&'static str, String)> {
     let value = value?.as_str()?.trim();
     if value.is_empty() || value.eq_ignore_ascii_case("DETECT") {
@@ -325,7 +342,7 @@ pub fn plan_lpl_import(
         } else if let Some(root) = &options.rom_root {
             root.join(&virtual_path)
         } else {
-            resolve_lpl_path(lpl_path, source_path)
+            resolve_lpl_rom_path(lpl_path, source_path)
         };
         if !rom_path.is_file() {
             if options.skip_missing {
