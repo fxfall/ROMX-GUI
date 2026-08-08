@@ -21,7 +21,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create a ROMX container from a ROM, metadata JSON, and optional PNG cover.
+    /// Create a ROMX container from a ROM, metadata JSON, and optional cover image.
     Pack(PackArgs),
     /// Print validated ROMX footer and metadata information as JSON.
     Inspect { romx: PathBuf },
