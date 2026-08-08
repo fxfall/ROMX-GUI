@@ -6,12 +6,12 @@ use image::ImageReader;
 use rfd::FileDialog;
 use romx_core::{
     classify_gb_payload, export_lpl_with_output_handling, import_lpl_with_error_handling,
-    plan_lpl_import, read_metadata_cover_path, read_path, ExportLplOptions,
+    plan_lpl_import, read_metadata_cover_path, read_path, ExportLplOptions, ImportLplPlan,
 };
 use serde_json::{Map, Value};
 use slint::{Image, ModelRc, SharedPixelBuffer, SharedString, VecModel};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::io::Cursor;
@@ -23,7 +23,7 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
@@ -144,7 +144,117 @@ struct LplWorkspace {
     single_conflict: Option<PendingSingleConflict>,
     romx_cover_path: Option<PathBuf>,
     romx_metadata: Option<Value>,
+    plan_cache: Option<ImportLplPlan>,
+    plan_path_index: Option<HashMap<String, usize>>,
+    rom_entries: Vec<PathBuf>,
+    preview_cache: Arc<Mutex<PreviewCache>>,
+    preview_generation: Arc<AtomicUsize>,
+    preview_sender: Sender<PreviewTask>,
     prompt_sender: Arc<Mutex<Option<Sender<PromptResponse>>>>,
+}
+
+#[derive(Clone)]
+struct DecodedPreview {
+    width: u32,
+    height: u32,
+    pixels: Arc<Vec<u8>>,
+}
+
+struct PreviewCache {
+    entries: VecDeque<(String, DecodedPreview)>,
+    capacity: usize,
+}
+
+impl PreviewCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<DecodedPreview> {
+        let position = self
+            .entries
+            .iter()
+            .position(|(entry_key, _)| entry_key == key)?;
+        let entry = self.entries.remove(position)?;
+        let preview = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(preview)
+    }
+
+    fn insert(&mut self, key: String, preview: DecodedPreview) {
+        self.entries.retain(|(entry_key, _)| entry_key != &key);
+        self.entries.push_back((key, preview));
+        while self.entries.len() > self.capacity {
+            self.entries.pop_front();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+enum PreviewSource {
+    File(PathBuf),
+    Bytes(Vec<u8>),
+}
+
+struct PreviewTask {
+    request_id: usize,
+    key: String,
+    source: PreviewSource,
+    cache: Arc<Mutex<PreviewCache>>,
+    generation: Arc<AtomicUsize>,
+    window: slint::Weak<MainWindow>,
+}
+
+fn start_preview_worker(generation: Arc<AtomicUsize>) -> Sender<PreviewTask> {
+    let (sender, receiver) = mpsc::channel::<PreviewTask>();
+    thread::spawn(move || {
+        while let Ok(task) = receiver.recv() {
+            let PreviewTask {
+                request_id,
+                key,
+                source,
+                cache,
+                generation,
+                window,
+            } = task;
+            if generation.load(Ordering::Relaxed) != request_id {
+                continue;
+            }
+            let result = match source {
+                PreviewSource::File(path) => decode_preview_path(&path),
+                PreviewSource::Bytes(bytes) => decode_preview_bytes(&bytes),
+            };
+            if generation.load(Ordering::Relaxed) == request_id {
+                if let Ok(preview) = &result {
+                    if let Ok(mut cache) = cache.lock() {
+                        cache.insert(key, preview.clone());
+                    }
+                }
+            }
+            if generation.load(Ordering::Relaxed) != request_id {
+                continue;
+            }
+            let generation_for_ui = generation.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if generation_for_ui.load(Ordering::Relaxed) != request_id {
+                    return;
+                }
+                if let Some(window) = window.upgrade() {
+                    match result {
+                        Ok(preview) => window.set_cover_preview(decoded_preview_to_slint(&preview)),
+                        Err(_) => window.set_cover_preview(Image::default()),
+                    }
+                }
+            });
+        }
+    });
+    sender
 }
 
 #[derive(Clone, Copy)]
@@ -186,6 +296,9 @@ impl LplWorkspace {
         // The directory is process-scoped, so removing this exact path is
         // safe and prevents stale workspaces from accumulating.
         let _ = fs::remove_dir_all(&temp_dir);
+        let preview_cache = Arc::new(Mutex::new(PreviewCache::new(6)));
+        let preview_generation = Arc::new(AtomicUsize::new(0));
+        let preview_sender = start_preview_worker(preview_generation.clone());
         Self {
             source_path: None,
             work_path: None,
@@ -202,6 +315,12 @@ impl LplWorkspace {
             single_conflict: None,
             romx_cover_path: None,
             romx_metadata: None,
+            plan_cache: None,
+            plan_path_index: None,
+            rom_entries: Vec::new(),
+            preview_cache,
+            preview_generation,
+            preview_sender,
             prompt_sender: Arc::new(Mutex::new(None)),
         }
     }
@@ -220,6 +339,13 @@ impl LplWorkspace {
         self.single_conflict = None;
         self.romx_cover_path = None;
         self.romx_metadata = None;
+        self.plan_cache = None;
+        self.plan_path_index = None;
+        self.rom_entries.clear();
+        self.preview_generation.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut cache) = self.preview_cache.lock() {
+            cache.clear();
+        }
         if let Ok(mut sender) = self.prompt_sender.lock() {
             *sender = None;
         }
@@ -400,26 +526,131 @@ fn retry_native_titlebar(weak: slint::Weak<MainWindow>, attempts_left: u8) {
     });
 }
 
-fn preview_image(path: &Path) -> Result<Image, Box<dyn std::error::Error>> {
+fn decode_preview_path(path: &Path) -> Result<DecodedPreview, Box<dyn std::error::Error>> {
     let image = ImageReader::open(path)?.with_guessed_format()?.decode()?;
-    Ok(image_to_slint(image))
+    Ok(decoded_preview(image))
 }
 
-fn preview_image_bytes(bytes: &[u8]) -> Result<Image, Box<dyn std::error::Error>> {
+fn decode_preview_bytes(bytes: &[u8]) -> Result<DecodedPreview, Box<dyn std::error::Error>> {
     let image = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()?
         .decode()?;
-    Ok(image_to_slint(image))
+    Ok(decoded_preview(image))
 }
 
-fn image_to_slint(image: image::DynamicImage) -> Image {
+fn decoded_preview(image: image::DynamicImage) -> DecodedPreview {
     // Keep the original cover dimensions for preview. Slint scales the image
     // to the fixed UI box, and avoiding an extra thumbnail/RGBA allocation
     // keeps directory browsing responsive and allows every selected cover to
     // be replaced reliably.
     let image = image.to_rgb8();
-    let buffer = SharedPixelBuffer::clone_from_slice(image.as_raw(), image.width(), image.height());
+    let width = image.width();
+    let height = image.height();
+    DecodedPreview {
+        width,
+        height,
+        pixels: Arc::new(image.into_raw()),
+    }
+}
+
+fn decoded_preview_to_slint(preview: &DecodedPreview) -> Image {
+    let buffer = SharedPixelBuffer::clone_from_slice(
+        preview.pixels.as_slice(),
+        preview.width,
+        preview.height,
+    );
     Image::from_rgb8(buffer)
+}
+
+fn preview_path_key(path: &Path) -> String {
+    let path = absolute_path(path);
+    let mut value = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        if let Some(rest) = value.strip_prefix("//?/UNC/") {
+            value = format!("//{rest}");
+        } else if let Some(rest) = value.strip_prefix("//?/") {
+            value = rest.to_owned();
+        }
+        value = value.to_lowercase();
+    }
+    let signature = fs::metadata(path)
+        .ok()
+        .map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|time| time.as_nanos())
+                .unwrap_or_default();
+            format!(":{}:{modified}", metadata.len())
+        })
+        .unwrap_or_default();
+    format!("{value}{signature}")
+}
+
+fn request_preview_source(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    key: String,
+    source: PreviewSource,
+) {
+    let (cache, generation, sender) = {
+        let state = workspace.borrow();
+        (
+            state.preview_cache.clone(),
+            state.preview_generation.clone(),
+            state.preview_sender.clone(),
+        )
+    };
+    let request_id = generation.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if let Ok(mut cache) = cache.lock() {
+        if let Some(preview) = cache.get(&key) {
+            window.set_cover_preview(decoded_preview_to_slint(&preview));
+            return;
+        }
+    }
+    let _ = sender.send(PreviewTask {
+        request_id,
+        key,
+        source,
+        cache,
+        generation,
+        window: window.as_weak(),
+    });
+}
+
+fn request_preview_path(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    path: Option<&Path>,
+) {
+    let Some(path) = path else {
+        let generation = workspace.borrow().preview_generation.clone();
+        generation.fetch_add(1, Ordering::Relaxed);
+        window.set_cover_preview(Image::default());
+        return;
+    };
+    request_preview_source(
+        window,
+        workspace,
+        preview_path_key(path),
+        PreviewSource::File(path.to_owned()),
+    );
+}
+
+fn request_preview_bytes(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    key: String,
+    bytes: &[u8],
+) {
+    request_preview_source(
+        window,
+        workspace,
+        format!("bytes:{key}"),
+        PreviewSource::Bytes(bytes.to_owned()),
+    );
 }
 
 fn resolution(window: &MainWindow) -> Result<Option<(u32, u32)>, String> {
@@ -677,7 +908,7 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
                         state.romx_cover_path = Some(path.clone());
                         path
                     };
-                    window.set_cover_preview(preview_image(&cover_path).unwrap_or_default());
+                    request_preview_path(window, workspace, Some(&cover_path));
                 } else {
                     window.set_cover_preview(Image::default());
                 }
@@ -708,7 +939,7 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     }
 }
 
-fn choose_cover(window: &MainWindow) {
+fn choose_cover(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     let Some(path) = FileDialog::new()
         .set_title("Choose cover image")
         .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
@@ -717,22 +948,13 @@ fn choose_cover(window: &MainWindow) {
         return;
     };
     let path_string = path.to_string_lossy().into_owned();
-    match preview_image(&path) {
-        Ok(image) => {
-            window.set_cover_path(path_string.clone().into());
-            window.set_cover_preview(image);
-            set_status(
-                window,
-                format!("Selected image: {path_string}"),
-                format!("Cover selected: {path_string}"),
-            );
-        }
-        Err(error) => set_status(
-            window,
-            format!("Image preview failed: {error}"),
-            format!("Cover preview failed: {error}"),
-        ),
-    }
+    window.set_cover_path(path_string.clone().into());
+    request_preview_path(window, workspace, Some(&path));
+    set_status(
+        window,
+        format!("Selected image: {path_string}"),
+        format!("Cover selected: {path_string}"),
+    );
 }
 
 fn choose_metadata(window: &MainWindow) {
@@ -807,6 +1029,25 @@ fn absolute_path(path: &Path) -> PathBuf {
     })
 }
 
+fn path_identity(path: &Path) -> String {
+    let path = absolute_path(path);
+    let mut value = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        if let Some(rest) = value.strip_prefix("//?/UNC/") {
+            value = format!("//{rest}");
+        } else if let Some(rest) = value.strip_prefix("//?/") {
+            value = rest.to_owned();
+        }
+        value = value.to_lowercase();
+    }
+    value
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    path_identity(left) == path_identity(right)
+}
+
 fn resolve_workspace_rom(lpl_path: &Path, value: &str, rom_dir: &str) -> PathBuf {
     let original = PathBuf::from(value);
     if !rom_dir.trim().is_empty() {
@@ -841,30 +1082,37 @@ fn resolve_workspace_rom(lpl_path: &Path, value: &str, rom_dir: &str) -> PathBuf
     absolute_path(&candidate)
 }
 
-fn find_workspace_cover(image_dir: &str, rom_path: &Path, label: &str) -> Option<PathBuf> {
+struct WorkspaceCoverIndex {
+    by_stem: HashMap<String, PathBuf>,
+}
+
+fn build_workspace_cover_index(image_dir: &str) -> WorkspaceCoverIndex {
+    let mut index = WorkspaceCoverIndex {
+        by_stem: HashMap::new(),
+    };
     if image_dir.trim().is_empty() {
-        return None;
+        return index;
     }
     let directory = Path::new(image_dir.trim());
-    let names = [
-        rom_path.file_stem()?.to_string_lossy().to_lowercase(),
-        label.to_lowercase(),
-    ];
     let supported = ["png", "jpg", "jpeg", "webp", "gif", "bmp"];
     let mut candidates = fs::read_dir(directory)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .filter(|path| {
-            path.extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|extension| {
-                    supported.contains(&extension.to_ascii_lowercase().as_str())
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_file())
+                .filter(|path| {
+                    path.extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|extension| {
+                            supported.contains(&extension.to_ascii_lowercase().as_str())
+                        })
                 })
+                .collect::<Vec<_>>()
         })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|path| {
+        .unwrap_or_default();
+    candidates.sort_unstable_by_key(|path| {
         let extension = path
             .extension()
             .and_then(|value| value.to_str())
@@ -874,14 +1122,26 @@ fn find_workspace_cover(image_dir: &str, rom_path: &Path, label: &str) -> Option
             .position(|value| value.eq_ignore_ascii_case(extension))
             .unwrap_or(99)
     });
-    candidates
+    for path in candidates {
+        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+            index.by_stem.entry(stem.to_lowercase()).or_insert(path);
+        }
+    }
+    index
+}
+
+fn find_workspace_cover(
+    index: &WorkspaceCoverIndex,
+    rom_path: &Path,
+    label: &str,
+) -> Option<PathBuf> {
+    let names = [
+        rom_path.file_stem()?.to_string_lossy().to_lowercase(),
+        label.to_lowercase(),
+    ];
+    names
         .into_iter()
-        .find(|path| {
-            path.file_stem()
-                .and_then(|value| value.to_str())
-                .is_some_and(|stem| names.iter().any(|name| name == &stem.to_lowercase()))
-        })
-        .map(|path| absolute_path(&path))
+        .find_map(|name| index.by_stem.get(&name).map(|path| absolute_path(path)))
 }
 
 fn resolve_original_cover(lpl_path: &Path, item: &Map<String, Value>) -> Option<PathBuf> {
@@ -964,6 +1224,7 @@ fn prepare_lpl_workspace(
     state.reset();
     fs::create_dir_all(&state.temp_dir)
         .map_err(|error| format!("Failed to create the temporary directory: {error}"))?;
+    let cover_index = build_workspace_cover_index(image_dir.trim());
     let items = document
         .get_mut("items")
         .and_then(Value::as_array_mut)
@@ -989,7 +1250,7 @@ fn prepare_lpl_workspace(
                     .and_then(|value| value.to_str())
                     .unwrap_or("")
             });
-        let cover = find_workspace_cover(image_dir.trim(), &rom_path, label)
+        let cover = find_workspace_cover(&cover_index, &rom_path, label)
             .or_else(|| resolve_original_cover(&base_path, item));
         set_lpl_cover_path(item, cover.as_deref());
     }
@@ -1001,6 +1262,8 @@ fn prepare_lpl_workspace(
     state.list_index = Some(list_index);
     state.rom_dir = rom_dir.trim().to_owned();
     state.image_dir = image_dir.trim().to_owned();
+    state.plan_cache = None;
+    state.plan_path_index = None;
     state.current_index = None;
     window.set_lpl_work_path(
         state
@@ -1037,7 +1300,7 @@ fn preflight_lpl(path: &Path) -> Result<String, String> {
             missing_roms.push(format!("#{index}: {}", rom_path.display()));
             continue;
         }
-        let key = absolute_path(&rom_path).to_string_lossy().to_lowercase();
+        let key = path_identity(&rom_path);
         if let Some(previous) = seen.insert(key, index) {
             duplicates.push(format!("#{previous} / #{index}"));
         }
@@ -1440,7 +1703,7 @@ fn start_pending_conversion(window: &MainWindow, workspace: &Rc<RefCell<LplWorks
                         window.set_conversion_total(report.total_items as i32);
                         window.set_conversion_imported(imported as i32);
                         window.set_conversion_skipped((report.skipped + collision_skipped) as i32);
-                        refresh_lpl_file_lists(&window);
+                        refresh_lpl_output_files(&window);
                         set_status(
                             &window,
                             format!(
@@ -1558,17 +1821,51 @@ fn paths_model(paths: &[PathBuf]) -> ModelRc<SharedString> {
     ModelRc::from(Rc::new(VecModel::from(values)))
 }
 
-fn refresh_lpl_file_lists(window: &MainWindow) {
+fn refresh_lpl_file_lists(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     let rom_entries = lpl_file_entries(&window.get_lpl_rom_dir(), LplFileListKind::Rom);
     let output_entries = lpl_file_entries(&window.get_lpl_save_path(), LplFileListKind::Output);
+    {
+        let mut state = workspace.borrow_mut();
+        state.rom_entries = rom_entries.clone();
+    }
     window.set_lpl_rom_files(paths_model(&rom_entries));
     window.set_lpl_output_files(paths_model(&output_entries));
     window.set_lpl_rom_selected(-1);
     window.set_lpl_output_selected(-1);
 }
 
-fn refresh_lpl_preview(window: &MainWindow) {
-    refresh_lpl_file_lists(window);
+fn refresh_lpl_output_files(window: &MainWindow) {
+    let output_entries = lpl_file_entries(&window.get_lpl_save_path(), LplFileListKind::Output);
+    window.set_lpl_output_files(paths_model(&output_entries));
+    window.set_lpl_output_selected(-1);
+}
+
+fn cached_lpl_plan(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+) -> Result<ImportLplPlan, String> {
+    if let Some(plan) = workspace.borrow().plan_cache.clone() {
+        return Ok(plan);
+    }
+    let lpl_path = window.get_lpl_work_path();
+    if lpl_path.trim().is_empty() {
+        return Err("Temporary LPL is missing".into());
+    }
+    let plan = plan_lpl_import(Path::new(lpl_path.trim()), &Default::default())
+        .map_err(|error| error.to_string())?;
+    workspace.borrow_mut().plan_cache = Some(plan.clone());
+    workspace.borrow_mut().plan_path_index = Some(
+        plan.items
+            .iter()
+            .enumerate()
+            .map(|(position, item)| (path_identity(&item.rom_path), position))
+            .collect(),
+    );
+    Ok(plan)
+}
+
+fn refresh_lpl_preview(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
+    refresh_lpl_file_lists(window, workspace);
     let lpl_path = window.get_lpl_work_path();
     if lpl_path.trim().is_empty() {
         window.set_lpl_detail_title(
@@ -1587,7 +1884,7 @@ fn refresh_lpl_preview(window: &MainWindow) {
         return;
     }
 
-    match plan_lpl_import(Path::new(lpl_path.trim()), &Default::default()) {
+    match cached_lpl_plan(window, workspace) {
         Ok(plan) => {
             let available = plan.items.len();
             let skipped = plan.skipped;
@@ -1611,9 +1908,7 @@ fn refresh_lpl_preview(window: &MainWindow) {
                 .iter()
                 .find_map(|item| item.cover_path.as_deref())
             {
-                if let Ok(image) = preview_image(cover_path) {
-                    window.set_cover_preview(image);
-                }
+                request_preview_path(window, workspace, Some(cover_path));
             } else {
                 window.set_cover_preview(Image::default());
             }
@@ -1642,12 +1937,12 @@ fn metadata_string(value: Option<&Value>, key: &str) -> String {
         .to_owned()
 }
 
-fn select_lpl_rom(window: &MainWindow, index: i32) {
+fn select_lpl_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, index: i32) {
     if index < 0 {
         return;
     }
-    let entries = lpl_file_entries(&window.get_lpl_rom_dir(), LplFileListKind::Rom);
-    let Some(path) = entries.get(index as usize) else {
+    let path = workspace.borrow().rom_entries.get(index as usize).cloned();
+    let Some(path) = path.as_deref() else {
         return;
     };
     let path_string = path.to_string_lossy().into_owned();
@@ -1661,15 +1956,22 @@ fn select_lpl_rom(window: &MainWindow, index: i32) {
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     let mut info = format!("ROM · {} bytes", size);
-    let plan = {
-        let lpl_path = window.get_lpl_work_path();
-        (!lpl_path.trim().is_empty())
-            .then(|| plan_lpl_import(Path::new(lpl_path.trim()), &Default::default()).ok())
-            .flatten()
-    };
-    let selected_item = plan
+    let plan = cached_lpl_plan(window, workspace).ok();
+    let path_key = path_identity(path);
+    let selected_item_position = workspace
+        .borrow()
+        .plan_path_index
         .as_ref()
-        .and_then(|plan| plan.items.iter().find(|item| item.rom_path == *path));
+        .and_then(|index| index.get(&path_key).copied());
+    let selected_item = selected_item_position
+        .and_then(|position| plan.as_ref().and_then(|plan| plan.items.get(position)))
+        .or_else(|| {
+            plan.as_ref().and_then(|plan| {
+                plan.items
+                    .iter()
+                    .find(|item| paths_equivalent(&item.rom_path, path))
+            })
+        });
     if let Some(item) = selected_item {
         title = item.label.clone();
         format = format!("{} · {}", item.platform, item.payload_format).to_uppercase();
@@ -1682,10 +1984,7 @@ fn select_lpl_rom(window: &MainWindow, index: i32) {
     let selected_item_index = selected_item.map(|item| item.index as i32).unwrap_or(0);
     window.set_lpl_selected_item_index(selected_item_index);
     if let Some(cover_path) = selected_item.and_then(|item| item.cover_path.as_deref()) {
-        match preview_image(cover_path) {
-            Ok(image) => window.set_cover_preview(image),
-            Err(_) => window.set_cover_preview(Image::default()),
-        }
+        request_preview_path(window, workspace, Some(cover_path));
     } else {
         window.set_cover_preview(Image::default());
     }
@@ -1695,7 +1994,7 @@ fn select_lpl_rom(window: &MainWindow, index: i32) {
     set_status(window, "rom_selected", "ROM selected");
 }
 
-fn select_lpl_output(window: &MainWindow, index: i32) {
+fn select_lpl_output(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, index: i32) {
     if index < 0 {
         return;
     }
@@ -1787,10 +2086,7 @@ fn select_lpl_output(window: &MainWindow, index: i32) {
             );
             window.set_lpl_detail_info(info.into());
             if let Some(cover) = document.cover.as_deref() {
-                match preview_image_bytes(cover) {
-                    Ok(image) => window.set_cover_preview(image),
-                    Err(_) => window.set_cover_preview(Image::default()),
-                }
+                request_preview_bytes(window, workspace, preview_path_key(path), cover);
             } else {
                 window.set_cover_preview(Image::default());
             }
@@ -1853,7 +2149,7 @@ fn unpack_romx_entries(window: &MainWindow) -> Vec<PathBuf> {
     entries
 }
 
-fn preview_unpack_romx(window: &MainWindow, path: &Path) {
+fn preview_unpack_romx(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, path: &Path) {
     let path_string = path.to_string_lossy().into_owned();
     match read_metadata_cover_path(path) {
         Ok(document) => {
@@ -1895,9 +2191,7 @@ fn preview_unpack_romx(window: &MainWindow, path: &Path) {
             );
             window.set_lpl_detail_info(info.into());
             if let Some(cover) = document.cover.as_deref() {
-                window.set_cover_preview(
-                    preview_image_bytes(cover).unwrap_or_else(|_| Image::default()),
-                );
+                request_preview_bytes(window, workspace, preview_path_key(path), cover);
             } else {
                 window.set_cover_preview(Image::default());
             }
@@ -1919,13 +2213,13 @@ fn preview_unpack_romx(window: &MainWindow, path: &Path) {
     }
 }
 
-fn refresh_unpack_preview(window: &MainWindow) {
+fn refresh_unpack_preview(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     let entries = unpack_romx_entries(window);
     window.set_unpack_romx_files(paths_model(&entries));
     window.set_unpack_romx_selected(-1);
     if let Some(first) = entries.first() {
         window.set_unpack_romx_selected(0);
-        preview_unpack_romx(window, first);
+        preview_unpack_romx(window, workspace, first);
     } else {
         window.set_lpl_detail_title(
             localized_text(window, "select_romx_source", "Select a ROMX file or folder").into(),
@@ -1943,7 +2237,7 @@ fn refresh_unpack_preview(window: &MainWindow) {
     }
 }
 
-fn choose_unpack_source(window: &MainWindow, folder: bool) {
+fn choose_unpack_source(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, folder: bool) {
     let dialog = FileDialog::new()
         .set_title(if folder {
             "Choose ROMX folder"
@@ -1961,7 +2255,7 @@ fn choose_unpack_source(window: &MainWindow, folder: bool) {
     };
     let path_string = path.to_string_lossy().into_owned();
     window.set_unpack_input_path(path_string.clone().into());
-    refresh_unpack_preview(window);
+    refresh_unpack_preview(window, workspace);
     set_status(
         window,
         format!("Input selected: {path_string}"),
@@ -2072,7 +2366,7 @@ fn choose_unpack_directory(window: &MainWindow, kind: UnpackDirectoryKind) {
     );
 }
 
-fn select_unpack_romx(window: &MainWindow, index: i32) {
+fn select_unpack_romx(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, index: i32) {
     if index < 0 {
         return;
     }
@@ -2081,7 +2375,7 @@ fn select_unpack_romx(window: &MainWindow, index: i32) {
         return;
     };
     window.set_unpack_romx_selected(index);
-    preview_unpack_romx(window, path);
+    preview_unpack_romx(window, workspace, path);
 }
 
 fn start_unpack_conversion(
@@ -2320,10 +2614,14 @@ fn lpl_item_cover_path(lpl_path: &Path, item: &Map<String, Value>) -> Option<Pat
         .find(|path| path.is_file())
 }
 
-fn set_edit_cover(window: &MainWindow, cover_path: Option<&Path>) {
+fn set_edit_cover(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    cover_path: Option<&Path>,
+) {
     if let Some(path) = cover_path {
         window.set_cover_path(path.to_string_lossy().into_owned().into());
-        window.set_cover_preview(preview_image(path).unwrap_or_default());
+        request_preview_path(window, workspace, Some(path));
     } else {
         window.set_cover_path("".into());
         window.set_cover_preview(Image::default());
@@ -2406,7 +2704,7 @@ fn begin_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     window.set_metadata_path("".into());
     window.set_save_path(window.get_lpl_save_path());
     set_metadata_form(window, &metadata);
-    set_edit_cover(window, cover_path.as_deref());
+    set_edit_cover(window, workspace, cover_path.as_deref());
     workspace.borrow_mut().current_index = Some(item_index as usize);
     window.set_editing_lpl_file(true);
     window.set_active_page(0);
@@ -2532,7 +2830,12 @@ fn save_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) -> 
         set_status(window, &error, &error);
         return false;
     }
-    set_edit_cover(window, cover_path.as_deref());
+    {
+        let mut state = workspace.borrow_mut();
+        state.plan_cache = None;
+        state.plan_path_index = None;
+    }
+    set_edit_cover(window, workspace, cover_path.as_deref());
     set_status(
         window,
         format!("Item {item_index} saved and merged into the temporary LPL"),
@@ -2558,7 +2861,7 @@ fn return_from_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace
     window.set_editing_lpl_file(false);
     window.set_active_page(0);
     window.set_pack_subpage(1);
-    refresh_lpl_preview(window);
+    refresh_lpl_preview(window, workspace);
     set_status(
         window,
         "Ended temporary LPL editing and returned to the LPL page",
@@ -2584,7 +2887,7 @@ fn choose_lpl(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
         set_status(window, &error, &error);
         return;
     }
-    refresh_lpl_preview(window);
+    refresh_lpl_preview(window, workspace);
     set_status(
         window,
         format!("LPL selected: {}", path.display()),
@@ -2616,7 +2919,7 @@ fn choose_lpl_directory(
         set_status(window, &error, &error);
         return;
     }
-    refresh_lpl_preview(window);
+    refresh_lpl_preview(window, workspace);
     set_status(
         window,
         format!("Folder selected: {path_string}"),
@@ -2988,7 +3291,7 @@ fn convert_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) 
             return;
         }
     };
-    set_edit_cover(window, cover_path.as_deref());
+    set_edit_cover(window, workspace, cover_path.as_deref());
     begin_preflight(
         window,
         workspace,
@@ -3000,6 +3303,7 @@ fn convert_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let window = MainWindow::new()?;
+    let lpl_workspace = Rc::new(RefCell::new(LplWorkspace::new()));
     {
         window.on_translate(|key, language_index| {
             locale_catalog().text(key.as_str(), language_index).into()
@@ -3007,6 +3311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
         window.on_language_changed(move || {
             if let Some(window) = weak.upgrade() {
                 window.set_status_text(
@@ -3015,9 +3320,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .into(),
                 );
                 if window.get_active_page() == 0 && window.get_pack_subpage() == 1 {
-                    refresh_lpl_preview(&window);
+                    refresh_lpl_preview(&window, &workspace);
                 } else if window.get_active_page() == 1 {
-                    refresh_unpack_preview(&window);
+                    refresh_unpack_preview(&window, &workspace);
                 }
             }
         });
@@ -3043,8 +3348,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .text("ready", window.get_language_index())
             .into(),
     );
-    let lpl_workspace = Rc::new(RefCell::new(LplWorkspace::new()));
-
     {
         let weak = window.as_weak();
         let workspace = lpl_workspace.clone();
@@ -3056,9 +3359,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
         window.on_open_cover_clicked(move || {
             if let Some(window) = weak.upgrade() {
-                choose_cover(&window);
+                choose_cover(&window, &workspace);
             }
         });
     }
@@ -3265,17 +3569,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
         window.on_lpl_rom_file_clicked(move |index| {
             if let Some(window) = weak.upgrade() {
-                select_lpl_rom(&window, index);
+                select_lpl_rom(&window, &workspace, index);
             }
         });
     }
     {
         let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
         window.on_lpl_output_file_clicked(move |index| {
             if let Some(window) = weak.upgrade() {
-                select_lpl_output(&window, index);
+                select_lpl_output(&window, &workspace, index);
             }
         });
     }
@@ -3308,17 +3614,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
         window.on_open_unpack_file_clicked(move || {
             if let Some(window) = weak.upgrade() {
-                choose_unpack_source(&window, false);
+                choose_unpack_source(&window, &workspace, false);
             }
         });
     }
     {
         let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
         window.on_open_unpack_folder_clicked(move || {
             if let Some(window) = weak.upgrade() {
-                choose_unpack_source(&window, true);
+                choose_unpack_source(&window, &workspace, true);
             }
         });
     }
@@ -3348,9 +3656,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
         window.on_unpack_romx_file_clicked(move |index| {
             if let Some(window) = weak.upgrade() {
-                select_unpack_romx(&window, index);
+                select_unpack_romx(&window, &workspace, index);
             }
         });
     }
