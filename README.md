@@ -2,6 +2,56 @@
 
 Cross-platform ROMX desktop application workspace.
 
+## ROMX GUI
+
+The ROMX GUI is a cross-platform Slint + Rust desktop application for packing
+and unpacking ROMX files. It calls `romx-core` directly and targets macOS,
+Linux, and Windows.
+
+Run the GUI from source with:
+
+```bash
+cargo run -p romx-gui
+```
+
+When macOS reports that a downloaded or extracted `romx-gui.app` is damaged,
+remove the quarantine attribute from this trusted local build, then open it:
+
+```bash
+xattr -cr "./romx-gui.app"
+open "./romx-gui.app"
+```
+
+The packaged macOS layout is `romx-gui.app`; Linux packages contain one
+`romx-gui` executable and Windows packages contain one `romx-gui.exe`.
+
+The current GUI provides:
+
+- top-level packing and unpacking pages;
+- unified left navigation for packing/unpacking and their game-file/LPL sub-pages;
+- game-file packing with native file/folder dialogs;
+- PNG/JPEG/WebP/GIF/BMP cover preview and exact PNG resizing;
+- metadata JSON import plus the requested custom game-information fields;
+- direct packing through `romx-core`, with the generated ROMX path shown in the status bar;
+- ROMX verification and extraction;
+- simplified Chinese/English switching and portable minimize/maximize/close controls.
+
+The GUI uses process-local temporary playlists with English names such as
+`temp-single-01.lpl`, `temp-list-01.lpl`, and `temp-list-01-2.lpl`. Single-file
+packing and LPL conversion both pass an LPL directly to `romx-core`. During a
+single-item edit, `temp-list-01-2.lpl` is converted independently; Save merges
+it into `temp-list-01.lpl`, while Back removes the edit playlist. The temporary
+workspace is removed when a playlist is replaced or the GUI exits.
+
+### GUI locales
+
+GUI text is stored outside the source in `crates/romx-gui/locales/en.json` and
+`crates/romx-gui/locales/zh-CN.json`. At runtime the loader checks
+`ROMX_LOCALE_DIR`, then a `locales` directory beside the executable (or
+`Contents/Resources/locales` inside the macOS app), and finally the development
+locale directory. To add another language, copy `en.json`, translate its
+values, and add the language to the Slint language selector.
+
 ## Workspace
 
 - `crates/romx-core`: Rust implementation of ROMX 1.0 binary packing, footer parsing, validation, SHA-256 checks, PNG cover checks, and extraction.
@@ -132,38 +182,3 @@ Import and export RetroArch playlists:
   ./build/romx/00-GB \
   --output ./build/retroarch
 ```
-
-## Slint GUI
-
-Run the GUI during development:
-
-```bash
-cargo run -p romx-gui
-```
-
-The current GUI provides:
-
-- top-level packing and unpacking pages;
-- unified left navigation for packing/unpacking and their game-file/LPL sub-pages;
-- game-file packing with native file/folder dialogs;
-- PNG/JPEG/WebP/GIF/BMP cover preview and exact PNG resizing;
-- metadata JSON import plus the requested custom game-information fields;
-- direct packing through `romx-core`, with the generated ROMX path shown in the status bar;
-- ROMX verification and extraction;
-- simplified Chinese/English switching and portable minimize/maximize/close controls.
-
-The GUI uses process-local temporary playlists with English names such as
-`temp-single-01.lpl`, `temp-list-01.lpl`, and `temp-list-01-2.lpl`. Single-file
-packing and LPL conversion both pass an LPL directly to `romx-core`. During a
-single-item edit, `temp-list-01-2.lpl` is converted independently; Save merges it
-into `temp-list-01.lpl`, while Back removes the edit playlist. The temporary
-workspace is removed when a playlist is replaced or the GUI exits.
-
-### GUI locales
-
-GUI text is stored outside the source in `crates/romx-gui/locales/en.json` and
-`crates/romx-gui/locales/zh-CN.json`. At runtime the loader checks
-`ROMX_LOCALE_DIR`, then a `locales` directory beside the executable (or
-`Contents/Resources/locales` inside the macOS app), and finally the development
-locale directory. To add another language, copy `en.json`, translate its
-values, and add the language to the Slint language selector.
