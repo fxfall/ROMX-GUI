@@ -48,6 +48,9 @@ pub struct PlannedLplItem {
     pub label: String,
     pub platform: String,
     pub payload_format: String,
+    /// LPL item fields that are useful for round-tripping but are not
+    /// intrinsic game metadata (for example db_name and core_name).
+    pub retroarch: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,11 +103,15 @@ pub struct ExportLplReport {
     pub cover_dir: PathBuf,
 }
 
-fn read_lpl_items(path: &Path) -> Result<Vec<Map<String, Value>>, RomxError> {
+fn read_lpl_document(path: &Path) -> Result<Value, RomxError> {
     let bytes = fs::read(path)?;
-    let document: Value = serde_json::from_slice(&bytes).map_err(|error| {
+    serde_json::from_slice(&bytes).map_err(|error| {
         RomxError::Invalid(format!("invalid LPL file {}: {error}", path.display()))
-    })?;
+    })
+}
+
+fn read_lpl_items(path: &Path) -> Result<Vec<Map<String, Value>>, RomxError> {
+    let document = read_lpl_document(path)?;
     let items = document
         .as_object()
         .and_then(|object| object.get("items"))
@@ -113,6 +120,111 @@ fn read_lpl_items(path: &Path) -> Result<Vec<Map<String, Value>>, RomxError> {
             RomxError::Invalid(format!("LPL file has no items array: {}", path.display()))
         })?;
     Ok(items.iter().filter_map(Value::as_object).cloned().collect())
+}
+
+fn resolve_lpl_path(lpl_path: &Path, value: &str) -> PathBuf {
+    let candidate = PathBuf::from(value);
+    if candidate.is_absolute() {
+        return candidate;
+    }
+    let relative_to_lpl = lpl_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(&candidate);
+    if relative_to_lpl.is_file() {
+        relative_to_lpl
+    } else {
+        candidate
+    }
+}
+
+fn lpl_identity(value: Option<&Value>) -> Option<(&'static str, String)> {
+    let value = value?.as_str()?.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("DETECT") {
+        return None;
+    }
+    let (token, kind) = value.split_once('|')?;
+    if token.is_empty() {
+        return None;
+    }
+    match kind.to_ascii_lowercase().as_str() {
+        "crc" => normalize_crc32(token).ok().map(|value| ("crc32", value)),
+        "serial" => Some(("serial", token.to_owned())),
+        _ => None,
+    }
+}
+
+fn retroarch_metadata(item: &Map<String, Value>) -> Value {
+    let mut extension = Map::new();
+    for key in ["db_name", "core_name"] {
+        if let Some(Value::String(value)) = item.get(key) {
+            if !value.is_empty() && value != "DETECT" {
+                extension.insert(key.into(), Value::String(value.clone()));
+            }
+        }
+    }
+    if let Some(value) = item.get("crc32").and_then(Value::as_str) {
+        if !value.is_empty() {
+            extension.insert("source_crc32".into(), Value::String(value.to_owned()));
+        }
+    }
+    let known = [
+        "path",
+        "label",
+        "core_path",
+        "core_name",
+        "crc32",
+        "db_name",
+    ];
+    let mut extra = Map::new();
+    for (key, value) in item {
+        if !known.contains(&key.as_str()) && !key.ends_with("_path") {
+            extra.insert(key.clone(), value.clone());
+        }
+    }
+    if !extra.is_empty() {
+        extension.insert("extra".into(), Value::Object(extra));
+    }
+    Value::Object(extension)
+}
+
+fn cover_from_lpl(
+    lpl_path: &Path,
+    playlist: &str,
+    item: &Map<String, Value>,
+    rom_path: &Path,
+    label: &str,
+    options: &ImportLplOptions,
+) -> Option<PathBuf> {
+    if let Some(directory) = &options.force_cover_dir {
+        return first_file(
+            directory.join(format!("{}.png", file_stem(rom_path))),
+            directory.join(format!("{label}.png")),
+        );
+    }
+    for key in ["cover_path", "thumbnail_path", "cover", "thumbnail"] {
+        if let Some(Value::String(value)) = item.get(key) {
+            let candidate = resolve_lpl_path(lpl_path, value);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let directory = if let Some(root) = &options.cover_root {
+        root.join(playlist).join(&options.cover_set)
+    } else {
+        lpl_path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."))
+            .join("thumbnails")
+            .join(playlist)
+            .join(&options.cover_set)
+    };
+    first_file(
+        directory.join(format!("{}.png", file_stem(rom_path))),
+        directory.join(format!("{label}.png")),
+    )
 }
 
 fn value_label(value: Option<&Value>, fallback: &str) -> String {
@@ -213,7 +325,7 @@ pub fn plan_lpl_import(
         } else if let Some(root) = &options.rom_root {
             root.join(&virtual_path)
         } else {
-            PathBuf::from(source_path)
+            resolve_lpl_path(lpl_path, source_path)
         };
         if !rom_path.is_file() {
             if options.skip_missing {
@@ -245,20 +357,7 @@ pub fn plan_lpl_import(
         }
         let stem = file_stem(&rom_path);
         let label = value_label(item.get("label"), &stem);
-        let cover_path = if let Some(directory) = &options.force_cover_dir {
-            first_file(
-                directory.join(format!("{stem}.png")),
-                directory.join(format!("{label}.png")),
-            )
-        } else if let Some(root) = &options.cover_root {
-            let directory = root.join(&playlist).join(&options.cover_set);
-            first_file(
-                directory.join(format!("{stem}.png")),
-                directory.join(format!("{label}.png")),
-            )
-        } else {
-            None
-        };
+        let cover_path = cover_from_lpl(lpl_path, &playlist, item, &rom_path, &label, options);
         items.push(PlannedLplItem {
             index,
             source_path: source_path.to_owned(),
@@ -267,6 +366,7 @@ pub fn plan_lpl_import(
             label,
             platform: platform_for(&payload_format, &playlist).to_owned(),
             payload_format,
+            retroarch: retroarch_metadata(item),
         });
     }
 
@@ -312,6 +412,24 @@ pub fn import_lpl(
     for item in &plan.items {
         let rom = fs::read(&item.rom_path)?;
         let mut metadata = required_metadata(&item.label, &item.platform, &item.payload_format);
+        if let Some(identity) = lpl_identity(item.retroarch.get("source_crc32")) {
+            if identity.0 == "serial" {
+                metadata
+                    .as_object_mut()
+                    .expect("required metadata is an object")
+                    .insert("serial".into(), Value::String(identity.1));
+            }
+        }
+        if item
+            .retroarch
+            .as_object()
+            .is_some_and(|object| !object.is_empty())
+        {
+            metadata
+                .as_object_mut()
+                .expect("required metadata is an object")
+                .insert("x-retroarch".into(), item.retroarch.clone());
+        }
         let cover = item.cover_path.as_deref().map(fs::read).transpose()?;
         if let Some(cover_bytes) = &cover {
             let mut description = Map::new();
@@ -338,11 +456,31 @@ pub fn import_lpl(
     }
 
     let manifest_path = output_dir.join("manifest.json");
+    let lpl_document = read_lpl_document(lpl_path)?;
+    let settings = lpl_document
+        .as_object()
+        .map(|object| {
+            [
+                "version",
+                "default_core_path",
+                "default_core_name",
+                "label_display_mode",
+                "right_thumbnail_mode",
+                "left_thumbnail_mode",
+                "thumbnail_match_mode",
+                "sort_mode",
+            ]
+            .into_iter()
+            .filter_map(|key| object.get(key).map(|value| (key.to_owned(), value.clone())))
+            .collect::<Map<String, Value>>()
+        })
+        .unwrap_or_default();
     let manifest = json!({
         "source_lpl": plan.source_lpl.to_string_lossy(),
         "playlist": plan.playlist,
         "items": plan.total_items,
         "imported": output_files.len(),
+        "lpl_settings": settings,
     });
     write_json(&manifest_path, &manifest)?;
     Ok(ImportLplReport {
@@ -477,13 +615,26 @@ pub fn export_lpl(
             .and_then(Value::as_str)
             .and_then(|value| normalize_crc32(value).ok())
             .unwrap_or_else(|| crc32(&document.rom));
+        let retroarch = document
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("x-retroarch"))
+            .and_then(Value::as_object);
+        let core_name = retroarch
+            .and_then(|value| value.get("core_name"))
+            .and_then(Value::as_str)
+            .unwrap_or("DETECT");
+        let db_name = retroarch
+            .and_then(|value| value.get("db_name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
         items.push(json!({
             "path": item_path,
             "label": label,
             "core_path": "DETECT",
-            "core_name": "DETECT",
+            "core_name": core_name,
             "crc32": format!("{}|crc", lookup_crc),
-            "db_name": "",
+            "db_name": db_name,
         }));
     }
     let lpl = json!({

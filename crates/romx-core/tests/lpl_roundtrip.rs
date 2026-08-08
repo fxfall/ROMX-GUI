@@ -21,7 +21,13 @@ fn lpl_import_and_export_preserve_payload_metadata_and_cover() {
         &lpl_path,
         serde_json::to_vec(&json!({
             "version": "1.5",
-            "items": [{"path": "/roms/02-GBA/game.gba", "label": "中文/Game"}]
+            "items": [{
+                "path": "/roms/02-GBA/game.gba",
+                "label": "中文/Game",
+                "core_name": "FBNeo",
+                "crc32": "DEADBEEF|crc",
+                "db_name": "Nintendo - Game Boy Advance.lpl"
+            }]
         }))
         .unwrap(),
     )
@@ -44,6 +50,14 @@ fn lpl_import_and_export_preserve_payload_metadata_and_cover() {
     assert_eq!(document.rom, b"real-rom-bytes");
     assert_eq!(document.metadata.as_ref().unwrap()["label"], "中文/Game");
     assert_eq!(document.metadata.as_ref().unwrap()["crc32"], "6b8a1dc0");
+    assert_eq!(
+        document.metadata.as_ref().unwrap()["x-retroarch"]["core_name"],
+        "FBNeo"
+    );
+    assert_eq!(
+        document.metadata.as_ref().unwrap()["x-retroarch"]["source_crc32"],
+        "DEADBEEF|crc"
+    );
     assert_eq!(document.metadata.as_ref().unwrap()["cover"]["width"], 16);
     assert_eq!(document.metadata.as_ref().unwrap()["cover"]["height"], 32);
     assert_eq!(document.cover.as_deref(), Some(PNG));
@@ -63,6 +77,11 @@ fn lpl_import_and_export_preserve_payload_metadata_and_cover() {
     assert_eq!(lpl["items"][0]["path"], "/roms/02-GBA/000001.gba");
     assert_eq!(lpl["items"][0]["label"], "中文/Game");
     assert_eq!(lpl["items"][0]["crc32"], "6b8a1dc0|crc");
+    assert_eq!(lpl["items"][0]["core_name"], "FBNeo");
+    assert_eq!(
+        lpl["items"][0]["db_name"],
+        "Nintendo - Game Boy Advance.lpl"
+    );
 }
 
 #[test]
@@ -115,4 +134,35 @@ fn lpl_import_accepts_an_explicit_crc32_override() {
     let report = import_lpl(&lpl_path, &output, &options).unwrap();
     let document = read_path(&report.output_files[0]).unwrap();
     assert_eq!(document.metadata.as_ref().unwrap()["crc32"], "deadbeef");
+}
+
+#[test]
+fn standalone_absolute_lpl_paths_resolve_rom_and_retroarch_cover() {
+    let root = tempdir().unwrap();
+    let retroarch = root.path().join("retroarch");
+    let rom_path = root.path().join("roms/game.gba");
+    let cover_path = retroarch.join("thumbnails/Absolute/Named_Snaps/game.png");
+    fs::create_dir_all(rom_path.parent().unwrap()).unwrap();
+    fs::create_dir_all(cover_path.parent().unwrap()).unwrap();
+    fs::write(&rom_path, b"absolute-rom").unwrap();
+    fs::write(&cover_path, PNG).unwrap();
+    let lpl_path = retroarch.join("playlists/Absolute.lpl");
+    fs::create_dir_all(lpl_path.parent().unwrap()).unwrap();
+    fs::write(
+        &lpl_path,
+        serde_json::to_vec(&json!({
+            "version": "1.5",
+            "items": [{"path": rom_path, "label": "game"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let options = ImportLplOptions::default();
+    let plan = plan_lpl_import(&lpl_path, &options).unwrap();
+    assert_eq!(plan.items[0].rom_path, rom_path);
+    assert_eq!(plan.items[0].cover_path, Some(cover_path));
+    let report = import_lpl(&lpl_path, &root.path().join("romx"), &options).unwrap();
+    let document = read_path(&report.output_files[0]).unwrap();
+    assert_eq!(document.cover.as_deref(), Some(PNG));
 }
