@@ -103,6 +103,14 @@ fn read_locale_file(name: &str) -> Option<String> {
     if let Ok(executable) = env::current_exe() {
         if let Some(directory) = executable.parent() {
             candidates.push(directory.join("locales").join(name));
+            // A macOS application stores bundled resources under
+            // Contents/Resources while the executable lives in
+            // Contents/MacOS.
+            if cfg!(target_os = "macos") {
+                if let Some(contents) = directory.parent() {
+                    candidates.push(contents.join("Resources").join("locales").join(name));
+                }
+            }
         }
     }
     candidates.push(

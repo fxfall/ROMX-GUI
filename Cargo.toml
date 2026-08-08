@@ -2,6 +2,11 @@
 resolver = "2"
 members = ["crates/romx-core", "crates/romx-cli", "crates/romx-gui"]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
 # zune-jpeg 0.5.14/0.5.15 has a warning! macro used as a tail expression,
 # which fails on the current Rust toolchain. Keep the one-line local fix
 # reproducible for the Slint image decoder dependency.

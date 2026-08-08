@@ -1,9 +1,9 @@
 [package]
 name = "romx-gui"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Cross-platform Slint GUI for ROMX"
-license = "MIT"
+license.workspace = true
 build = "build.rs"
 
 [dependencies]

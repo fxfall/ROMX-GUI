@@ -1,9 +1,9 @@
 [package]
 name = "romx-cli"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Command-line interface for ROMX containers and RetroArch playlists"
-license = "MIT"
+license.workspace = true
 
 [[bin]]
 name = "romx"

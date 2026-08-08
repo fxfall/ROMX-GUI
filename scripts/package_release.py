@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Package the cross-platform ROMX binaries and runtime locale files."""
+"""Package the cross-platform ROMX GUI release artifacts."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import shutil
 import tarfile
 import zipfile
@@ -19,9 +20,103 @@ def parse_args() -> argparse.Namespace:
         "--archive", choices=("zip", "tar.gz"), required=True, help="Archive format"
     )
     parser.add_argument(
-        "--windows", action="store_true", help="Use .exe binary names"
+        "--platform",
+        choices=("macos", "linux", "windows"),
+        required=True,
+        help="Release platform layout",
     )
     return parser.parse_args()
+
+
+def workspace_version(root: Path) -> str:
+    in_workspace_package = False
+    for line in (root / "Cargo.toml").read_text(encoding="utf-8").splitlines():
+        section = line.strip()
+        if section.startswith("["):
+            in_workspace_package = section == "[workspace.package]"
+            continue
+        if in_workspace_package:
+            match = re.match(r'^version\s*=\s*["\']([^"\']+)["\']\s*$', line.strip())
+            if match:
+                return match.group(1)
+    raise RuntimeError("workspace package version is missing from Cargo.toml")
+
+
+def copy_locales(root: Path, destination: Path) -> None:
+    shutil.copytree(root / "crates" / "romx-gui" / "locales", destination)
+
+
+def write_macos_bundle(
+    root: Path, release_dir: Path, package_dir: Path, target: str
+) -> None:
+    """Create a standard macOS application bundle with bundled locales."""
+
+    app_dir = package_dir / "romx-gui.app"
+    contents_dir = app_dir / "Contents"
+    macos_dir = contents_dir / "MacOS"
+    resources_dir = contents_dir / "Resources"
+    macos_dir.mkdir(parents=True)
+    resources_dir.mkdir()
+
+    executable = release_dir / "romx-gui"
+    if not executable.is_file():
+        raise FileNotFoundError(f"release binary not found: {executable}")
+    shutil.copy2(executable, macos_dir / "romx-gui")
+    (macos_dir / "romx-gui").chmod(0o755)
+    copy_locales(root, resources_dir / "locales")
+
+    version = workspace_version(root)
+    minimum_system_version = "11.0" if target.startswith("aarch64-") else "10.15"
+    (contents_dir / "Info.plist").write_text(
+        """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\"
+  \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+  <key>CFBundleDisplayName</key>
+  <string>ROMX</string>
+  <key>CFBundleExecutable</key>
+  <string>romx-gui</string>
+  <key>CFBundleIdentifier</key>
+  <string>org.romx.gui</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>ROMX</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>VERSION_PLACEHOLDER</string>
+  <key>CFBundleVersion</key>
+  <string>VERSION_PLACEHOLDER</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>MINIMUM_SYSTEM_VERSION</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+""".replace("VERSION_PLACEHOLDER", version)
+        .replace("MINIMUM_SYSTEM_VERSION", minimum_system_version),
+        encoding="utf-8",
+    )
+
+
+def copy_single_binary(
+    root: Path, release_dir: Path, package_dir: Path, platform: str
+) -> None:
+    suffix = ".exe" if platform == "windows" else ""
+    source = release_dir / f"romx-gui{suffix}"
+    if not source.is_file():
+        raise FileNotFoundError(f"release binary not found: {source}")
+    destination = package_dir / source.name
+    shutil.copy2(source, destination)
+    if platform != "windows":
+        destination.chmod(0o755)
+
+    # The two built-in locales keep the binary self-contained. The external
+    # directory is copied alongside it so users can add or replace languages
+    # without rebuilding the application.
+    copy_locales(root, package_dir / "locales")
 
 
 def main() -> None:
@@ -38,19 +133,10 @@ def main() -> None:
     package_dir.mkdir(parents=True)
     archive_path.unlink(missing_ok=True)
 
-    suffix = ".exe" if args.windows else ""
-    for binary in ("romx-gui", "romx"):
-        source = release_dir / f"{binary}{suffix}"
-        if not source.is_file():
-            raise FileNotFoundError(f"release binary not found: {source}")
-        shutil.copy2(source, package_dir / source.name)
-
-    shutil.copytree(
-        root / "crates" / "romx-gui" / "locales", package_dir / "locales"
-    )
-    readme = root / "README.md"
-    if readme.is_file():
-        shutil.copy2(readme, package_dir / "README.md")
+    if args.platform == "macos":
+        write_macos_bundle(root, release_dir, package_dir, args.target)
+    else:
+        copy_single_binary(root, release_dir, package_dir, args.platform)
 
     if args.archive == "zip":
         with zipfile.ZipFile(

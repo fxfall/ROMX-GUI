@@ -11,7 +11,7 @@ use std::process::ExitCode;
 #[derive(Debug, Parser)]
 #[command(
     name = "romx",
-    version,
+    version = romx_core::APP_VERSION,
     about = "Pack, inspect, verify, extract, import, and export ROMX files"
 )]
 struct Cli {

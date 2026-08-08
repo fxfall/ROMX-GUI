@@ -23,6 +23,13 @@ pub use lpl::{
 
 pub const FOOTER_SIZE: usize = 128;
 pub const VERSION: u32 = 1;
+/// Current application release version, shared by Core, CLI, and GUI.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Return the current application release version.
+pub const fn application_version() -> &'static str {
+    APP_VERSION
+}
 pub const FLAG_METADATA: u32 = 1 << 0;
 pub const FLAG_COVER: u32 = 1 << 1;
 pub const FLAG_BODY_SHA256: u32 = 1 << 2;
