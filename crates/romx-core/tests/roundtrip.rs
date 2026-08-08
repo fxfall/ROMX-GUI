@@ -1,7 +1,7 @@
 use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgb};
 use romx_core::{
     classify_gb_payload, crc32, normalize_cover_bytes, pack_bytes, pack_bytes_with_crc32,
-    read_bytes, FLAG_BODY_SHA256, FLAG_COVER, FLAG_METADATA,
+    pack_bytes_with_options, read_bytes, FLAG_BODY_SHA256, FLAG_COVER, FLAG_METADATA,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -67,6 +67,27 @@ fn cover_png_is_preserved_without_target_and_other_formats_are_png_converted() {
         image::load_from_memory(&resized).unwrap().dimensions(),
         (8, 6)
     );
+
+    let metadata = json!({
+        "schema_version": "1.0",
+        "label": "Cover metadata",
+        "platform": "gba",
+        "payload_format": "gba"
+    });
+    let packed = pack_bytes_with_options(
+        b"rom",
+        Some(&metadata),
+        Some(jpeg.get_ref()),
+        None,
+        Some((8, 6)),
+    )
+    .unwrap();
+    let document = read_bytes(&packed).unwrap();
+    let cover_metadata = &document.metadata.as_ref().unwrap()["cover"];
+    assert_eq!(cover_metadata["mime_type"], "image/png");
+    assert_eq!(cover_metadata["width"], 8);
+    assert_eq!(cover_metadata["height"], 6);
+    assert_eq!(cover_metadata["sha256"].as_str().unwrap().len(), 64);
 }
 
 #[test]

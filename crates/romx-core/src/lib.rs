@@ -149,6 +149,21 @@ pub fn normalize_cover_path(path: &Path, target: Option<(u32, u32)>) -> Result<V
     normalize_cover_bytes(&fs::read(path)?, target)
 }
 
+fn png_dimensions(value: &[u8]) -> Option<(u32, u32)> {
+    if value.len() >= 24 && value.starts_with(PNG_SIGNATURE) && &value[12..16] == b"IHDR" {
+        Some((
+            u32::from_be_bytes(value[16..20].try_into().ok()?),
+            u32::from_be_bytes(value[20..24].try_into().ok()?),
+        ))
+    } else {
+        None
+    }
+}
+
+fn hex_digest(value: &[u8]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Classify a Game Boy payload using the CGB flag at ROM header offset 0x143.
 ///
 /// 0xC0 means GBC-only and always wins. 0x80 means dual GB/GBC compatibility;
@@ -397,7 +412,7 @@ pub fn pack_bytes_with_options(
     if rom.is_empty() {
         return Err(RomxError::Invalid("ROM payload must not be empty".into()));
     }
-    let metadata_value = if let Some(value) = metadata {
+    let mut metadata_value = if let Some(value) = metadata {
         let mut value = value.clone();
         validate_metadata(&value)?;
         let lookup_crc = crc32_override
@@ -416,10 +431,6 @@ pub fn pack_bytes_with_options(
     } else {
         None
     };
-    let metadata_bytes = metadata_value
-        .as_ref()
-        .map(serde_json::to_vec)
-        .transpose()?;
     let cover_bytes = cover
         .map(|value| normalize_cover_bytes(value, cover_target))
         .transpose()?;
@@ -428,6 +439,28 @@ pub fn pack_bytes_with_options(
             return Err(RomxError::Invalid("cover is not a PNG".into()));
         }
     }
+    if let (Some(metadata_value), Some(cover_bytes)) =
+        (metadata_value.as_mut(), cover_bytes.as_deref())
+    {
+        let object = metadata_value
+            .as_object_mut()
+            .expect("validated metadata is an object");
+        let mut cover = Map::new();
+        cover.insert("mime_type".into(), Value::String("image/png".into()));
+        cover.insert(
+            "sha256".into(),
+            Value::String(hex_digest(&sha256(cover_bytes))),
+        );
+        if let Some((width, height)) = png_dimensions(cover_bytes) {
+            cover.insert("width".into(), Value::from(width));
+            cover.insert("height".into(), Value::from(height));
+        }
+        object.insert("cover".into(), Value::Object(cover));
+    }
+    let metadata_bytes = metadata_value
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()?;
     let rom_region = Region {
         offset: 0,
         size: rom.len() as u64,
