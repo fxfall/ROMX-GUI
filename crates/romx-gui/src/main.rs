@@ -40,9 +40,6 @@ const ROMX_EXTENSIONS: &[&str] = &[
     "gbx", "gbcx", "gbax", "nesx", "fdsx", "sfcx", "smcx", "ndsx", "3dsx", "ccix", "ciax", "mdx",
     "genx", "smdx", "binx", "romx",
 ];
-const PREVIEW_MAX_WIDTH: u32 = 256;
-const PREVIEW_MAX_HEIGHT: u32 = 160;
-
 struct LocaleCatalog {
     languages: Vec<HashMap<String, String>>,
 }
@@ -51,8 +48,8 @@ impl LocaleCatalog {
     fn load() -> Self {
         let mut languages = Vec::with_capacity(2);
         for (name, embedded) in [
-            ("zh-CN.json", include_str!("../locales/zh-CN.json")),
             ("en.json", include_str!("../locales/en.json")),
+            ("zh-CN.json", include_str!("../locales/zh-CN.json")),
         ] {
             let contents = read_locale_file(name).unwrap_or_else(|| embedded.to_owned());
             let entries = serde_json::from_str::<Value>(&contents)
@@ -80,7 +77,7 @@ impl LocaleCatalog {
             .cloned()
             .or_else(|| {
                 self.languages
-                    .get(1)
+                    .get(0)
                     .and_then(|language| language.get(key))
                     .cloned()
             })
@@ -416,11 +413,13 @@ fn preview_image_bytes(bytes: &[u8]) -> Result<Image, Box<dyn std::error::Error>
 }
 
 fn image_to_slint(image: image::DynamicImage) -> Image {
-    let image = image
-        .thumbnail(PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
-        .to_rgba8();
+    // Keep the original cover dimensions for preview. Slint scales the image
+    // to the fixed UI box, and avoiding an extra thumbnail/RGBA allocation
+    // keeps directory browsing responsive and allows every selected cover to
+    // be replaced reliably.
+    let image = image.to_rgb8();
     let buffer = SharedPixelBuffer::clone_from_slice(image.as_raw(), image.width(), image.height());
-    Image::from_rgba8(buffer)
+    Image::from_rgb8(buffer)
 }
 
 fn resolution(window: &MainWindow) -> Result<Option<(u32, u32)>, String> {
@@ -3023,6 +3022,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    // Registering a callback does not automatically invalidate bindings that
+    // were evaluated while MainWindow::new() was constructing the component.
+    // Toggle once after registration so the initial language is rendered too.
+    window.set_language_index(1);
+    window.set_language_index(0);
     window.set_lpl_detail_title(
         localized_text(&window, "select_lpl_preview", "Select ROM / ROMX").into(),
     );

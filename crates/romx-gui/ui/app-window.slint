@@ -20,6 +20,7 @@ export component MainWindow inherits Window {
 
     in-out property <int> active_page: 0;
     in-out property <int> pack_subpage: 0;
+    // 0 = English, 1 = Simplified Chinese.
     in-out property <int> language_index: 0;
 
     in-out property <string> rom_path;
@@ -235,7 +236,7 @@ export component MainWindow inherits Window {
             y: 14px;
             width: 108px;
             height: 30px;
-            model: [root.translate("language_zh", root.language_index), root.translate("language_en", root.language_index)];
+            model: [root.translate("language_en", root.language_index), root.translate("language_zh", root.language_index)];
             current-index <=> root.language_index;
         }
     }
