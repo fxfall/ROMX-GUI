@@ -51,12 +51,21 @@ fn cover_png_is_preserved_without_target_and_other_formats_are_png_converted() {
     let source = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(2, 1, Rgb([255, 0, 0])));
     let mut jpeg = Cursor::new(Vec::new());
     source.write_to(&mut jpeg, ImageFormat::Jpeg).unwrap();
-    let converted = normalize_cover_bytes(jpeg.get_ref(), None).unwrap();
-    assert!(converted.starts_with(romx_core::PNG_SIGNATURE));
-    assert_eq!(
-        image::load_from_memory(&converted).unwrap().dimensions(),
-        (2, 1)
-    );
+    for format in [
+        ImageFormat::Jpeg,
+        ImageFormat::WebP,
+        ImageFormat::Gif,
+        ImageFormat::Bmp,
+    ] {
+        let mut encoded = Cursor::new(Vec::new());
+        source.write_to(&mut encoded, format).unwrap();
+        let converted = normalize_cover_bytes(encoded.get_ref(), None).unwrap();
+        assert!(converted.starts_with(romx_core::PNG_SIGNATURE));
+        assert_eq!(
+            image::load_from_memory(&converted).unwrap().dimensions(),
+            (2, 1)
+        );
+    }
 
     let mut png = Cursor::new(Vec::new());
     source.write_to(&mut png, ImageFormat::Png).unwrap();
