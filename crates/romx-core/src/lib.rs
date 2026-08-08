@@ -9,16 +9,16 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 mod lpl;
 
 pub use lpl::{
-    export_lpl, import_lpl, import_lpl_with_error_handling, import_lpl_with_output_handling,
-    import_lpl_with_progress, plan_lpl_import, ExportLplOptions, ExportLplReport, ImportLplOptions,
-    ImportLplPlan, ImportLplReport, PlannedLplItem,
+    export_lpl, export_lpl_with_output_handling, import_lpl, import_lpl_with_error_handling,
+    import_lpl_with_output_handling, import_lpl_with_progress, plan_lpl_import, ExportLplOptions,
+    ExportLplReport, ImportLplOptions, ImportLplPlan, ImportLplReport, PlannedLplItem,
 };
 
 pub const FOOTER_SIZE: usize = 128;
@@ -72,6 +72,17 @@ pub struct Footer {
 pub struct RomxDocument {
     pub footer: Footer,
     pub rom: Vec<u8>,
+    pub metadata: Option<Value>,
+    pub cover: Option<Vec<u8>>,
+}
+
+/// Lightweight ROMX data for previews and metadata editing.
+///
+/// Unlike [`RomxDocument`], this type does not load or hash the ROM payload.
+/// It reads only the footer, metadata region, and optional cover region.
+#[derive(Debug, Clone)]
+pub struct RomxPreview {
+    pub footer: Footer,
     pub metadata: Option<Value>,
     pub cover: Option<Vec<u8>>,
 }
@@ -338,7 +349,7 @@ fn slice_region<'a>(body: &'a [u8], name: &str, region: Region) -> Result<&'a [u
     Ok(&body[region.offset as usize..end as usize])
 }
 
-fn validate_regions(footer: &Footer, body_len: usize) -> Result<(), RomxError> {
+fn validate_regions(footer: &Footer, body_len: u64) -> Result<(), RomxError> {
     if footer.rom.size == 0 {
         return Err(RomxError::Invalid("ROM payload must not be empty".into()));
     }
@@ -353,7 +364,7 @@ fn validate_regions(footer: &Footer, body_len: usize) -> Result<(), RomxError> {
             continue;
         }
         let end = region.end()?;
-        if end > body_len as u64 {
+        if end > body_len {
             return Err(RomxError::Invalid(format!("{name} region reaches footer")));
         }
         nonempty.push((name, region.offset, end));
@@ -579,7 +590,7 @@ pub fn read_bytes(bytes: &[u8]) -> Result<RomxDocument, RomxError> {
     }
     let body_len = bytes.len() - FOOTER_SIZE;
     let footer = Footer::decode(&bytes[body_len..])?;
-    validate_regions(&footer, body_len)?;
+    validate_regions(&footer, body_len as u64)?;
     let body = &bytes[..body_len];
     let rom = slice_region(body, "rom", footer.rom)?.to_vec();
     if sha256(&rom) != footer.rom_sha256 {
@@ -588,33 +599,122 @@ pub fn read_bytes(bytes: &[u8]) -> Result<RomxDocument, RomxError> {
     if footer.flags & FLAG_BODY_SHA256 != 0 && sha256(body) != footer.body_sha256 {
         return Err(RomxError::Invalid("body SHA-256 mismatch".into()));
     }
-    let metadata = if footer.metadata.size > 0 {
-        let value: Value =
-            serde_json::from_slice(slice_region(body, "metadata", footer.metadata)?)?;
-        validate_metadata(&value)?;
-        Some(value)
-    } else {
+    let metadata = if footer.metadata.size == 0 {
         None
-    };
-    let cover = if footer.cover.size > 0 {
-        let value = slice_region(body, "cover", footer.cover)?;
-        if !value.starts_with(PNG_SIGNATURE) {
-            return Err(RomxError::Invalid("embedded cover is not PNG".into()));
-        }
-        Some(value.to_vec())
     } else {
-        None
+        Some(slice_region(body, "metadata", footer.metadata)?.to_vec())
     };
+    let cover = if footer.cover.size == 0 {
+        None
+    } else {
+        Some(slice_region(body, "cover", footer.cover)?.to_vec())
+    };
+    let preview = parse_preview_regions(footer, metadata, cover)?;
     Ok(RomxDocument {
-        footer,
+        footer: preview.footer,
         rom,
-        metadata,
-        cover,
+        metadata: preview.metadata,
+        cover: preview.cover,
     })
 }
 
 pub fn read_path(path: &Path) -> Result<RomxDocument, RomxError> {
     read_bytes(&fs::read(path)?)
+}
+
+fn parse_preview_regions(
+    footer: Footer,
+    metadata_bytes: Option<Vec<u8>>,
+    cover_bytes: Option<Vec<u8>>,
+) -> Result<RomxPreview, RomxError> {
+    let metadata = if let Some(bytes) = metadata_bytes {
+        let value: Value = serde_json::from_slice(&bytes)?;
+        validate_metadata(&value)?;
+        Some(value)
+    } else {
+        None
+    };
+    let cover = if let Some(bytes) = cover_bytes {
+        if !bytes.starts_with(PNG_SIGNATURE) {
+            return Err(RomxError::Invalid("embedded cover is not PNG".into()));
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    Ok(RomxPreview {
+        footer,
+        metadata,
+        cover,
+    })
+}
+
+fn read_file_region(
+    file: &mut fs::File,
+    body_len: u64,
+    name: &str,
+    region: Region,
+) -> Result<Option<Vec<u8>>, RomxError> {
+    if region.size == 0 {
+        return Ok(None);
+    }
+    let end = region.end()?;
+    if end > body_len {
+        return Err(RomxError::Invalid(format!("{name} region reaches footer")));
+    }
+    let size = usize::try_from(region.size)
+        .map_err(|_| RomxError::Invalid(format!("{name} region is too large")))?;
+    file.seek(SeekFrom::Start(region.offset))?;
+    let mut bytes = vec![0u8; size];
+    file.read_exact(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// Read only the footer, metadata, and optional cover from an in-memory ROMX.
+///
+/// This intentionally skips the ROM and body SHA-256 checks because it does
+/// not read the ROM region. Use [`read_bytes`] when full validation is needed.
+pub fn read_metadata_cover_bytes(bytes: &[u8]) -> Result<RomxPreview, RomxError> {
+    if bytes.len() < FOOTER_SIZE {
+        return Err(RomxError::Invalid("file is shorter than footer".into()));
+    }
+    let body_len = bytes.len() - FOOTER_SIZE;
+    let footer = Footer::decode(&bytes[body_len..])?;
+    validate_regions(&footer, body_len as u64)?;
+    let body = &bytes[..body_len];
+    let metadata = if footer.metadata.size == 0 {
+        None
+    } else {
+        Some(slice_region(body, "metadata", footer.metadata)?.to_vec())
+    };
+    let cover = if footer.cover.size == 0 {
+        None
+    } else {
+        Some(slice_region(body, "cover", footer.cover)?.to_vec())
+    };
+    parse_preview_regions(footer, metadata, cover)
+}
+
+/// Read only the footer, metadata, and optional cover from a ROMX path.
+///
+/// Unlike [`read_path`], this does not load the ROM payload or verify either
+/// payload hash, so it is suitable for metadata and cover previews of large
+/// ROMX files.
+pub fn read_metadata_cover_path(path: &Path) -> Result<RomxPreview, RomxError> {
+    let mut file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len < FOOTER_SIZE as u64 {
+        return Err(RomxError::Invalid("file is shorter than footer".into()));
+    }
+    let body_len = file_len - FOOTER_SIZE as u64;
+    file.seek(SeekFrom::Start(body_len))?;
+    let mut footer_bytes = [0u8; FOOTER_SIZE];
+    file.read_exact(&mut footer_bytes)?;
+    let footer = Footer::decode(&footer_bytes)?;
+    validate_regions(&footer, body_len)?;
+    let metadata = read_file_region(&mut file, body_len, "metadata", footer.metadata)?;
+    let cover = read_file_region(&mut file, body_len, "cover", footer.cover)?;
+    parse_preview_regions(footer, metadata, cover)
 }
 
 pub fn extract_to_dir(path: &Path, output_dir: &Path) -> Result<PathBuf, RomxError> {

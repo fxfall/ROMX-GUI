@@ -1,3 +1,34 @@
+# Rust build output
 /target/
+/target-*/
+
+# Release and local build artifacts
+/dist/
+/build/
+/out/
+/release/
+/test-output/
+/test-data/
+*.tmp
+*.tmp.*
+*.log
+*.tar.gz
+*.zip
+*.sha256
+
+# Rust/editor caches
+**/*.rs.bk
+**/*.swp
+.cargo/.package-cache
+.cargo/.global-cache
+.vscode/
+.idea/
+
+# Python tooling caches used by packaging helpers
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Operating-system metadata
 .DS_Store
-test-output/
+Thumbs.db

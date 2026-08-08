@@ -1,0 +1,1197 @@
+import {
+    Button,
+    ComboBox,
+    GroupBox,
+    HorizontalBox,
+    LineEdit,
+    ListView,
+    ScrollView,
+    VerticalBox,
+} from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "ROMX";
+    no-frame: false;
+    background: #ffffff;
+    preferred-width: 980px;
+    preferred-height: 720px;
+    min-width: 820px;
+    min-height: 600px;
+
+    in-out property <int> active_page: 0;
+    in-out property <int> pack_subpage: 0;
+    in-out property <int> language_index: 0;
+
+    in-out property <string> rom_path;
+    in-out property <string> cover_path;
+    in-out property <string> metadata_path;
+    in-out property <string> save_path;
+    in-out property <image> cover_preview;
+
+    in-out property <string> display_title;
+    in-out property <string> sort_title;
+    in-out property <string> original_title;
+    in-out property <string> developer;
+    in-out property <string> release_date;
+    in-out property <string> version;
+    in-out property <string> game_id;
+    in-out property <string> region_code: "JP";
+    in-out property <string> description;
+    in-out property <string> tags;
+
+    in-out property <int> resolution_index: 0;
+    in-out property <string> custom_width: "512";
+    in-out property <string> custom_height: "512";
+    in-out property <bool> conflict_visible: false;
+    in-out property <string> conflict_path;
+    in-out property <bool> error_visible: false;
+    in-out property <string> error_message;
+    in-out property <bool> preflight_visible: false;
+    // 0 = ask whether to scan, 1 = show scan results before conversion.
+    in-out property <int> preflight_stage: 0;
+    in-out property <bool> preflight_scanning: false;
+    in-out property <string> preflight_report;
+    in-out property <bool> conversion_running: false;
+    in-out property <int> conversion_current: 0;
+    in-out property <int> conversion_total: 0;
+    in-out property <int> conversion_imported: 0;
+    in-out property <int> conversion_skipped: 0;
+
+    in-out property <string> unpack_input_path;
+    in-out property <string> unpack_rom_dir;
+    in-out property <string> unpack_cover_dir;
+    in-out property <string> unpack_lpl_dir;
+    in-out property <string> unpack_lpl_rom_path;
+    in-out property <string> unpack_lpl_cover_path;
+    in-out property <[string]> unpack_romx_files;
+    in-out property <int> unpack_romx_selected: -1;
+    in-out property <string> lpl_path;
+    in-out property <string> lpl_work_path;
+    in-out property <string> lpl_rom_dir;
+    in-out property <string> lpl_image_dir;
+    in-out property <string> lpl_save_path;
+    in-out property <string> lpl_detail_title;
+    in-out property <string> lpl_detail_format: "-";
+    in-out property <string> lpl_detail_info;
+    in-out property <[string]> lpl_rom_files;
+    in-out property <[string]> lpl_output_files;
+    in-out property <int> lpl_rom_selected: -1;
+    in-out property <int> lpl_output_selected: -1;
+    in-out property <string> lpl_selected_path;
+    in-out property <int> lpl_selected_item_index: 0;
+    in-out property <bool> editing_lpl_file: false;
+    in-out property <string> status_text;
+
+    pure callback translate(string, int) -> string;
+    callback language_changed();
+
+    changed language_index => {
+        root.language_changed();
+    }
+
+    callback open_rom_clicked();
+    callback open_cover_clicked();
+    callback open_metadata_clicked();
+    callback open_save_path_clicked();
+    callback open_lpl_clicked();
+    callback open_lpl_rom_dir_clicked();
+    callback open_lpl_image_dir_clicked();
+    callback open_lpl_save_path_clicked();
+    callback lpl_rom_file_clicked(index: int);
+    callback lpl_output_file_clicked(index: int);
+    callback edit_lpl_file_clicked();
+    callback save_lpl_edit_clicked();
+    callback return_lpl_edit_clicked();
+    callback convert_clicked();
+    callback preflight_scan_clicked();
+    callback preflight_skip_clicked();
+    callback preflight_start_clicked();
+    callback preflight_cancel_clicked();
+    callback cancel_conversion_clicked();
+    callback conflict_skip_clicked();
+    callback conflict_skip_all_clicked();
+    callback conflict_rename_clicked();
+    callback conflict_rename_all_clicked();
+    callback conflict_replace_clicked();
+    callback conflict_replace_all_clicked();
+    callback error_continue_clicked();
+    callback error_stop_clicked();
+    callback open_unpack_file_clicked();
+    callback open_unpack_folder_clicked();
+    callback open_unpack_rom_dir_clicked();
+    callback open_unpack_cover_dir_clicked();
+    callback open_unpack_lpl_dir_clicked();
+    callback unpack_romx_file_clicked(index: int);
+    callback unpack_file_convert_clicked();
+    callback unpack_batch_convert_clicked();
+    callback window_minimize_clicked();
+    callback window_maximize_clicked();
+    callback window_close_clicked();
+
+    Rectangle {
+        background: #f6f7f9;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    // Unified navigation: pack/unpack and their matching sub-pages live here.
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 184px;
+        height: parent.height;
+        background: #202938;
+
+        VerticalBox {
+            x: 14px;
+            y: 16px;
+            width: parent.width - 28px;
+            height: parent.height - 32px;
+            spacing: 6px;
+
+            Text {
+                text: "ROMX";
+                color: #ffffff;
+                font-size: 24px;
+                font-weight: 700;
+                height: 34px;
+            }
+
+            Text {
+                text: root.translate("pack", root.language_index);
+                color: #9da8b8;
+                font-size: 18px;
+                height: 22px;
+                vertical-alignment: center;
+            }
+            VerticalBox {
+                x: 8px;
+                spacing: 4px;
+                Button {
+                text: root.translate("game_file", root.language_index);
+                    height: 30px;
+                    clicked => {
+                        root.active_page = 0;
+                        root.pack_subpage = 0;
+                    }
+                }
+                Button {
+                text: root.translate("lpl_file", root.language_index);
+                    height: 30px;
+                    clicked => {
+                        root.active_page = 0;
+                        root.pack_subpage = 1;
+                    }
+                }
+            }
+
+            Text {
+                text: root.translate("unpack", root.language_index);
+                color: #9da8b8;
+                font-size: 18px;
+                height: 22px;
+                vertical-alignment: center;
+            }
+            VerticalBox {
+                x: 8px;
+                spacing: 4px;
+                Button {
+                text: root.translate("romx_file_folder", root.language_index);
+                    height: 30px;
+                    clicked => {
+                        root.active_page = 1;
+                    }
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+            Text {
+            text: root.translate("app_subtitle", root.language_index);
+                color: #9da8b8;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    // The operating system provides the title bar and window controls.
+    Rectangle {
+        x: 184px;
+        y: 0px;
+        width: parent.width - 184px;
+        height: 58px;
+        background: #ffffff;
+
+        Text {
+            x: 18px;
+            y: 17px;
+            text: root.translate("app_title", root.language_index);
+            color: #202938;
+            font-size: 19px;
+            font-weight: 700;
+        }
+        ComboBox {
+            x: parent.width - 126px;
+            y: 14px;
+            width: 108px;
+            height: 30px;
+            model: [root.translate("language_zh", root.language_index), root.translate("language_en", root.language_index)];
+            current-index <=> root.language_index;
+        }
+    }
+
+    if root.active_page == 0 && root.pack_subpage == 0: ScrollView {
+        x: 204px;
+        y: 72px;
+        width: parent.width - 224px;
+        height: parent.height - 136px;
+        viewport-width: 700px;
+        VerticalBox {
+            x: 0px;
+            y: 0px;
+            width: 700px;
+            height: 697px;
+            spacing: 10px;
+
+            HorizontalBox {
+                height: 300px;
+                spacing: 12px;
+
+                Rectangle {
+                    width: 450px;
+                    height: 300px;
+                    Text {
+                        x: 0px;
+                        y: 0px;
+                        height: 20px;
+                        text: root.translate("files", root.language_index);
+                        font-size: 15px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    VerticalBox {
+                        x: 0px;
+                        y: 30px;
+                        width: 418px;
+                        height: 230px;
+                        spacing: 1px;
+                        if !root.editing_lpl_file: Text { text: root.translate("game_path", root.language_index); height: 15px; vertical-alignment: center; }
+                        if !root.editing_lpl_file: HorizontalBox {
+                            width: 418px;
+                            height: 48px;
+                            spacing: 10px;
+                            LineEdit {
+                                text <=> root.rom_path;
+                                placeholder-text: root.translate("choose_rom_romx", root.language_index);
+                                width: 340px;
+                                height: 30px;
+                            }
+                            Button {
+                                text: root.translate("open", root.language_index);
+                                width: 66px;
+                                height: 30px;
+                                clicked => { root.open_rom_clicked(); }
+                            }
+                        }
+                        if root.editing_lpl_file: Rectangle {
+                            width: 418px;
+                            height: 48px;
+                            background: #eef0f3;
+                            border-radius: 6px;
+                            HorizontalBox {
+                                padding: 8px;
+                                spacing: 8px;
+                                Text {
+                                    text: root.translate("progress", root.language_index) + " " + root.conversion_current + "/" + root.conversion_total + "  " + root.translate("success", root.language_index) + " " + root.conversion_imported + "  " + root.translate("skipped", root.language_index) + " " + root.conversion_skipped;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                Button {
+                                    text: root.translate("cancel", root.language_index);
+                                    width: 60px;
+                                    height: 30px;
+                                    enabled: root.conversion_running;
+                                    clicked => { root.cancel_conversion_clicked(); }
+                                }
+                            }
+                        }
+                        Text { text: root.translate("cover_image", root.language_index); height: 15px; vertical-alignment: center; }
+                        HorizontalBox {
+                            width: 418px;
+                            height: 48px;
+                            spacing: 10px;
+                            LineEdit {
+                                text <=> root.cover_path;
+                                placeholder-text: root.translate("choose_cover_optional", root.language_index);
+                                width: 340px;
+                                height: 30px;
+                            }
+                            Button {
+                                text: root.translate("open", root.language_index);
+                                width: 66px;
+                                height: 30px;
+                                clicked => { root.open_cover_clicked(); }
+                            }
+                        }
+                        Text { text: root.translate("metadata_json", root.language_index); height: 15px; vertical-alignment: center; }
+                        HorizontalBox {
+                            width: 418px;
+                            height: 48px;
+                            spacing: 10px;
+                            LineEdit {
+                                text <=> root.metadata_path;
+                                placeholder-text: root.translate("choose_metadata_optional", root.language_index);
+                                width: 340px;
+                                height: 30px;
+                            }
+                            Button {
+                                text: root.translate("open", root.language_index);
+                                width: 66px;
+                                height: 30px;
+                                clicked => { root.open_metadata_clicked(); }
+                            }
+                        }
+                        Text { text: root.translate("output_folder", root.language_index); height: 15px; vertical-alignment: center; }
+                        HorizontalBox {
+                            width: 418px;
+                            height: 48px;
+                            spacing: 10px;
+                            LineEdit {
+                                text <=> root.save_path;
+                                placeholder-text: root.translate("choose_romx_output_folder", root.language_index);
+                                width: 340px;
+                                height: 30px;
+                            }
+                            Button {
+                                text: root.translate("open", root.language_index);
+                                width: 66px;
+                                height: 30px;
+                                clicked => { root.open_save_path_clicked(); }
+                            }
+                        }
+                    }
+                }
+
+                VerticalBox {
+                    width: 238px;
+                    height: 200px;
+                    spacing: 0px;
+
+                    Rectangle {
+                        width: 238px;
+                        height: 250px;
+                        background: #eef0f3;
+                        border-radius: 8px;
+                        VerticalBox {
+                            padding: 9px;
+                            spacing: 5px;
+                            Text {
+                                text: root.translate("cover_preview", root.language_index);
+                                font-size: 15px;
+                                font-weight: 700;
+                                height: 20px;
+                            }
+                            Rectangle {
+                                vertical-stretch: 1;
+                                background: #ffffff;
+                                border-radius: 6px;
+                                Image {
+                                    source: root.cover_preview;
+                                    image-fit: contain;
+                                    width: parent.width;
+                                    height: parent.height;
+                                }
+                            }
+                            Text {
+                                text: "PNG / JPG / WebP / GIF / BMP";
+                                color: #777f8c;
+                                font-size: 10px;
+                                height: 14px;
+                            }
+                        }
+                    }
+
+                    GroupBox {
+                        title: root.translate("cover_resolution", root.language_index);
+                        width: 238px;
+                        height: 110px;
+                        VerticalBox {
+                            padding: 7px;
+                            spacing: 5px;
+                            ComboBox {
+                                model: [root.translate("resolution_original", root.language_index), "256 × 224", "320 × 240", "512 × 512", "640 × 480", root.translate("resolution_custom", root.language_index)];
+                                current-index <=> root.resolution_index;
+                                height: 30px;
+                            }
+                            HorizontalBox {
+                                height: 30px;
+                                spacing: 5px;
+                                LineEdit {
+                                    text <=> root.custom_width;
+                                    enabled: root.resolution_index == 5;
+                                    placeholder-text: root.translate("width", root.language_index);
+                                    width: 92px;
+                                    height: 30px;
+                                }
+                                Text { text: "×"; vertical-alignment: center; width: 14px; }
+                                LineEdit {
+                                    text <=> root.custom_height;
+                                    enabled: root.resolution_index == 5;
+                                    placeholder-text: root.translate("height", root.language_index);
+                                    width: 92px;
+                                    height: 30px;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 700px;
+                height: 387px;
+                Text {
+                    x: 0px;
+                    y: 0px;
+                    height: 80px;
+                    text: root.translate("custom_game_metadata", root.language_index);
+                    font-size: 15px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+                VerticalBox {
+                    x: 0px;
+                    y: 60px;
+                    width: 700px;
+                    height: 345px;
+                    spacing: 5px;
+                    HorizontalBox {
+                        height: 30px;
+                        Text { text: root.translate("display_title", root.language_index); height: 30px; width: 160px; vertical-alignment: center; }
+                        LineEdit { text <=> root.display_title; placeholder-text: root.translate("display_title_placeholder", root.language_index); width: 350px; height: 30px; }
+                    }
+                    HorizontalBox {
+                        height: 30px;
+                        Text { text: root.translate("sort_title", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        LineEdit { text <=> root.sort_title; placeholder-text: root.translate("sort_title_placeholder", root.language_index); width: 350px; height: 30px; }
+                    }
+                    HorizontalBox {
+                        height: 30px;
+                        Text { text: root.translate("original_title", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        LineEdit { text <=> root.original_title; placeholder-text: root.translate("original_title_placeholder", root.language_index); width: 350px; height: 30px; }
+                    }
+                    HorizontalBox {
+                        height: 30px;
+                        Text { text: root.translate("developer", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        LineEdit { text <=> root.developer; placeholder-text: root.translate("developer", root.language_index); width: 350px; height: 30px; }
+                    }
+                    HorizontalBox {
+                        height: 30px;
+                        Text { text: root.translate("release_date", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        LineEdit { text <=> root.release_date; placeholder-text: root.translate("release_date", root.language_index); width: 350px; height: 30px; }
+                    }
+                    HorizontalBox {
+                        height: 30px;
+                        Text { text: root.translate("version", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        LineEdit { text <=> root.version; placeholder-text: root.translate("version", root.language_index); width: 350px; height: 30px; }
+                    }
+                    HorizontalBox {
+                        height: 30px;
+                        Text { text: root.translate("game_id", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        LineEdit { text <=> root.game_id; placeholder-text: root.translate("game_id", root.language_index); width: 350px; height: 30px; }
+                    }
+                    HorizontalBox {
+                        height: 30px;
+                        Text { text: root.translate("region_code", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["JP", "US", "EU", "CN", "KR", "WORLD", "OTHER"];
+                            current-value <=> root.region_code;
+                            width: 190px;
+                            height: 30px;
+                        }
+                    }
+                    HorizontalBox {
+                        height: 30px;
+                        Text { text: root.translate("description", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        LineEdit { text <=> root.description; placeholder-text: root.translate("description", root.language_index); width: 350px; height: 30px; }
+                    }
+                    HorizontalBox {
+                        height: 30px;
+                        Text { text: root.translate("tags", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        LineEdit { text <=> root.tags; placeholder-text: root.translate("tags_placeholder", root.language_index); width: 350px; height: 30px; }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.active_page == 0 && root.pack_subpage == 0 && root.editing_lpl_file: HorizontalBox {
+        x: parent.width - 230px;
+        y: parent.height - 96px;
+        width: 214px;
+        height: 34px;
+        spacing: 8px;
+        Button {
+            text: root.translate("save", root.language_index);
+            width: 100px;
+            height: 30px;
+            clicked => { root.save_lpl_edit_clicked(); }
+        }
+        Button {
+            text: root.translate("back", root.language_index);
+            width: 100px;
+            height: 30px;
+            clicked => { root.return_lpl_edit_clicked(); }
+        }
+    }
+
+    if root.active_page == 0 && root.pack_subpage == 1: Rectangle {
+        x: 204px;
+        y: 72px;
+        width: parent.width - 224px;
+        height: parent.height - 136px;
+        background: #ffffff;
+        border-radius: 8px;
+        VerticalBox {
+            x: 0px;
+            y: 0px;
+            width: 700px;
+            height: parent.height;
+            spacing: 10px;
+
+            HorizontalBox {
+                height: 270px;
+                spacing: 30px;
+
+                VerticalBox {
+                    width: 418px;
+                    height: 270px;
+                    spacing: 3px;
+                    Text { text: root.translate("lpl_file_path", root.language_index); height: 15px; vertical-alignment: center; }
+                    HorizontalBox {
+                        cross-axis-alignment: start;
+                        width: 418px;
+                        height: 46px;
+                        spacing: 10px;
+                        LineEdit {
+                            text <=> root.lpl_path;
+                            placeholder-text: root.translate("choose_lpl_file", root.language_index);
+                            width: 340px;
+                            height: 30px;
+                        }
+                        Button {
+                            text: root.translate("open", root.language_index);
+                            width: 66px;
+                            height: 30px;
+                            clicked => { root.open_lpl_clicked(); }
+                        }
+                    }
+                    Text { text: root.translate("rom_folder_path", root.language_index); height: 15px; vertical-alignment: center; }
+                    HorizontalBox {
+                        cross-axis-alignment: start;
+                        width: 418px;
+                        height: 46px;
+                        spacing: 10px;
+                        LineEdit {
+                            text <=> root.lpl_rom_dir;
+                            placeholder-text: root.translate("choose_rom_folder", root.language_index);
+                            width: 340px;
+                            height: 30px;
+                        }
+                        Button {
+                            text: root.translate("open", root.language_index);
+                            width: 66px;
+                            height: 30px;
+                            clicked => { root.open_lpl_rom_dir_clicked(); }
+                        }
+                    }
+                    Text { text: root.translate("image_folder", root.language_index); height: 15px; vertical-alignment: center; }
+                    HorizontalBox {
+                        cross-axis-alignment: start;
+                        width: 418px;
+                        height: 46px;
+                        spacing: 10px;
+                        LineEdit {
+                            text <=> root.lpl_image_dir;
+                            placeholder-text: root.translate("choose_image_folder", root.language_index);
+                            width: 340px;
+                            height: 30px;
+                        }
+                        Button {
+                            text: root.translate("open", root.language_index);
+                            width: 66px;
+                            height: 30px;
+                            clicked => { root.open_lpl_image_dir_clicked(); }
+                        }
+                    }
+                    Text { text: root.translate("output_folder", root.language_index); height: 15px; vertical-alignment: center; }
+                    HorizontalBox {
+                        cross-axis-alignment: start;
+                        width: 418px;
+                        height: 46px;
+                        spacing: 10px;
+                        LineEdit {
+                            text <=> root.lpl_save_path;
+                            placeholder-text: root.translate("choose_output_folder", root.language_index);
+                            width: 340px;
+                            height: 30px;
+                        }
+                        Button {
+                            text: root.translate("open", root.language_index);
+                            width: 66px;
+                            height: 30px;
+                            clicked => { root.open_lpl_save_path_clicked(); }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 270px;
+                    height: 270px;
+                    background: #eef0f3;
+                    border-radius: 8px;
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 6px;
+                        Text {
+                            text: root.translate("info_preview", root.language_index);
+                            font-size: 15px;
+                            font-weight: 600;
+                            height: 22px;
+                        }
+                        Rectangle {
+                            height: 150px;
+                            background: #ffffff;
+                            border-radius: 6px;
+                            Image {
+                                source: root.cover_preview;
+                                image-fit: contain;
+                                width: parent.width;
+                                height: parent.height;
+                            }
+                        }
+                        Text {
+                            text: root.lpl_work_path == ""
+                                ? root.translate("select_lpl_preview", root.language_index)
+                                : root.lpl_detail_title;
+                            font-size: 12px;
+                            font-weight: 600;
+                            height: 20px;
+                        }
+                        Text { text: root.lpl_detail_format; color: #667085; height: 18px; }
+                        Text {
+                            text: root.lpl_work_path == ""
+                                ? root.translate("select_lpl_preview_info", root.language_index)
+                                : root.lpl_detail_info;
+                            color: #667085;
+                            wrap: word-wrap;
+                            vertical-stretch: 1;
+                        }
+                    }
+                }
+            }
+
+            HorizontalBox {
+                height: parent.height - 280px;
+                spacing: 40px;
+
+                Rectangle {
+                    width: 344px;
+                    background: #ffffff;
+                    border-radius: 8px;
+                    VerticalBox {
+                        padding: 10px;
+                        spacing: 6px;
+                        Text {
+                            text: root.translate("rom_folder_preview", root.language_index);
+                            font-size: 15px;
+                            font-weight: 600;
+                            height: 22px;
+                        }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: #f8fafc;
+                            border-radius: 6px;
+                            ListView {
+                                width: parent.width;
+                                height: parent.height;
+                                for item[index] in root.lpl_rom_files: Rectangle {
+                                    width: parent.width;
+                                    height: 28px;
+                                    background: index == root.lpl_rom_selected ? #dbeafe : (Math.mod(index, 2) == 0 ? #f8fafc : #f1f5f9);
+                                    Text {
+                                        x: 8px;
+                                        text: item;
+                                        color: #344054;
+                                        vertical-alignment: center;
+                                        width: parent.width - 16px;
+                                        overflow: elide;
+                                    }
+                                    TouchArea {
+                                        clicked => { root.lpl_rom_file_clicked(index); }
+                                    }
+                                }
+                            }
+                            if root.lpl_rom_files.length == 0: Text {
+                                text: root.translate("no_rom_files", root.language_index);
+                                color: #98a2b3;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: parent.width;
+                                height: parent.height;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 344px;
+                    background: #ffffff;
+                    border-radius: 8px;
+                    VerticalBox {
+                        padding: 10px;
+                        spacing: 6px;
+                        Text {
+                            text: root.translate("output_folder_preview", root.language_index);
+                            font-size: 15px;
+                            font-weight: 600;
+                            height: 22px;
+                        }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: #f8fafc;
+                            border-radius: 6px;
+                            ListView {
+                                width: parent.width;
+                                height: parent.height;
+                                for item[index] in root.lpl_output_files: Rectangle {
+                                    width: parent.width;
+                                    height: 28px;
+                                    background: index == root.lpl_output_selected ? #dbeafe : (Math.mod(index, 2) == 0 ? #f8fafc : #f1f5f9);
+                                    Text {
+                                        x: 8px;
+                                        text: item;
+                                        color: #344054;
+                                        vertical-alignment: center;
+                                        width: parent.width - 16px;
+                                        overflow: elide;
+                                    }
+                                    TouchArea {
+                                        clicked => { root.lpl_output_file_clicked(index); }
+                                    }
+                                }
+                            }
+                            if root.lpl_output_files.length == 0: Text {
+                                text: root.translate("no_romx_output_files", root.language_index);
+                                color: #98a2b3;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: parent.width;
+                                height: parent.height;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.active_page == 1: Rectangle {
+        x: 204px;
+        y: 72px;
+        width: parent.width - 224px;
+        height: parent.height - 136px;
+        background: #ffffff;
+        border-radius: 8px;
+        VerticalBox {
+            x: 0px;
+            y: 0px;
+            width: 700px;
+            height: parent.height;
+            spacing: 10px;
+
+            HorizontalBox {
+                height: 270px;
+                spacing: 30px;
+
+                VerticalBox {
+                    width: 418px;
+                    height: 270px;
+                    spacing: 3px;
+                    Text { text: root.translate("input_file_folder", root.language_index); height: 15px; vertical-alignment: center; }
+                    HorizontalBox {
+                        cross-axis-alignment: start;
+                        width: 418px;
+                        height: 46px;
+                        spacing: 6px;
+                        LineEdit {
+                            text <=> root.unpack_input_path;
+                            placeholder-text: root.translate("choose_romx_file_folder", root.language_index);
+                            width: 270px;
+                            height: 30px;
+                        }
+                        Button { text: root.translate("file", root.language_index); width: 64px; height: 30px; clicked => { root.open_unpack_file_clicked(); } }
+                        Button { text: root.translate("folder", root.language_index); width: 64px; height: 30px; clicked => { root.open_unpack_folder_clicked(); } }
+                    }
+                    Text { text: root.translate("rom_output_folder", root.language_index); height: 15px; vertical-alignment: center; }
+                    HorizontalBox {
+                        cross-axis-alignment: start;
+                        width: 418px;
+                        height: 46px;
+                        spacing: 10px;
+                        LineEdit { text <=> root.unpack_rom_dir; placeholder-text: root.translate("default_rom_output", root.language_index); width: 340px; height: 30px; }
+                        Button { text: root.translate("open", root.language_index); width: 66px; height: 30px; clicked => { root.open_unpack_rom_dir_clicked(); } }
+                    }
+                    Text { text: root.translate("cover_output_folder", root.language_index); height: 15px; vertical-alignment: center; }
+                    HorizontalBox {
+                        cross-axis-alignment: start;
+                        width: 418px;
+                        height: 46px;
+                        spacing: 10px;
+                        LineEdit { text <=> root.unpack_cover_dir; placeholder-text: root.translate("default_cover_output", root.language_index); width: 340px; height: 30px; }
+                        Button { text: root.translate("open", root.language_index); width: 66px; height: 30px; clicked => { root.open_unpack_cover_dir_clicked(); } }
+                    }
+                    Text { text: root.translate("lpl_content_root", root.language_index); height: 15px; vertical-alignment: center; }
+                    HorizontalBox {
+                        cross-axis-alignment: start;
+                        width: 418px;
+                        height: 46px;
+                        spacing: 10px;
+                        LineEdit { text <=> root.unpack_lpl_dir; placeholder-text: root.translate("choose_content_root", root.language_index); width: 340px; height: 30px; }
+                        Button { text: root.translate("open", root.language_index); width: 66px; height: 30px; clicked => { root.open_unpack_lpl_dir_clicked(); } }
+                    }
+                }
+
+                Rectangle {
+                    width: 270px;
+                    height: 270px;
+                    background: #eef0f3;
+                    border-radius: 8px;
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 6px;
+                        Text { text: root.translate("preview", root.language_index); font-size: 15px; font-weight: 600; height: 22px; }
+                        Rectangle {
+                            height: 150px;
+                            background: #ffffff;
+                            border-radius: 6px;
+                            Image { source: root.cover_preview; image-fit: contain; width: parent.width; height: parent.height; }
+                        }
+                        Text {
+                            text: root.unpack_input_path == ""
+                                ? root.translate("select_romx_source", root.language_index)
+                                : root.lpl_detail_title;
+                            font-size: 12px;
+                            font-weight: 600;
+                            height: 20px;
+                        }
+                        Text { text: root.lpl_detail_format; color: #667085; height: 18px; }
+                        Text {
+                            text: root.unpack_input_path == ""
+                                ? root.translate("select_romx_source_info", root.language_index)
+                                : root.lpl_detail_info;
+                            color: #667085;
+                            wrap: word-wrap;
+                            vertical-stretch: 1;
+                        }
+                    }
+                }
+            }
+
+            HorizontalBox {
+                height: parent.height - 280px;
+                spacing: 40px;
+
+                Rectangle {
+                    width: 344px;
+                    background: #ffffff;
+                    border-radius: 8px;
+                    VerticalBox {
+                        padding: 10px;
+                        spacing: 6px;
+                        Text { text: root.translate("romx_folder_preview", root.language_index); font-size: 15px; font-weight: 600; height: 22px; }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: #f8fafc;
+                            border-radius: 6px;
+                            ListView {
+                                width: parent.width;
+                                height: parent.height;
+                                for item[index] in root.unpack_romx_files: Rectangle {
+                                    width: parent.width;
+                                    height: 28px;
+                                    background: index == root.unpack_romx_selected ? #dbeafe : (Math.mod(index, 2) == 0 ? #f8fafc : #f1f5f9);
+                                    Text { x: 8px; text: item; color: #344054; vertical-alignment: center; width: parent.width - 16px; overflow: elide; }
+                                    TouchArea { clicked => { root.unpack_romx_file_clicked(index); } }
+                                }
+                            }
+                            if root.unpack_romx_files.length == 0: Text {
+                                text: root.translate("no_romx_files", root.language_index);
+                                color: #98a2b3;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: parent.width;
+                                height: parent.height;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 344px;
+                    background: #ffffff;
+                    border-radius: 8px;
+                    VerticalBox {
+                        padding: 10px;
+                        spacing: 8px;
+                        Text { text: root.translate("custom_lpl_paths", root.language_index); font-size: 15px; font-weight: 600; height: 22px; }
+                        Text { text: root.translate("rom_path", root.language_index); height: 18px; }
+                        LineEdit {
+                            text <=> root.unpack_lpl_rom_path;
+                            placeholder-text: root.translate("default_lpl_rom_path", root.language_index);
+                            height: 30px;
+                        }
+                        Text { text: root.translate("cover_path", root.language_index); height: 18px; }
+                        LineEdit {
+                            text <=> root.unpack_lpl_cover_path;
+                            placeholder-text: root.translate("default_lpl_cover_path", root.language_index);
+                            height: 30px;
+                        }
+                        Text {
+                            text: root.translate("custom_lpl_paths_hint", root.language_index);
+                            color: #667085;
+                            wrap: word-wrap;
+                            vertical-stretch: 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.preflight_visible: Rectangle {
+        x: 184px;
+        y: 0px;
+        width: parent.width - 184px;
+        height: parent.height;
+        background: #66000000;
+        Rectangle {
+            x: (parent.width - 620px) / 2;
+            y: (parent.height - 430px) / 2;
+            width: 620px;
+            height: 430px;
+            background: #ffffff;
+            border-radius: 10px;
+            VerticalBox {
+                padding: 18px;
+                spacing: 10px;
+                Text {
+                    text: root.preflight_stage == 0
+                        ? root.translate("preflight_scan", root.language_index)
+                        : root.translate("scan_results", root.language_index);
+                    font-size: 18px;
+                    font-weight: 700;
+                    height: 28px;
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: #f6f7f9;
+                    border-radius: 6px;
+                    if root.preflight_stage == 0: Text {
+                        text: root.preflight_scanning
+                            ? root.translate("scanning_entries", root.language_index)
+                            : root.translate("scan_prompt", root.language_index);
+                        x: 12px;
+                        y: 10px;
+                        width: parent.width - 24px;
+                        height: parent.height - 20px;
+                        wrap: word-wrap;
+                        color: #344054;
+                    }
+                    if root.preflight_stage == 1: Text {
+                        text: root.preflight_report;
+                        x: 12px;
+                        y: 10px;
+                        width: parent.width - 24px;
+                        height: parent.height - 20px;
+                        wrap: word-wrap;
+                        overflow: elide;
+                        color: #344054;
+                    }
+                }
+                HorizontalBox {
+                    height: 34px;
+                    spacing: 8px;
+                    Button {
+                        text: root.translate("cancel", root.language_index);
+                        width: 100px;
+                        height: 30px;
+                        clicked => { root.preflight_cancel_clicked(); }
+                    }
+                    if root.preflight_stage == 0: Button {
+                        text: root.translate("skip_and_convert", root.language_index);
+                        width: 140px;
+                        height: 30px;
+                        enabled: !root.conversion_running && !root.preflight_scanning;
+                        clicked => { root.preflight_skip_clicked(); }
+                    }
+                    if root.preflight_stage == 0: Button {
+                        text: root.translate("scan", root.language_index);
+                        width: 120px;
+                        height: 30px;
+                        enabled: !root.conversion_running && !root.preflight_scanning;
+                        clicked => { root.preflight_scan_clicked(); }
+                    }
+                    if root.preflight_stage == 1: Button {
+                        text: root.translate("start", root.language_index);
+                        width: 120px;
+                        height: 30px;
+                        enabled: !root.conversion_running && !root.preflight_scanning;
+                        clicked => { root.preflight_start_clicked(); }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.conflict_visible: Rectangle {
+        x: 184px;
+        y: 0px;
+        width: parent.width - 184px;
+        height: parent.height;
+        background: #66000000;
+        Rectangle {
+            x: (parent.width - 620px) / 2;
+            y: (parent.height - 220px) / 2;
+            width: 620px;
+            height: 220px;
+            background: #ffffff;
+            border-radius: 10px;
+            VerticalBox {
+                padding: 18px;
+                spacing: 10px;
+                Text {
+                    text: root.translate("output_exists", root.language_index);
+                    font-size: 18px;
+                    font-weight: 700;
+                    height: 28px;
+                }
+                Text {
+                    text: root.conflict_path;
+                    color: #667085;
+                    overflow: elide;
+                    height: 24px;
+                }
+                HorizontalBox {
+                    height: 34px;
+                    spacing: 6px;
+                    Button { text: root.translate("skip", root.language_index); width: 82px; height: 30px; clicked => { root.conflict_skip_clicked(); } }
+                    Button { text: root.translate("skip_all", root.language_index); width: 92px; height: 30px; clicked => { root.conflict_skip_all_clicked(); } }
+                    Button { text: root.translate("rename", root.language_index); width: 82px; height: 30px; clicked => { root.conflict_rename_clicked(); } }
+                    Button { text: root.translate("rename_all", root.language_index); width: 104px; height: 30px; clicked => { root.conflict_rename_all_clicked(); } }
+                    Button { text: root.translate("replace", root.language_index); width: 82px; height: 30px; clicked => { root.conflict_replace_clicked(); } }
+                    Button { text: root.translate("replace_all", root.language_index); width: 104px; height: 30px; clicked => { root.conflict_replace_all_clicked(); } }
+                }
+            }
+        }
+    }
+
+    if root.error_visible: Rectangle {
+        x: 184px;
+        y: 0px;
+        width: parent.width - 184px;
+        height: parent.height;
+        background: #66000000;
+        Rectangle {
+            x: (parent.width - 500px) / 2;
+            y: (parent.height - 220px) / 2;
+            width: 500px;
+            height: 220px;
+            background: #ffffff;
+            border-radius: 10px;
+            VerticalBox {
+                padding: 18px;
+                spacing: 10px;
+                Text { text: root.translate("conversion_error", root.language_index); font-size: 18px; font-weight: 700; height: 28px; }
+                Text { text: root.error_message; color: #b42318; wrap: word-wrap; vertical-stretch: 1; }
+                HorizontalBox {
+                    height: 34px;
+                    spacing: 8px;
+                    Button { text: root.translate("skip_continue", root.language_index); width: 130px; height: 30px; clicked => { root.error_continue_clicked(); } }
+                    Button { text: root.translate("stop", root.language_index); width: 90px; height: 30px; clicked => { root.error_stop_clicked(); } }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        x: 204px;
+        y: parent.height - 54px;
+        width: parent.width - 224px;
+        height: 38px;
+        background: #e9edf2;
+        border-radius: 8px;
+        if !root.conversion_running: Text {
+            text: root.status_text == ""
+                || root.status_text == root.translate("ready", 0)
+                || root.status_text == root.translate("ready", 1)
+                ? root.translate("ready", root.language_index)
+                : root.status_text;
+            color: #3f4a59;
+            vertical-alignment: center;
+            x: 12px;
+            width: root.active_page == 1 ? parent.width - 250px : parent.width - 150px;
+        }
+        if root.conversion_running: HorizontalBox {
+            x: 12px;
+            y: 4px;
+            width: parent.width - 24px;
+            height: 30px;
+            spacing: 8px;
+            Text {
+                text: root.translate("progress", root.language_index) + " " + root.conversion_current + "/" + root.conversion_total + "  " + root.translate("success", root.language_index) + " " + root.conversion_imported + "  " + root.translate("skipped", root.language_index) + " " + root.conversion_skipped;
+                color: #3f4a59;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Button {
+                text: root.translate("cancel", root.language_index);
+                width: 72px;
+                height: 30px;
+                clicked => { root.cancel_conversion_clicked(); }
+            }
+        }
+        if !root.conversion_running && root.active_page == 0: Button {
+            text: root.translate("convert", root.language_index);
+            x: parent.width - 112px;
+            y: 4px;
+            width: 96px;
+            height: 30px;
+            clicked => { root.convert_clicked(); }
+        }
+        if !root.conversion_running && root.active_page == 0 && root.pack_subpage == 1 && root.lpl_selected_path != "": Button {
+            text: root.translate("edit_game_info", root.language_index);
+            x: parent.width - 224px;
+            y: 4px;
+            width: 104px;
+            height: 30px;
+            clicked => { root.edit_lpl_file_clicked(); }
+        }
+        if !root.conversion_running && root.active_page == 1: Button {
+            text: root.translate("file_convert", root.language_index);
+            x: parent.width - 240px;
+            y: 4px;
+            width: 104px;
+            height: 30px;
+            clicked => { root.unpack_file_convert_clicked(); }
+        }
+        if !root.conversion_running && root.active_page == 1: Button {
+            text: root.translate("batch_convert", root.language_index);
+            x: parent.width - 132px;
+            y: 4px;
+            width: 120px;
+            height: 30px;
+            clicked => { root.unpack_batch_convert_clicked(); }
+        }
+    }
+}

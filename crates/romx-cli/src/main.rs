@@ -219,7 +219,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 rom_dir: args.rom_dir,
                 cover_dir: args.cover_dir,
                 lpl_rom_prefix: args.lpl_rom_prefix,
+                lpl_cover_prefix: None,
                 cover_set: args.cover_set,
+                temporary_output: false,
             };
             let report = export_lpl(&args.romx_dir, &args.output, &options)?;
             println!(

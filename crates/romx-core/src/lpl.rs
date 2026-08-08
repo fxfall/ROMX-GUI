@@ -86,7 +86,13 @@ pub struct ExportLplOptions {
     pub rom_dir: Option<PathBuf>,
     pub cover_dir: Option<PathBuf>,
     pub lpl_rom_prefix: Option<String>,
+    /// Optional cover path prefix written into each exported LPL entry.
+    /// RetroArch's standard thumbnail layout is used when this is omitted.
+    pub lpl_cover_prefix: Option<String>,
     pub cover_set: String,
+    /// Write every generated file with a `.tmp` suffix and invoke the output
+    /// callback before processing the next file.
+    pub temporary_output: bool,
 }
 
 impl Default for ExportLplOptions {
@@ -97,14 +103,18 @@ impl Default for ExportLplOptions {
             rom_dir: None,
             cover_dir: None,
             lpl_rom_prefix: None,
+            lpl_cover_prefix: None,
             cover_set: "Named_Snaps".into(),
+            temporary_output: false,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportLplReport {
+    pub total_items: usize,
     pub exported: usize,
+    pub skipped: usize,
     pub playlist: String,
     pub lpl_path: PathBuf,
     pub rom_dir: PathBuf,
@@ -674,6 +684,32 @@ fn collect_romx_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(),
     Ok(())
 }
 
+fn numeric_path_cmp(left: &Path, right: &Path) -> std::cmp::Ordering {
+    let name = |path: &Path| {
+        path.file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    };
+    let left_name = name(left);
+    let right_name = name(right);
+    let number = |value: &str| {
+        value
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()
+    };
+    match (number(&left_name), number(&right_name)) {
+        (Some(left_number), Some(right_number)) => left_number
+            .cmp(&right_number)
+            .then_with(|| left_name.to_lowercase().cmp(&right_name.to_lowercase())),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left_name.to_lowercase().cmp(&right_name.to_lowercase()),
+    }
+}
+
 fn playlist_from_manifest(romx_dir: &Path) -> Option<String> {
     let bytes = fs::read(romx_dir.join("manifest.json")).ok()?;
     let manifest: Value = serde_json::from_slice(&bytes).ok()?;
@@ -703,25 +739,91 @@ fn write_json(path: &Path, value: &Value) -> Result<(), RomxError> {
     Ok(())
 }
 
-pub fn export_lpl(
-    romx_dir: &Path,
-    output_root: &Path,
-    options: &ExportLplOptions,
-) -> Result<ExportLplReport, RomxError> {
+fn export_sources(source: &Path) -> Result<Vec<PathBuf>, RomxError> {
     let mut files = Vec::new();
-    collect_romx_files(romx_dir, &mut files)?;
-    files.sort();
+    if source.is_file() {
+        files.push(source.to_owned());
+    } else if source.is_dir() {
+        collect_romx_files(source, &mut files)?;
+    } else {
+        return Err(RomxError::Invalid(format!(
+            "ROMX source does not exist: {}",
+            source.display()
+        )));
+    }
+    files.sort_by(|left, right| numeric_path_cmp(left, right));
     if files.is_empty() {
         return Err(RomxError::Invalid(format!(
             "no ROMX files found in {}",
-            romx_dir.display()
+            source.display()
         )));
     }
+    Ok(files)
+}
+
+fn temporary_output_path(path: &Path, temporary: bool) -> PathBuf {
+    if !temporary {
+        return path.to_owned();
+    }
+    let filename = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".into());
+    path.with_file_name(format!("{filename}.tmp"))
+}
+
+fn joined_lpl_path(prefix: &str, filename: &str) -> String {
+    format!("{}/{}", prefix.trim_end_matches(['/', '\\']), filename)
+}
+
+pub fn export_lpl(
+    source: &Path,
+    output_root: &Path,
+    options: &ExportLplOptions,
+) -> Result<ExportLplReport, RomxError> {
+    export_lpl_with_output_handling(
+        source,
+        output_root,
+        options,
+        |_current, _total, _exported, _skipped| {},
+        || false,
+        |_index, _error| false,
+        |path| Ok(Some(path.to_owned())),
+    )
+}
+
+/// Export one ROMX file or all ROMX files below a directory. Each generated
+/// ROM, cover, and LPL file is passed to `on_output` immediately after it is
+/// completely written. The callback can atomically commit a temporary file
+/// and return its final path, or return `None` to skip the current item.
+pub fn export_lpl_with_output_handling<F, C, E, O>(
+    source: &Path,
+    output_root: &Path,
+    options: &ExportLplOptions,
+    mut progress: F,
+    mut is_cancelled: C,
+    mut on_error: E,
+    mut on_output: O,
+) -> Result<ExportLplReport, RomxError>
+where
+    F: FnMut(usize, usize, usize, usize),
+    C: FnMut() -> bool,
+    E: FnMut(usize, &RomxError) -> bool,
+    O: FnMut(&Path) -> Result<Option<PathBuf>, RomxError>,
+{
+    let files = export_sources(source)?;
+    let total_items = files.len();
     let playlist = options
         .playlist_name
         .clone()
-        .or_else(|| playlist_from_manifest(romx_dir))
-        .unwrap_or_else(|| file_stem(romx_dir));
+        .or_else(|| {
+            if source.is_dir() {
+                playlist_from_manifest(source)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| file_stem(source));
     let rom_dir = options
         .rom_dir
         .clone()
@@ -744,65 +846,109 @@ pub fn export_lpl(
         .clone()
         .unwrap_or_else(|| format!("/roms/{playlist}"));
     let mut items = Vec::with_capacity(files.len());
+    let mut skipped = 0usize;
+    progress(0, total_items, 0, skipped);
 
     for (position, romx_path) in files.iter().enumerate() {
         let index = position + 1;
-        let document = read_path(romx_path)?;
-        let payload_format = document
-            .metadata
-            .as_ref()
-            .and_then(|value| value.get("payload_format"))
-            .and_then(Value::as_str)
-            .unwrap_or("rom");
-        let filename = format!("{index:06}.{payload_format}");
-        fs::write(rom_dir.join(&filename), &document.rom)?;
-        let label = document
-            .metadata
-            .as_ref()
-            .and_then(|value| value.get("label"))
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| {
-                romx_path
+        if is_cancelled() {
+            return Err(RomxError::Cancelled);
+        }
+        let result = (|| -> Result<Option<Value>, RomxError> {
+            let document = read_path(romx_path)?;
+            let payload_format = document
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("payload_format"))
+                .and_then(Value::as_str)
+                .unwrap_or("rom");
+            let source_stem = romx_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(safe_filename)
+                .unwrap_or_else(|| "untitled".into());
+            let rom_target = rom_dir.join(format!("{source_stem}.{payload_format}"));
+            let staged_rom = temporary_output_path(&rom_target, options.temporary_output);
+            fs::write(&staged_rom, &document.rom)?;
+            let Some(committed_rom) = on_output(&staged_rom)? else {
+                return Ok(None);
+            };
+            let rom_filename = committed_rom
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| RomxError::Invalid("exported ROM filename is invalid".into()))?;
+            let label = document
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("label"))
+                .and_then(Value::as_str)
+                .unwrap_or(&source_stem);
+            let committed_cover = if let Some(cover) = document.cover.as_deref() {
+                // Keep the thumbnail basename identical to the exported ROM
+                // basename. Do not use the metadata label here: labels are
+                // often localized and RetroArch thumbnail lookup is filename
+                // based.
+                let cover_stem = committed_rom
                     .file_stem()
                     .and_then(|value| value.to_str())
-                    .unwrap_or_default()
-            });
-        if let Some(cover) = document.cover {
-            fs::write(
-                cover_dir.join(format!("{}.png", safe_filename(label))),
-                cover,
-            )?;
+                    .map(safe_filename)
+                    .unwrap_or_else(|| source_stem.clone());
+                let cover_target = cover_dir.join(format!("{cover_stem}.png"));
+                let staged_cover = temporary_output_path(&cover_target, options.temporary_output);
+                fs::write(&staged_cover, cover)?;
+                on_output(&staged_cover)?
+            } else {
+                None
+            };
+            let item_path = joined_lpl_path(&prefix, rom_filename);
+            let lookup_crc = document
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("crc32"))
+                .and_then(Value::as_str)
+                .and_then(|value| normalize_crc32(value).ok())
+                .unwrap_or_else(|| crc32(&document.rom));
+            let retroarch = document
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("x-retroarch"))
+                .and_then(Value::as_object);
+            let core_name = retroarch
+                .and_then(|value| value.get("core_name"))
+                .and_then(Value::as_str)
+                .unwrap_or("DETECT");
+            let db_name = retroarch
+                .and_then(|value| value.get("db_name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let mut item = Map::new();
+            item.insert("path".into(), Value::String(item_path));
+            item.insert("label".into(), Value::String(label.to_owned()));
+            item.insert("core_path".into(), Value::String("DETECT".into()));
+            item.insert("core_name".into(), Value::String(core_name.to_owned()));
+            item.insert("crc32".into(), Value::String(format!("{}|crc", lookup_crc)));
+            item.insert("db_name".into(), Value::String(db_name.to_owned()));
+            if let (Some(cover_prefix), Some(cover_path)) =
+                (&options.lpl_cover_prefix, committed_cover)
+            {
+                if let Some(filename) = cover_path.file_name().and_then(|value| value.to_str()) {
+                    item.insert(
+                        "cover_path".into(),
+                        Value::String(joined_lpl_path(cover_prefix, filename)),
+                    );
+                }
+            }
+            Ok(Some(Value::Object(item)))
+        })();
+        match result {
+            Ok(Some(item)) => items.push(item),
+            Ok(None) => skipped += 1,
+            Err(error) if on_error(index, &error) => skipped += 1,
+            Err(error) => return Err(error),
         }
-        let item_path = format!("{}/{}", prefix.trim_end_matches('/'), filename);
-        let lookup_crc = document
-            .metadata
-            .as_ref()
-            .and_then(|value| value.get("crc32"))
-            .and_then(Value::as_str)
-            .and_then(|value| normalize_crc32(value).ok())
-            .unwrap_or_else(|| crc32(&document.rom));
-        let retroarch = document
-            .metadata
-            .as_ref()
-            .and_then(|value| value.get("x-retroarch"))
-            .and_then(Value::as_object);
-        let core_name = retroarch
-            .and_then(|value| value.get("core_name"))
-            .and_then(Value::as_str)
-            .unwrap_or("DETECT");
-        let db_name = retroarch
-            .and_then(|value| value.get("db_name"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        items.push(json!({
-            "path": item_path,
-            "label": label,
-            "core_path": "DETECT",
-            "core_name": core_name,
-            "crc32": format!("{}|crc", lookup_crc),
-            "db_name": db_name,
-        }));
+        progress(index, total_items, items.len(), skipped);
     }
+    let exported = items.len();
     let lpl = json!({
         "version": "1.5",
         "default_core_path": "DETECT",
@@ -814,11 +960,15 @@ pub fn export_lpl(
         "sort_mode": 0,
         "items": items,
     });
-    write_json(&lpl_path, &lpl)?;
+    let staged_lpl = temporary_output_path(&lpl_path, options.temporary_output);
+    write_json(&staged_lpl, &lpl)?;
+    let committed_lpl = on_output(&staged_lpl)?.unwrap_or(lpl_path);
     Ok(ExportLplReport {
-        exported: files.len(),
+        total_items,
+        exported,
+        skipped,
         playlist,
-        lpl_path,
+        lpl_path: committed_lpl,
         rom_dir,
         cover_dir,
     })

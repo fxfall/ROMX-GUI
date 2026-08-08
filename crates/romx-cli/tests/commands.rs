@@ -124,7 +124,7 @@ fn import_and_export_lpl_commands_work() {
         "{}",
         String::from_utf8_lossy(&import.stderr)
     );
-    assert!(romx_dir.join("000001.gbx").is_file());
+    assert!(romx_dir.join("1.gbx").is_file());
 
     let export = Command::new(env!("CARGO_BIN_EXE_romx"))
         .arg("export-lpl")
@@ -139,11 +139,11 @@ fn import_and_export_lpl_commands_work() {
         String::from_utf8_lossy(&export.stderr)
     );
     assert_eq!(
-        fs::read(exported.join("roms/00-GB/000001.gb")).unwrap(),
+        fs::read(exported.join("roms/00-GB/1.gb")).unwrap(),
         b"gb-rom"
     );
     assert!(exported
-        .join("thumbnails/00-GB/Named_Snaps/Game One.png")
+        .join("thumbnails/00-GB/Named_Snaps/1.png")
         .is_file());
     assert!(exported.join("playlists/00-GB.lpl").is_file());
 }

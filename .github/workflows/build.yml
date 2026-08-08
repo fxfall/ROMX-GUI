@@ -1,0 +1,117 @@
+name: Build ROMX packages
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - name: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - name: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+            windows: true
+          - name: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            windows: true
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libfontconfig1-dev libfreetype-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libegl1-mesa-dev libudev-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build workspace
+        shell: bash
+        run: cargo build --locked --workspace --release --target "${{ matrix.target }}"
+
+      - name: Run workspace tests
+        shell: bash
+        run: cargo test --locked --workspace --target "${{ matrix.target }}"
+
+      - name: Package binaries
+        shell: bash
+        run: >-
+          python scripts/package_release.py
+          --target "${{ matrix.target }}"
+          --name "romx-${{ matrix.name }}"
+          --archive "${{ matrix.archive }}"
+          ${{ matrix.windows && '--windows' || '' }}
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: romx-${{ matrix.name }}
+          path: |
+            dist/romx-${{ matrix.name }}.*
+          if-no-files-found: error
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: romx-*
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "ROMX ${GITHUB_REF_NAME}" \
+            --generate-notes

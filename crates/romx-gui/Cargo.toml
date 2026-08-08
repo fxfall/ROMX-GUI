@@ -1,0 +1,24 @@
+[package]
+name = "romx-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform Slint GUI for ROMX"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]
+romx-core = { path = "../romx-core" }
+# Keep the GUI runtime small: use winit plus the software renderer and avoid
+# Slint's default Skia/femtovg, accessibility, system-tray, and extra backend features.
+slint = { version = "1.17", default-features = false, features = ["backend-winit", "renderer-software", "compat-1-2", "raw-window-handle-06"] }
+rfd = "0.15"
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6"
+objc2 = "0.5.2"
+objc2-app-kit = { version = "0.2.2", default-features = false, features = ["NSColor", "NSResponder", "NSView", "NSWindow"] }
+
+[build-dependencies]
+slint-build = "1.17"

@@ -1,7 +1,8 @@
 use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgb};
 use romx_core::{
     classify_gb_payload, crc32, normalize_cover_bytes, pack_bytes, pack_bytes_with_crc32,
-    pack_bytes_with_options, read_bytes, FLAG_BODY_SHA256, FLAG_COVER, FLAG_METADATA,
+    pack_bytes_with_options, read_bytes, read_metadata_cover_bytes, read_metadata_cover_path,
+    FLAG_BODY_SHA256, FLAG_COVER, FLAG_METADATA,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -44,6 +45,30 @@ fn custom_crc32_overrides_lookup_key_but_not_footer_integrity() {
     assert_eq!(document.metadata.as_ref().unwrap()["crc32"], "a1b2c3d4");
     let expected_hash: [u8; 32] = Sha256::digest(rom).into();
     assert_eq!(document.footer.rom_sha256, expected_hash);
+}
+
+#[test]
+fn preview_reader_loads_only_footer_metadata_and_cover() {
+    let metadata = json!({
+        "schema_version": "1.0",
+        "label": "Preview",
+        "platform": "gba",
+        "payload_format": "gba"
+    });
+    let cover = b"\x89PNG\r\n\x1a\npreview";
+    let bytes = pack_bytes(&vec![7u8; 4096], Some(&metadata), Some(cover)).unwrap();
+    let preview = read_metadata_cover_bytes(&bytes).unwrap();
+    assert_eq!(preview.footer.rom.size, 4096);
+    assert_eq!(preview.metadata.as_ref().unwrap()["label"], "Preview");
+    assert_eq!(preview.cover.as_deref(), Some(cover.as_slice()));
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("preview.gbax");
+    std::fs::write(&path, bytes).unwrap();
+    let from_path = read_metadata_cover_path(&path).unwrap();
+    assert_eq!(from_path.footer, preview.footer);
+    assert_eq!(from_path.metadata, preview.metadata);
+    assert_eq!(from_path.cover, preview.cover);
 }
 
 #[test]
