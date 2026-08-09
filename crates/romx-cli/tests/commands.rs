@@ -4,7 +4,13 @@ use std::path::Path;
 use std::process::{Command, Output};
 use tempfile::tempdir;
 
-const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x20";
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x02, 0x00,
+    0x00, 0x05, 0x00, 0x01, 0x7a, 0x5e, 0xab, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+];
 
 fn romx(args: &[&Path], literals: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_romx"));
@@ -30,7 +36,7 @@ fn pack_inspect_verify_and_extract_commands_work() {
         &metadata,
         serde_json::to_vec(&json!({
             "schema_version": "1.0",
-            "label": "CLI Test",
+            "name": "CLI Test",
             "platform": "gba",
             "payload_format": "gba"
         }))
@@ -58,7 +64,7 @@ fn pack_inspect_verify_and_extract_commands_work() {
     let inspect = romx(&[&packed], &["inspect"]);
     assert!(inspect.status.success());
     let info: Value = serde_json::from_slice(&inspect.stdout).unwrap();
-    assert_eq!(info["metadata"]["label"], "CLI Test");
+    assert_eq!(info["metadata"]["name"], "CLI Test");
     assert_eq!(info["has_cover"], true);
 
     let verify = romx(&[&packed], &["verify"]);

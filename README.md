@@ -36,11 +36,15 @@ The current GUI provides:
 - ROMX verification and extraction;
 - simplified Chinese/English switching and portable minimize/maximize/close controls.
 
-The GUI uses process-local temporary playlists with English names such as
-`temp-single-01.lpl`, `temp-list-01.lpl`, and `temp-list-01-2.lpl`. Single-file
-packing and LPL conversion both pass an LPL directly to `romx-core`. During a
-single-item edit, `temp-list-01-2.lpl` is converted independently; Save merges
-it into `temp-list-01.lpl`, while Back removes the edit playlist. The temporary
+The GUI uses process-local extended temporary playlists with English names such
+as `temp-single-01.lplx`, `temp-list-01.lplx`, and `temp-list-01-2.lplx`.
+Single-file packing and LPL conversion pass these LPLX files directly to
+`romx-core`. Each LPLX item keeps official RetroArch fields at the item root,
+stores ROMX-only fields under a `metadata` object, and may specify a
+`cover_path` file or directory. A selected `core_path`/`core_name` therefore
+travels unchanged through the GUI conversion. During a single-item edit,
+`temp-list-01-2.lplx` is converted independently; Save merges it into
+`temp-list-01.lplx`, while Back removes the edit playlist. The temporary
 workspace is removed when a playlist is replaced or the GUI exits.
 
 ### GUI locales
@@ -54,11 +58,11 @@ values, and add the language to the Slint language selector.
 
 ## Workspace
 
-- `crates/romx-core`: Rust implementation of ROMX 1.0 binary packing, footer parsing, validation, SHA-256 checks, PNG cover checks, and extraction.
+- `crates/romx-core`: Rust implementation of the frozen ROMX 1.0 / metadata 1.0 container, strict footer and region validation, optional body SHA-256, structural PNG validation, payload salvage, extraction, and LPL conversion.
 - `crates/romx-cli`: command-line interface for Core file operations and LPL import/export.
 - `crates/romx-gui`: Slint + Rust desktop GUI. It calls `romx-core` directly and is intended to target macOS, Windows, and Linux.
 
-The current release line is `0.2`, represented as SemVer `0.2.2`. The single
+The current release line is `0.3`, represented as SemVer `0.3.0`. The single
 version source is `[workspace.package]` in the root `Cargo.toml`; all crates
 inherit it. Rust callers can read `romx_core::APP_VERSION` or call
 `romx_core::application_version()`, and the CLI exposes the same value through
@@ -68,20 +72,35 @@ inherit it. Rust callers can read `romx_core::APP_VERSION` or call
 
 The core exposes byte-oriented functions for GUI and CLI callers:
 
-- `pack_bytes` / `pack_to_path`: create a ROMX container from an unchanged ROM, JSON metadata, and an optional PNG/JPG/JPEG/WebP/GIF/BMP cover. PNG bytes are preserved by default; other formats are normalized to PNG. They always regenerate metadata `crc32` from the original ROM.
-- `pack_bytes_with_crc32` / `pack_to_path_with_crc32`: the same operations with an explicit eight-digit CRC32 lookup override; footer SHA-256 still covers the actual ROM.
+- `pack_bytes` / `pack_to_path`: create the canonical `payload | metadata | cover | footer` container from an unchanged ROM, strict metadata 1.0, and an optional structurally valid PNG. Metadata `crc32` is regenerated from the original ROM.
+- `pack_bytes_with_crc32` / `pack_to_path_with_crc32`: the same operations with an explicit eight-digit CRC32 lookup override. ROMX 1.0 does not store a payload SHA-256 in the footer; the `0x38..0x58` field is reserved.
+- `pack_bytes_with_writer_options` / `pack_to_path_with_writer_options`: expose the writer options, including opt-in body SHA-256 and atomic publication.
 - `normalize_cover_bytes` / `normalize_cover_path`: accept PNG, JPG/JPEG, WebP, GIF, and BMP; preserve PNG bytes by default, or convert/resize any supported format to an exact PNG resolution.
-- `read_bytes` / `read_path`: parse and validate footer, regions, metadata, cover, and hashes.
+- `read_bytes` / `read_path`: validate the footer, complete body coverage, and optional body hash; invalid optional metadata/cover is ignored so the ROM payload can be salvaged.
+- `validate_bytes` / `validate_path`: return component-level validation status, calculated payload CRC32/SHA-256, and cover information.
 - `read_metadata_cover_bytes` / `read_metadata_cover_path`: lightweight preview readers that load only the footer, metadata, and optional cover; they intentionally skip the ROM payload and payload/body hash checks.
 - `extract_to_dir`: write the embedded payload, metadata, and cover to a directory.
 - `required_metadata`: create the four required metadata fields for a GUI form.
 - `classify_gb_payload`: apply the `0xC0`/`0x80` Game Boy CGB-flag policy.
-- `crc32` / `normalize_crc32`: calculate or validate the RetroArch/database lookup key; footer SHA-256 remains the integrity check.
+- `crc32` / `normalize_crc32`: calculate or validate the RetroArch/database lookup key; body SHA-256 is an optional container integrity check, while payload SHA-256 is a derived API value.
 - `plan_lpl_import`: resolve every LPL item to its ROM and optional thumbnail without copying large payloads; intended for GUI import previews.
-- `import_lpl`: convert an LPL and its ROM/thumbnail tree to sequential ROMX files plus a manifest. With no roots, real absolute ROM paths and RetroArch virtual `/roms/...` paths are resolved from the LPL location, and the sibling thumbnail tree is inferred; useful LPL fields become metadata and frontend-only fields are preserved under `x-retroarch`.
-- `export_lpl`: extract a ROMX directory to a RetroArch-compatible ROM, thumbnail, and playlist tree.
+- `import_lpl`: convert an `.lpl` or extended `.lplx` and its ROM/thumbnail tree to sequential ROMX files plus a manifest. With no roots, real absolute ROM paths and RetroArch virtual `/roms/...` paths are resolved from the playlist location, and the sibling thumbnail tree is inferred. LPLX `metadata` fields are merged with corresponding LPL fields (`label`→`name`, path extension→`payload_format`, `db_name`→`platform`, CRC/serial identity), while playlist-only core fields are retained in the manifest. `cover_path` may point to an individual cover or a directory indexed by ROM stem.
+- `export_lpl`: extract a ROMX directory to a RetroArch-compatible ROM, thumbnail, and playlist tree. The generated `.lpl` is filtered to RetroArch's official root/item fields; ROMX-only metadata and custom thumbnail path keys are not written into the playlist.
 
-The core does not start an emulator and does not contain UI code. LPL integration will be added above this format layer so the same binary implementation is shared by the GUI and future CLI.
+### RetroArch playlist fields
+
+The core's official field lists follow RetroArch's current `playlist.c` reader and
+writer. Root fields are `version`, `default_core_path`, `default_core_name`,
+`base_content_directory`, `label_display_mode`, `right_thumbnail_mode`,
+`left_thumbnail_mode`, `thumbnail_match_mode`, `sort_mode`, the `scan_*`
+configuration fields, and `items`. Item fields include the usual `path`,
+`label`, `core_path`, `core_name`, `crc32`, and `db_name`, plus `entry_slot`,
+subsystem fields, runtime counters, and last-played date/time fields. The
+exporter writes only these allowlisted fields.
+
+The core does not start an emulator and does not contain UI code. LPL/LPLX
+conversion is implemented above the binary format layer so the same behavior is
+shared by the GUI and CLI.
 
 ## Local development
 
@@ -129,7 +148,7 @@ builds and tests native arm64 and x86_64 packages for macOS, Linux, and Windows.
 The GUI release
 layouts are platform-native: macOS archives contain `romx-gui.app`, Linux
 archives contain the single `romx-gui` executable, and Windows archives contain
-the single `romx-gui.exe`. Pushing a tag such as `v0.2.2` additionally attaches
+the single `romx-gui.exe`. Pushing a tag such as `v0.3.0` additionally attaches
 the archives and SHA-256 files to the GitHub release. A manual workflow run
 creates downloadable Actions artifacts without publishing a release.
 
@@ -158,6 +177,7 @@ Pack, inspect, verify, and extract a ROMX file:
 # Optional database identity override; otherwise CRC32 is regenerated from game.gba.
 ./target/release/romx pack game.gba metadata.json --crc32 0123abcd --output game.gbax
 ./target/release/romx inspect game.gbax
+./target/release/romx validate game.gbax
 ./target/release/romx verify game.gbax
 ./target/release/romx extract game.gbax --output extracted
 ```

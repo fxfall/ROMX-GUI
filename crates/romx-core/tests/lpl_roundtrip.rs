@@ -8,7 +8,13 @@ use std::fs;
 use std::io::Cursor;
 use tempfile::tempdir;
 
-const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x20";
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x02, 0x00,
+    0x00, 0x05, 0x00, 0x01, 0x7a, 0x5e, 0xab, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+];
 
 #[test]
 fn lpl_import_and_export_preserve_payload_metadata_and_cover() {
@@ -51,18 +57,16 @@ fn lpl_import_and_export_preserve_payload_metadata_and_cover() {
     assert_eq!(imported.imported, 1);
     let document = read_path(&imported.output_files[0]).unwrap();
     assert_eq!(document.rom, b"real-rom-bytes");
-    assert_eq!(document.metadata.as_ref().unwrap()["label"], "中文/Game");
+    assert_eq!(document.metadata.as_ref().unwrap()["name"], "中文/Game");
     assert_eq!(document.metadata.as_ref().unwrap()["crc32"], "6b8a1dc0");
-    assert_eq!(
-        document.metadata.as_ref().unwrap()["x-retroarch"]["core_name"],
-        "FBNeo"
-    );
-    assert_eq!(
-        document.metadata.as_ref().unwrap()["x-retroarch"]["source_crc32"],
-        "DEADBEEF|crc"
-    );
-    assert_eq!(document.metadata.as_ref().unwrap()["cover"]["width"], 16);
-    assert_eq!(document.metadata.as_ref().unwrap()["cover"]["height"], 32);
+    assert!(document
+        .metadata
+        .as_ref()
+        .unwrap()
+        .get("x-retroarch")
+        .is_none());
+    assert_eq!(document.metadata.as_ref().unwrap()["cover"]["width"], 1);
+    assert_eq!(document.metadata.as_ref().unwrap()["cover"]["height"], 1);
     assert_eq!(document.cover.as_deref(), Some(PNG));
 
     let export_root = root.path().join("export");
@@ -101,10 +105,69 @@ fn lpl_import_and_export_preserve_payload_metadata_and_cover() {
     assert!(single.rom_dir.join("game.gba").is_file());
     let custom_lpl: Value = serde_json::from_slice(&fs::read(&single.lpl_path).unwrap()).unwrap();
     assert_eq!(custom_lpl["items"][0]["path"], "/custom/roms/game.gba");
-    assert_eq!(
-        custom_lpl["items"][0]["cover_path"],
-        "/custom/covers/game.png"
-    );
+    assert!(custom_lpl["items"][0].get("cover_path").is_none());
+    assert!(single.cover_dir.join("game.png").is_file());
+}
+
+#[test]
+fn lplx_carries_romx_metadata_and_core_but_lpl_export_is_official_only() {
+    let root = tempdir().unwrap();
+    let rom_path = root.path().join("game.gba");
+    let cover_dir = root.path().join("covers");
+    fs::write(&rom_path, b"lplx-rom").unwrap();
+    fs::create_dir_all(&cover_dir).unwrap();
+    fs::write(cover_dir.join("game.png"), PNG).unwrap();
+    let lplx_path = root.path().join("custom.lplx");
+    fs::write(
+        &lplx_path,
+        serde_json::to_vec(&json!({
+            "version": "1.5",
+            "scan_content_dir": "/roms",
+            "unknown_root": true,
+            "items": [{
+                "path": rom_path,
+                "label": "Playlist Label",
+                "core_path": "/cores/gba_libretro.dylib",
+                "core_name": "GBA Core",
+                "db_name": "Nintendo - Game Boy Advance.lpl",
+                "cover_path": cover_dir,
+                "metadata": {
+                    "developer": "ROMX Developer",
+                    "genre": ["RPG"],
+                    "cover": {"mime_type": "image/png", "width": 1, "height": 1},
+                    "unknown_item": "discard me"
+                }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let romx_dir = root.path().join("romx");
+    let imported = import_lpl(&lplx_path, &romx_dir, &ImportLplOptions::default()).unwrap();
+    let document = read_path(&imported.output_files[0]).unwrap();
+    let metadata = document.metadata.as_ref().unwrap();
+    assert_eq!(metadata["name"], "Playlist Label");
+    assert_eq!(metadata["platform"], "gba");
+    assert_eq!(metadata["payload_format"], "gba");
+    assert_eq!(metadata["developer"], "ROMX Developer");
+    assert_eq!(metadata["genre"], json!(["RPG"]));
+    assert_eq!(metadata["cover"]["mime_type"], "image/png");
+    assert_eq!(document.cover.as_deref(), Some(PNG));
+    assert!(metadata.get("unknown_item").is_none());
+
+    let exported = export_lpl(&romx_dir, &root.path().join("export"), &Default::default()).unwrap();
+    let lpl: Value = serde_json::from_slice(&fs::read(exported.lpl_path).unwrap()).unwrap();
+    let root_object = lpl.as_object().unwrap();
+    assert_eq!(root_object["scan_content_dir"], "/roms");
+    assert!(root_object.get("unknown_root").is_none());
+    let item = lpl["items"][0].as_object().unwrap();
+    assert_eq!(item["core_path"], "/cores/gba_libretro.dylib");
+    assert_eq!(item["core_name"], "GBA Core");
+    assert_eq!(item["db_name"], "Nintendo - Game Boy Advance.lpl");
+    assert!(item.get("developer").is_none());
+    assert!(item.get("unknown_item").is_none());
+    assert!(item.get("cover_path").is_none());
 }
 
 #[test]

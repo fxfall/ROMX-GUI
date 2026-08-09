@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use romx_core::{
-    export_lpl, extract_to_dir, import_lpl, pack_to_path_with_options, read_path, ExportLplOptions,
-    ImportLplOptions,
+    export_lpl, extract_to_dir, import_lpl, pack_to_path_with_options, read_metadata_cover_path,
+    validate_path, ExportLplOptions, ImportLplOptions,
 };
 use serde_json::json;
 use std::error::Error;
@@ -25,7 +25,9 @@ enum Command {
     Pack(PackArgs),
     /// Print validated ROMX footer and metadata information as JSON.
     Inspect { romx: PathBuf },
-    /// Validate a ROMX container, including regions and SHA-256 hashes.
+    /// Validate the ROMX structure and report component statuses as JSON.
+    Validate { romx: PathBuf },
+    /// Validate a ROMX container, including regions, optional metadata/cover, and body SHA-256.
     Verify { romx: PathBuf },
     /// Extract the payload, metadata, and optional cover from a ROMX container.
     Extract(ExtractArgs),
@@ -44,7 +46,7 @@ struct PackArgs {
     /// Output ROMX path.
     #[arg(short, long)]
     output: PathBuf,
-    /// Optional PNG/JPEG/WebP/GIF/BMP cover.
+    /// Optional PNG cover; common image formats are normalized by the CLI adapter.
     #[arg(long)]
     cover: Option<PathBuf>,
     /// Normalize the cover to an exact WIDTHxHEIGHT PNG.
@@ -164,10 +166,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             println!("packed ROMX: {}", args.output.display());
         }
         Command::Inspect { romx } => {
-            let document = read_path(&romx)?;
-            let footer = &document.footer;
+            let preview = read_metadata_cover_path(&romx)?;
+            let footer = &preview.footer;
             let value = json!({
                 "path": romx,
+                "spec_version": romx_core::SPEC_VERSION,
                 "version": footer.version,
                 "rom_offset": footer.rom.offset,
                 "rom_size": footer.rom.size,
@@ -176,15 +179,33 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 "cover_offset": footer.cover.offset,
                 "cover_size": footer.cover.size,
                 "flags": footer.flags,
-                "rom_sha256": hex(&footer.rom_sha256),
+                "reserved": hex(&footer.reserved),
                 "body_sha256": hex(&footer.body_sha256),
-                "metadata": document.metadata,
-                "has_cover": document.cover.is_some(),
+                "metadata": preview.metadata,
+                "has_cover": preview.cover.is_some(),
             });
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
+        Command::Validate { romx } => {
+            let report = validate_path(&romx)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "path": romx,
+                    "structure": format!("{:?}", report.structure),
+                    "payload_hashes": format!("{:?}", report.payload_hashes),
+                    "body_sha256": format!("{:?}", report.body_sha256),
+                    "metadata": format!("{:?}", report.metadata),
+                    "cover": format!("{:?}", report.cover),
+                    "metadata_crc32": format!("{:?}", report.metadata_crc32),
+                    "computed_payload_crc32": report.computed_payload_crc32,
+                    "metadata_result": report.metadata_result,
+                    "cover_result": report.cover_result,
+                }))?
+            );
+        }
         Command::Verify { romx } => {
-            read_path(&romx)?;
+            validate_path(&romx)?;
             println!("valid ROMX: {}", romx.display());
         }
         Command::Extract(args) => {

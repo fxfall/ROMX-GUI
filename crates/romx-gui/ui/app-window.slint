@@ -22,6 +22,7 @@ export component MainWindow inherits Window {
     in-out property <int> pack_subpage: 0;
     // 0 = English, 1 = Simplified Chinese.
     in-out property <int> language_index: 0;
+    in-out property <string> app_version;
 
     in-out property <string> rom_path;
     in-out property <string> cover_path;
@@ -29,20 +30,16 @@ export component MainWindow inherits Window {
     in-out property <string> save_path;
     in-out property <image> cover_preview;
 
+    // Editable metadata mirrors the LPLX/ROMX metadata contract.
     in-out property <string> display_title;
-    in-out property <string> sort_title;
-    in-out property <string> original_title;
+    in-out property <string> genre;
+    in-out property <string> platform: "gba";
     in-out property <string> developer;
     in-out property <string> release_date;
-    in-out property <string> version;
-    in-out property <string> game_id;
-    in-out property <string> region_code: "JP";
-    in-out property <string> description;
-    in-out property <string> tags;
+    in-out property <string> origin;
 
     in-out property <int> resolution_index: 0;
-    in-out property <string> custom_width: "512";
-    in-out property <string> custom_height: "512";
+    in-out property <string> custom_resolution: "512 × 512";
     in-out property <bool> conflict_visible: false;
     in-out property <string> conflict_path;
     in-out property <bool> error_visible: false;
@@ -144,16 +141,16 @@ export component MainWindow inherits Window {
         background: #202938;
 
         VerticalBox {
-            x: 14px;
+            x: 0px;
             y: 16px;
-            width: parent.width - 28px;
+            width: parent.width - 0px;
             height: parent.height - 32px;
             spacing: 6px;
 
             Text {
-                text: "ROMX";
+                text: "ROMX v" + root.app_version;
                 color: #ffffff;
-                font-size: 24px;
+                font-size: 22px;
                 font-weight: 700;
                 height: 34px;
             }
@@ -167,9 +164,11 @@ export component MainWindow inherits Window {
             }
             VerticalBox {
                 x: 8px;
+                width: parent.width - 30px;
                 spacing: 4px;
                 Button {
-                text: root.translate("game_file", root.language_index);
+                    text: root.translate("game_file", root.language_index);
+                    width: parent.width;
                     height: 30px;
                     clicked => {
                         root.active_page = 0;
@@ -177,7 +176,8 @@ export component MainWindow inherits Window {
                     }
                 }
                 Button {
-                text: root.translate("lpl_file", root.language_index);
+                    text: root.translate("lpl_file", root.language_index);
+                    width: parent.width;
                     height: 30px;
                     clicked => {
                         root.active_page = 0;
@@ -195,9 +195,11 @@ export component MainWindow inherits Window {
             }
             VerticalBox {
                 x: 8px;
+                width: parent.width - 30px;
                 spacing: 4px;
                 Button {
-                text: root.translate("romx_file_folder", root.language_index);
+                    text: root.translate("romx_file_folder", root.language_index);
+                    width: parent.width;
                     height: 30px;
                     clicked => {
                         root.active_page = 1;
@@ -206,8 +208,19 @@ export component MainWindow inherits Window {
             }
 
             Rectangle { vertical-stretch: 1; }
+            VerticalBox {
+                x: 8px;
+                width: parent.width - 30px;
+                spacing: 4px;
+                ComboBox {
+                    model: [root.translate("language_en", root.language_index), root.translate("language_zh", root.language_index)];
+                    current-index <=> root.language_index;
+                    width: parent.width;
+                    height: 30px;
+                }
+            }
             Text {
-            text: root.translate("app_subtitle", root.language_index);
+                text: root.translate("app_subtitle", root.language_index);
                 color: #9da8b8;
                 font-size: 11px;
                 wrap: word-wrap;
@@ -215,37 +228,11 @@ export component MainWindow inherits Window {
         }
     }
 
-    // The operating system provides the title bar and window controls.
-    Rectangle {
-        x: 184px;
-        y: 0px;
-        width: parent.width - 184px;
-        height: 58px;
-        background: #ffffff;
-
-        Text {
-            x: 18px;
-            y: 17px;
-            text: root.translate("app_title", root.language_index);
-            color: #202938;
-            font-size: 19px;
-            font-weight: 700;
-        }
-        ComboBox {
-            x: parent.width - 126px;
-            y: 14px;
-            width: 108px;
-            height: 30px;
-            model: [root.translate("language_en", root.language_index), root.translate("language_zh", root.language_index)];
-            current-index <=> root.language_index;
-        }
-    }
-
     if root.active_page == 0 && root.pack_subpage == 0: ScrollView {
         x: 204px;
-        y: 72px;
+        y: 16px;
         width: parent.width - 224px;
-        height: parent.height - 136px;
+        height: parent.height - 80px;
         viewport-width: 700px;
         VerticalBox {
             x: 0px;
@@ -415,33 +402,19 @@ export component MainWindow inherits Window {
                     GroupBox {
                         title: root.translate("cover_resolution", root.language_index);
                         width: 238px;
-                        height: 110px;
+                        height: 70px;
                         VerticalBox {
                             padding: 7px;
                             spacing: 5px;
-                            ComboBox {
+                            if root.resolution_index != 5: ComboBox {
                                 model: [root.translate("resolution_original", root.language_index), "256 × 224", "320 × 240", "512 × 512", "640 × 480", root.translate("resolution_custom", root.language_index)];
                                 current-index <=> root.resolution_index;
                                 height: 30px;
                             }
-                            HorizontalBox {
+                            if root.resolution_index == 5: LineEdit {
+                                text <=> root.custom_resolution;
+                                placeholder-text: root.translate("resolution_custom", root.language_index);
                                 height: 30px;
-                                spacing: 5px;
-                                LineEdit {
-                                    text <=> root.custom_width;
-                                    enabled: root.resolution_index == 5;
-                                    placeholder-text: root.translate("width", root.language_index);
-                                    width: 92px;
-                                    height: 30px;
-                                }
-                                Text { text: "×"; vertical-alignment: center; width: 14px; }
-                                LineEdit {
-                                    text <=> root.custom_height;
-                                    enabled: root.resolution_index == 5;
-                                    placeholder-text: root.translate("height", root.language_index);
-                                    width: 92px;
-                                    height: 30px;
-                                }
                             }
                         }
                     }
@@ -450,7 +423,7 @@ export component MainWindow inherits Window {
 
             Rectangle {
                 width: 700px;
-                height: 387px;
+                height: 275px;
                 Text {
                     x: 0px;
                     y: 0px;
@@ -464,7 +437,7 @@ export component MainWindow inherits Window {
                     x: 0px;
                     y: 60px;
                     width: 700px;
-                    height: 345px;
+                    height: 205px;
                     spacing: 5px;
                     HorizontalBox {
                         height: 30px;
@@ -473,13 +446,18 @@ export component MainWindow inherits Window {
                     }
                     HorizontalBox {
                         height: 30px;
-                        Text { text: root.translate("sort_title", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        LineEdit { text <=> root.sort_title; placeholder-text: root.translate("sort_title_placeholder", root.language_index); width: 350px; height: 30px; }
+                        Text { text: root.translate("genre", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        LineEdit { text <=> root.genre; placeholder-text: root.translate("genre_placeholder", root.language_index); width: 350px; height: 30px; }
                     }
                     HorizontalBox {
                         height: 30px;
-                        Text { text: root.translate("original_title", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        LineEdit { text <=> root.original_title; placeholder-text: root.translate("original_title_placeholder", root.language_index); width: 350px; height: 30px; }
+                        Text { text: root.translate("platform", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["gb", "gbc", "gba", "nes", "snes", "nds", "3ds", "genesis"];
+                            current-value <=> root.platform;
+                            width: 190px;
+                            height: 30px;
+                        }
                     }
                     HorizontalBox {
                         height: 30px;
@@ -493,33 +471,8 @@ export component MainWindow inherits Window {
                     }
                     HorizontalBox {
                         height: 30px;
-                        Text { text: root.translate("version", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        LineEdit { text <=> root.version; placeholder-text: root.translate("version", root.language_index); width: 350px; height: 30px; }
-                    }
-                    HorizontalBox {
-                        height: 30px;
-                        Text { text: root.translate("game_id", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        LineEdit { text <=> root.game_id; placeholder-text: root.translate("game_id", root.language_index); width: 350px; height: 30px; }
-                    }
-                    HorizontalBox {
-                        height: 30px;
-                        Text { text: root.translate("region_code", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        ComboBox {
-                            model: ["JP", "US", "EU", "CN", "KR", "WORLD", "OTHER"];
-                            current-value <=> root.region_code;
-                            width: 190px;
-                            height: 30px;
-                        }
-                    }
-                    HorizontalBox {
-                        height: 30px;
-                        Text { text: root.translate("description", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        LineEdit { text <=> root.description; placeholder-text: root.translate("description", root.language_index); width: 350px; height: 30px; }
-                    }
-                    HorizontalBox {
-                        height: 30px;
-                        Text { text: root.translate("tags", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        LineEdit { text <=> root.tags; placeholder-text: root.translate("tags_placeholder", root.language_index); width: 350px; height: 30px; }
+                        Text { text: root.translate("origin", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
+                        LineEdit { text <=> root.origin; placeholder-text: root.translate("origin_placeholder", root.language_index); width: 350px; height: 30px; }
                     }
                 }
             }
@@ -548,9 +501,9 @@ export component MainWindow inherits Window {
 
     if root.active_page == 0 && root.pack_subpage == 1: Rectangle {
         x: 204px;
-        y: 72px;
+        y: 16px;
         width: parent.width - 224px;
-        height: parent.height - 136px;
+        height: parent.height - 80px;
         background: #ffffff;
         border-radius: 8px;
         VerticalBox {
@@ -799,9 +752,9 @@ export component MainWindow inherits Window {
 
     if root.active_page == 1: Rectangle {
         x: 204px;
-        y: 72px;
+        y: 16px;
         width: parent.width - 224px;
-        height: parent.height - 136px;
+        height: parent.height - 80px;
         background: #ffffff;
         border-radius: 8px;
         VerticalBox {

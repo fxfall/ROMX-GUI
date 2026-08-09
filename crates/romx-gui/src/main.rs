@@ -5,8 +5,9 @@ slint::include_modules!();
 use image::ImageReader;
 use rfd::FileDialog;
 use romx_core::{
-    classify_gb_payload, export_lpl_with_output_handling, import_lpl_with_error_handling,
-    plan_lpl_import, read_metadata_cover_path, read_path, ExportLplOptions, ImportLplPlan,
+    application_version, classify_gb_payload, export_lpl_with_output_handling,
+    import_lpl_with_error_handling, plan_lpl_import, read_metadata_cover_path, read_path,
+    ExportLplOptions, ImportLplPlan, LPLX_METADATA_KEY, ROMX_LPLX_METADATA_FIELDS,
 };
 use serde_json::{Map, Value};
 use slint::{Image, ModelRc, SharedPixelBuffer, SharedString, VecModel};
@@ -77,7 +78,7 @@ impl LocaleCatalog {
             .cloned()
             .or_else(|| {
                 self.languages
-                    .get(0)
+                    .first()
                     .and_then(|language| language.get(key))
                     .cloned()
             })
@@ -211,7 +212,7 @@ struct PreviewTask {
     window: slint::Weak<MainWindow>,
 }
 
-fn start_preview_worker(generation: Arc<AtomicUsize>) -> Sender<PreviewTask> {
+fn start_preview_worker() -> Sender<PreviewTask> {
     let (sender, receiver) = mpsc::channel::<PreviewTask>();
     thread::spawn(move || {
         while let Ok(task) = receiver.recv() {
@@ -298,7 +299,7 @@ impl LplWorkspace {
         let _ = fs::remove_dir_all(&temp_dir);
         let preview_cache = Arc::new(Mutex::new(PreviewCache::new(6)));
         let preview_generation = Arc::new(AtomicUsize::new(0));
-        let preview_sender = start_preview_worker(preview_generation.clone());
+        let preview_sender = start_preview_worker();
         Self {
             source_path: None,
             work_path: None,
@@ -361,7 +362,7 @@ impl LplWorkspace {
     fn next_single_path(&mut self) -> PathBuf {
         let index = self.next_single_index;
         self.next_single_index = self.next_single_index.saturating_add(1);
-        self.temp_dir.join(format!("temp-single-{index:02}.lpl"))
+        self.temp_dir.join(format!("temp-single-{index:02}.lplx"))
     }
 
     fn next_list_path(&mut self) -> (u32, PathBuf) {
@@ -369,13 +370,13 @@ impl LplWorkspace {
         self.next_list_index = self.next_list_index.saturating_add(1);
         (
             index,
-            self.temp_dir.join(format!("temp-list-{index:02}.lpl")),
+            self.temp_dir.join(format!("temp-list-{index:02}.lplx")),
         )
     }
 
     fn new_edit_path(&self) -> Option<PathBuf> {
         self.list_index
-            .map(|index| self.temp_dir.join(format!("temp-list-{index:02}-2.lpl")))
+            .map(|index| self.temp_dir.join(format!("temp-list-{index:02}-2.lplx")))
     }
 }
 
@@ -677,13 +678,18 @@ fn resolution(window: &MainWindow) -> Result<Option<(u32, u32)>, String> {
         3 => Ok(Some((512, 512))),
         4 => Ok(Some((640, 480))),
         5 => {
-            let width = window
-                .get_custom_width()
+            let value = window.get_custom_resolution();
+            let value = value.trim();
+            let (width, height) = value
+                .split_once('×')
+                .or_else(|| value.split_once('x'))
+                .or_else(|| value.split_once('X'))
+                .ok_or_else(|| "Custom resolution must use WIDTH × HEIGHT".to_owned())?;
+            let width = width
                 .trim()
                 .parse::<u32>()
                 .map_err(|_| "Custom width must be a positive integer".to_owned())?;
-            let height = window
-                .get_custom_height()
+            let height = height
                 .trim()
                 .parse::<u32>()
                 .map_err(|_| "Custom height must be a positive integer".to_owned())?;
@@ -708,115 +714,297 @@ fn load_metadata(path: &str) -> Result<Value, Box<dyn std::error::Error>> {
 }
 
 fn text_or_empty(value: &Value, key: &str) -> String {
-    value
+    let result = value
         .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if result.is_empty() && key == "label" {
+        value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        result
+    }
+}
+
+fn metadata_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value
+        .get(LPLX_METADATA_KEY)
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(key))
+        .or_else(|| value.get(key))
+}
+
+fn metadata_text(value: &Value, key: &str) -> String {
+    metadata_value(value, key)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned()
 }
 
+fn metadata_genre_text(value: &Value) -> String {
+    match metadata_value(value, "genre") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(Value::String(value)) => value.clone(),
+        _ => String::new(),
+    }
+}
+
+fn parse_genre(value: &str) -> Value {
+    let mut genres = Vec::new();
+    for genre in value.split([',', '，', ';', '；']) {
+        let genre = genre.trim();
+        if !genre.is_empty() && !genres.iter().any(|item: &String| item == genre) {
+            genres.push(genre.to_owned());
+        }
+    }
+    Value::Array(genres.into_iter().map(Value::String).collect())
+}
+
+fn platform_for_path(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "gb" => "gb",
+        "gbc" => "gbc",
+        "gba" => "gba",
+        "nes" | "fds" => "nes",
+        "sfc" | "smc" => "snes",
+        "nds" => "nds",
+        "3ds" | "cci" | "cia" => "3ds",
+        "md" | "gen" | "smd" | "bin" => "genesis",
+        _ => "gba",
+    }
+}
+
+fn supported_platform(value: &str) -> bool {
+    matches!(
+        value,
+        "gb" | "gbc" | "gba" | "nes" | "snes" | "nds" | "3ds" | "genesis"
+    )
+}
+
 fn set_metadata_form(window: &MainWindow, value: &Value) {
-    window.set_display_title(text_or_empty(value, "label").into());
-    window.set_sort_title(text_or_empty(value, "sort_title").into());
-    window.set_original_title(text_or_empty(value, "original_title").into());
-    window.set_developer(text_or_empty(value, "developer").into());
-    window.set_release_date(text_or_empty(value, "release_date").into());
-    window.set_version(text_or_empty(value, "version").into());
-    window.set_game_id(text_or_empty(value, "game_id").into());
-    window.set_region_code(if text_or_empty(value, "region_code").is_empty() {
-        "JP".into()
+    let name = text_or_empty(value, "name");
+    let name = if name.is_empty() {
+        text_or_empty(value, "label")
     } else {
-        text_or_empty(value, "region_code").into()
-    });
-    window.set_description(text_or_empty(value, "description").into());
-    window.set_tags(text_or_empty(value, "tags").into());
+        name
+    };
+    let platform = metadata_text(value, "platform");
+    let origin = {
+        let origin = metadata_text(value, "origin");
+        if origin.is_empty() {
+            metadata_text(value, "country")
+        } else {
+            origin
+        }
+    };
+    window.set_display_title(name.into());
+    window.set_genre(metadata_genre_text(value).into());
+    window.set_platform(
+        if supported_platform(&platform) {
+            platform
+        } else {
+            "gba".to_owned()
+        }
+        .into(),
+    );
+    window.set_developer(metadata_text(value, "developer").into());
+    window.set_release_date(metadata_text(value, "release_date").into());
+    window.set_origin(origin.into());
 }
 
 fn build_metadata_with_base(
     window: &MainWindow,
     base: Option<&Value>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let mut metadata = if window.get_metadata_path().trim().is_empty() {
+    let source = if window.get_metadata_path().trim().is_empty() {
         base.cloned().unwrap_or_else(|| Value::Object(Map::new()))
     } else {
         load_metadata(&window.get_metadata_path())?
     };
-    let object = metadata
-        .as_object_mut()
+    let source = source
+        .as_object()
         .ok_or("Metadata root must be a JSON object")?;
+    let mut object = Map::new();
+    object.insert("schema_version".into(), Value::String("1.0".into()));
+    for key in ["developer", "origin"] {
+        if let Some(value) = source
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            object.insert(key.into(), Value::String(value.to_owned()));
+        }
+    }
     let fallback = path_stem(&window.get_rom_path());
     let label = if window.get_display_title().trim().is_empty() {
         fallback
     } else {
         window.get_display_title().trim().to_owned()
     };
-    object.insert("label".into(), Value::String(label));
+    object.insert("name".into(), Value::String(label));
+
+    let platform = window.get_platform().trim().to_owned();
     object.insert(
-        "sort_title".into(),
-        Value::String(window.get_sort_title().trim().into()),
+        "platform".into(),
+        Value::String(if supported_platform(&platform) {
+            platform
+        } else {
+            platform_for_path(&window.get_rom_path()).to_owned()
+        }),
     );
-    object.insert(
-        "original_title".into(),
-        Value::String(window.get_original_title().trim().into()),
-    );
-    object.insert(
-        "developer".into(),
-        Value::String(window.get_developer().trim().into()),
-    );
-    object.insert(
-        "release_date".into(),
-        Value::String(window.get_release_date().trim().into()),
-    );
-    object.insert(
-        "version".into(),
-        Value::String(window.get_version().trim().into()),
-    );
-    object.insert(
-        "game_id".into(),
-        Value::String(window.get_game_id().trim().into()),
-    );
-    object.insert(
-        "region_code".into(),
-        Value::String(window.get_region_code().trim().into()),
-    );
-    object.insert(
-        "description".into(),
-        Value::String(window.get_description().trim().into()),
-    );
-    object.insert(
-        "tags".into(),
-        Value::String(window.get_tags().trim().into()),
-    );
-    Ok(metadata)
+    if let Ok(format) = payload_format(&window.get_rom_path()) {
+        object.insert("payload_format".into(), Value::String(format));
+    } else if let Some(format) = source.get("payload_format").and_then(Value::as_str) {
+        object.insert("payload_format".into(), Value::String(format.to_owned()));
+    }
+    object.insert("genre".into(), parse_genre(&window.get_genre()));
+    let developer_value = window.get_developer();
+    let developer = developer_value.trim();
+    if developer.is_empty() {
+        object.remove("developer");
+    } else {
+        object.insert("developer".into(), Value::String(developer.to_owned()));
+    }
+    let origin_value = window.get_origin();
+    let origin = origin_value.trim();
+    if origin.is_empty() {
+        object.remove("origin");
+    } else {
+        object.insert("origin".into(), Value::String(origin.to_owned()));
+    }
+    let release_date_value = window.get_release_date();
+    let release_date = release_date_value.trim();
+    if release_date.is_empty() {
+        object.remove("release_date");
+    } else {
+        object.insert(
+            "release_date".into(),
+            Value::String(release_date.to_owned()),
+        );
+    }
+    Ok(Value::Object(object))
+}
+
+fn lplx_metadata_object_mut(item: &mut Map<String, Value>) -> &mut Map<String, Value> {
+    item.entry(LPLX_METADATA_KEY)
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .expect("LPLX metadata must be an object")
+}
+
+fn set_lplx_metadata_value(item: &mut Map<String, Value>, key: &str, value: Value) {
+    lplx_metadata_object_mut(item).insert(key.into(), value);
 }
 
 fn copy_metadata_to_lpl_item(item: &mut Map<String, Value>, metadata: &Value) {
     let Some(metadata) = metadata.as_object() else {
         return;
     };
+    let mut display_name = None;
     for (key, value) in metadata {
         match key.as_str() {
-            "schema_version" | "platform" | "payload_format" | "cover" => {}
+            "name" => {
+                display_name = Some(value.clone());
+                set_lplx_metadata_value(item, key, value.clone());
+            }
+            key if key != "crc32" && ROMX_LPLX_METADATA_FIELDS.contains(&key) => {
+                set_lplx_metadata_value(item, key, value.clone());
+            }
             "x-retroarch" => {
                 let Some(retroarch) = value.as_object() else {
                     continue;
                 };
                 for (retroarch_key, retroarch_value) in retroarch {
-                    if retroarch_key == "extra" {
-                        if let Some(extra) = retroarch_value.as_object() {
-                            for (extra_key, extra_value) in extra {
-                                item.insert(extra_key.clone(), extra_value.clone());
-                            }
-                        }
-                    } else if retroarch_key == "source_crc32" {
-                        item.insert("crc32".into(), retroarch_value.clone());
+                    let lpl_key = if retroarch_key == "source_crc32" {
+                        "crc32"
                     } else {
-                        item.insert(retroarch_key.clone(), retroarch_value.clone());
+                        retroarch_key
+                    };
+                    if [
+                        "path",
+                        "label",
+                        "core_path",
+                        "core_name",
+                        "crc32",
+                        "db_name",
+                        "entry_slot",
+                        "subsystem_ident",
+                        "subsystem_name",
+                        "subsystem_roms",
+                        "runtime_hours",
+                        "runtime_minutes",
+                        "runtime_seconds",
+                        "last_played_year",
+                        "last_played_month",
+                        "last_played_day",
+                        "last_played_hour",
+                        "last_played_minute",
+                        "last_played_second",
+                    ]
+                    .contains(&lpl_key)
+                    {
+                        item.insert(lpl_key.into(), retroarch_value.clone());
                     }
                 }
             }
+            _ => {}
+        }
+    }
+    if let Some(display_name) = display_name {
+        item.insert("label".into(), display_name);
+    }
+    let metadata_object = lplx_metadata_object_mut(item);
+    metadata_object
+        .entry("schema_version")
+        .or_insert_with(|| Value::String("1.0".into()));
+}
+
+fn ensure_lplx_metadata(item: &mut Map<String, Value>, label: &str) {
+    let legacy = ROMX_LPLX_METADATA_FIELDS
+        .iter()
+        .filter_map(|key| {
+            if *key == "crc32" {
+                return None;
+            }
+            let value = item.get(*key)?.clone();
+            // A string in the legacy `cover` key is a cover path; an object
+            // is the ROMX cover descriptor and belongs in metadata.
+            let should_move = *key != "cover" || value.is_object();
+            should_move.then(|| ((*key).to_owned(), value))
+        })
+        .collect::<Vec<_>>();
+    let metadata = lplx_metadata_object_mut(item);
+    for (key, value) in legacy {
+        metadata.entry(key).or_insert(value);
+    }
+    metadata
+        .entry("schema_version")
+        .or_insert_with(|| Value::String("1.0".into()));
+    metadata
+        .entry("name")
+        .or_insert_with(|| Value::String(label.to_owned()));
+    for key in ROMX_LPLX_METADATA_FIELDS {
+        match *key {
+            "crc32" => {}
+            "cover" if item.get(*key).is_some_and(Value::is_string) => {}
             _ => {
-                item.insert(key.clone(), value.clone());
+                item.remove(*key);
             }
         }
     }
@@ -846,7 +1034,7 @@ fn create_single_lpl(
         Value::String(rom_path.to_string_lossy().into_owned()),
     );
     copy_metadata_to_lpl_item(&mut item, &metadata);
-    if let Some(cover_path) = cover_reference.as_deref().filter(|path| path.is_file()) {
+    if let Some(cover_path) = cover_reference.as_deref().filter(|path| path.exists()) {
         item.insert(
             "cover_path".into(),
             Value::String(absolute_path(cover_path).to_string_lossy().into_owned()),
@@ -902,6 +1090,9 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
                     .unwrap_or_else(|| Value::Object(Map::new()));
                 workspace.borrow_mut().romx_metadata = Some(metadata.clone());
                 set_metadata_form(window, &metadata);
+                if !supported_platform(&metadata_text(&metadata, "platform")) {
+                    window.set_platform(platform_for_path(&path_string).into());
+                }
                 if window.get_display_title().trim().is_empty() {
                     window.set_display_title(path_stem(&path_string).into());
                 }
@@ -943,8 +1134,11 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
                 );
             }
         }
-    } else if window.get_display_title().trim().is_empty() {
-        window.set_display_title(path_stem(&path_string).into());
+    } else {
+        if window.get_display_title().trim().is_empty() {
+            window.set_display_title(path_stem(&path_string).into());
+        }
+        window.set_platform(platform_for_path(&path_string).into());
     }
     if !is_romx {
         set_status(
@@ -1024,7 +1218,7 @@ fn write_json_file(path: &Path, value: &Value) -> Result<(), Box<dyn std::error:
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temporary = path.with_extension("lpl.tmp");
+    let temporary = path.with_extension("lplx.tmp");
     fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
     if let Err(error) = fs::rename(&temporary, path) {
         let _ = fs::remove_file(path);
@@ -1164,7 +1358,7 @@ fn resolve_original_cover(lpl_path: &Path, item: &Map<String, Value>) -> Option<
                     .join(path)
             }
         })
-        .find(|path| path.is_file())
+        .find(|path| path.exists())
         .map(|path| absolute_path(&path))
 }
 
@@ -1249,15 +1443,23 @@ fn prepare_lpl_workspace(
         let label = item
             .get("label")
             .and_then(Value::as_str)
+            .or_else(|| {
+                item.get(LPLX_METADATA_KEY)
+                    .and_then(Value::as_object)
+                    .and_then(|metadata| metadata.get("name"))
+                    .and_then(Value::as_str)
+            })
             .unwrap_or_else(|| {
                 rom_path
                     .file_stem()
                     .and_then(|value| value.to_str())
                     .unwrap_or("")
             });
-        let cover = find_workspace_cover(&cover_index, &rom_path, label)
+        let label = label.to_owned();
+        let cover = find_workspace_cover(&cover_index, &rom_path, &label)
             .or_else(|| resolve_original_cover(&base_path, item));
         set_lpl_cover_path(item, cover.as_deref());
+        ensure_lplx_metadata(item, &label);
     }
     let (list_index, work_path) = state.next_list_path();
     write_json_file(&work_path, &document)
@@ -1670,29 +1872,10 @@ fn start_pending_conversion(window: &MainWindow, workspace: &Rc<RefCell<LplWorks
             result
         };
         let final_result = result.and_then(|report| {
-            let manifest_destination = Path::new(&pending.save_path).join("manifest.json");
-            let destination_choice = resolve_output_destination(
-                &conflict_mode,
-                &prompt_sender,
-                &weak,
-                &cancel,
-                &manifest_destination,
-            );
-            match destination_choice {
-                Ok(Some((path, replace))) => {
-                    if let Err(error) = commit_staged(&report.manifest_path, &path, replace) {
-                        let _ = fs::remove_file(&report.manifest_path);
-                        return Err(romx_core::RomxError::Invalid(error));
-                    }
-                }
-                Ok(None) => {
-                    let _ = fs::remove_file(&report.manifest_path);
-                }
-                Err(error) => {
-                    let _ = fs::remove_file(&report.manifest_path);
-                    return Err(error);
-                }
-            }
+            // The GUI output directory contains only the converted ROMX
+            // files. Core still creates a temporary manifest internally for
+            // export compatibility, but it is not part of GUI output.
+            let _ = fs::remove_file(&report.manifest_path);
             let collision_skipped = collision_skipped.load(Ordering::Relaxed);
             let imported = report.imported;
             Ok((report, imported, collision_skipped))
@@ -1923,7 +2106,7 @@ fn refresh_lpl_preview(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>
                 localized_text(window, "lpl_read_failed", "Failed to read LPL").into(),
             );
             window.set_lpl_detail_format("-".into());
-            window.set_lpl_detail_info(format!("{error}").into());
+            window.set_lpl_detail_info(error.to_string().into());
             window.set_cover_preview(Image::default());
             set_status(
                 window,
@@ -1935,11 +2118,20 @@ fn refresh_lpl_preview(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>
 }
 
 fn metadata_string(value: Option<&Value>, key: &str) -> String {
-    value
+    let result = value
         .and_then(|metadata| metadata.get(key))
         .and_then(Value::as_str)
         .unwrap_or_default()
-        .to_owned()
+        .to_owned();
+    if result.is_empty() && key == "label" {
+        value
+            .and_then(|metadata| metadata.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        result
+    }
 }
 
 fn select_lpl_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, index: i32) {
@@ -2549,16 +2741,30 @@ fn start_unpack_conversion(
 }
 
 fn lpl_item_value<'a>(item: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
-    item.get(key).or_else(|| {
-        item.get("x-retroarch")
-            .and_then(Value::as_object)
-            .and_then(|retroarch| retroarch.get("extra"))
-            .and_then(Value::as_object)
-            .and_then(|extra| extra.get(key))
-    })
+    item.get(LPLX_METADATA_KEY)
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(key))
+        .or_else(|| item.get(key))
+        .or_else(|| {
+            item.get("x-retroarch")
+                .and_then(Value::as_object)
+                .and_then(|retroarch| retroarch.get("extra"))
+                .and_then(Value::as_object)
+                .and_then(|extra| extra.get(key))
+        })
 }
 
 fn set_lpl_item_value(item: &mut Map<String, Value>, key: &str, value: Value) {
+    if ROMX_LPLX_METADATA_FIELDS.contains(&key) {
+        set_lplx_metadata_value(item, key, value.clone());
+        if key == "name" {
+            item.insert("label".into(), value);
+        }
+        return;
+    }
+    if key == "label" && item.contains_key(LPLX_METADATA_KEY) {
+        set_lplx_metadata_value(item, "name", value.clone());
+    }
     if item.contains_key(key) {
         item.insert(key.into(), value);
         return;
@@ -2577,26 +2783,37 @@ fn set_lpl_item_value(item: &mut Map<String, Value>, key: &str, value: Value) {
     item.insert(key.into(), value);
 }
 
+fn remove_lplx_metadata_value(item: &mut Map<String, Value>, key: &str) {
+    if let Some(metadata) = item
+        .get_mut(LPLX_METADATA_KEY)
+        .and_then(Value::as_object_mut)
+    {
+        metadata.remove(key);
+    }
+}
+
 fn lpl_item_metadata(item: &Map<String, Value>) -> Value {
     let mut metadata = Map::new();
     for key in [
-        "label",
-        "sort_title",
-        "original_title",
+        "name",
+        "genre",
+        "platform",
+        "payload_format",
         "developer",
         "release_date",
-        "version",
-        "game_id",
-        "region_code",
-        "description",
-        "tags",
+        "origin",
     ] {
         if let Some(value) = lpl_item_value(item, key) {
             metadata.insert(key.into(), value.clone());
         }
     }
-    if !metadata.contains_key("label") {
-        metadata.insert("label".into(), Value::String(String::new()));
+    if !metadata.contains_key("name") {
+        if let Some(value) = item.get("label") {
+            metadata.insert("name".into(), value.clone());
+        }
+    }
+    if !metadata.contains_key("name") {
+        metadata.insert("name".into(), Value::String(String::new()));
     }
     Value::Object(metadata)
 }
@@ -2709,6 +2926,9 @@ fn begin_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     window.set_metadata_path("".into());
     window.set_save_path(window.get_lpl_save_path());
     set_metadata_form(window, &metadata);
+    if !supported_platform(&metadata_text(&metadata, "platform")) {
+        window.set_platform(platform_for_path(&window.get_rom_path()).into());
+    }
     set_edit_cover(window, workspace, cover_path.as_deref());
     workspace.borrow_mut().current_index = Some(item_index as usize);
     window.set_editing_lpl_file(true);
@@ -2768,22 +2988,37 @@ fn update_lpl_edit_file(
     } else {
         window.get_display_title().trim().to_owned()
     };
-    set_lpl_item_value(item, "label", title.into());
+    set_lpl_item_value(item, "name", title.into());
+    set_lpl_item_value(item, "genre", parse_genre(&window.get_genre()));
+    set_lpl_item_value(
+        item,
+        "platform",
+        Value::String(if supported_platform(window.get_platform().trim()) {
+            window.get_platform().trim().to_owned()
+        } else {
+            platform_for_path(&rom_path_text).to_owned()
+        }),
+    );
+    let developer = window.get_developer().trim().to_owned();
+    let origin = window.get_origin().trim().to_owned();
     for (key, value) in [
-        ("sort_title", window.get_sort_title().trim().to_owned()),
-        (
-            "original_title",
-            window.get_original_title().trim().to_owned(),
-        ),
-        ("developer", window.get_developer().trim().to_owned()),
-        ("release_date", window.get_release_date().trim().to_owned()),
-        ("version", window.get_version().trim().to_owned()),
-        ("game_id", window.get_game_id().trim().to_owned()),
-        ("region_code", window.get_region_code().trim().to_owned()),
-        ("description", window.get_description().trim().to_owned()),
-        ("tags", window.get_tags().trim().to_owned()),
+        ("developer", developer.as_str()),
+        ("origin", origin.as_str()),
     ] {
-        set_lpl_item_value(item, key, value.into());
+        if value.is_empty() {
+            remove_lplx_metadata_value(item, key);
+        } else {
+            set_lpl_item_value(item, key, Value::String(value.to_owned()));
+        }
+    }
+    if window.get_release_date().trim().is_empty() {
+        remove_lplx_metadata_value(item, "release_date");
+    } else {
+        set_lpl_item_value(
+            item,
+            "release_date",
+            Value::String(window.get_release_date().trim().to_owned()),
+        );
     }
     let cover_path = if window.get_cover_path().trim().is_empty() {
         set_lpl_cover_path(item, None);
@@ -2860,7 +3095,7 @@ fn return_from_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace
     }
     if let Some(edit_path) = workspace.borrow_mut().edit_path.take() {
         let _ = fs::remove_file(&edit_path);
-        let _ = fs::remove_file(edit_path.with_extension("lpl.tmp"));
+        let _ = fs::remove_file(edit_path.with_extension("lplx.tmp"));
     }
     workspace.borrow_mut().current_index = None;
     window.set_editing_lpl_file(false);
@@ -2876,8 +3111,8 @@ fn return_from_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace
 
 fn choose_lpl(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     let Some(path) = FileDialog::new()
-        .set_title("Choose LPL file")
-        .add_filter("LPL", &["lpl"])
+        .set_title("Choose LPL/LPLX file")
+        .add_filter("LPL/LPLX", &["lpl", "lplx"])
         .pick_file()
     else {
         return;
@@ -2969,7 +3204,7 @@ fn convert_lpl(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
 
 fn remove_single_temp(path: &Path, payload_path: Option<&Path>) {
     let _ = fs::remove_file(path);
-    let _ = fs::remove_file(path.with_extension("lpl.tmp"));
+    let _ = fs::remove_file(path.with_extension("lplx.tmp"));
     if let Some(payload_path) = payload_path {
         let _ = fs::remove_file(payload_path);
     }
@@ -3127,15 +3362,7 @@ fn run_single_conversion(
             }
             commit_staged(generated_path, &output_path, replace)
                 .map_err(romx_core::RomxError::Invalid)?;
-
-            let manifest_destination = save_path.join("manifest.json");
-            let manifest_target = if manifest_destination.exists() && !replace {
-                renamed_target(&manifest_destination)
-            } else {
-                manifest_destination
-            };
-            commit_staged(&report.manifest_path, &manifest_target, replace)
-                .map_err(romx_core::RomxError::Invalid)?;
+            let _ = fs::remove_file(&report.manifest_path);
             Ok((report, output_path))
         });
         remove_single_temp(&temporary_lpl, temporary_payload.as_deref());
@@ -3308,6 +3535,7 @@ fn convert_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let window = MainWindow::new()?;
+    window.set_app_version(application_version().into());
     let lpl_workspace = Rc::new(RefCell::new(LplWorkspace::new()));
     {
         window.on_translate(|key, language_index| {
