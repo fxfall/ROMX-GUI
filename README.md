@@ -58,7 +58,7 @@ values, and add the language to the Slint language selector.
 - `crates/romx-cli`: command-line interface for Core file operations and LPL import/export.
 - `crates/romx-gui`: Slint + Rust desktop GUI. It calls `romx-core` directly and is intended to target macOS, Windows, and Linux.
 
-The current release line is `0.2`, represented as SemVer `0.2.1`. The single
+The current release line is `0.2`, represented as SemVer `0.2.2`. The single
 version source is `[workspace.package]` in the root `Cargo.toml`; all crates
 inherit it. Rust callers can read `romx_core::APP_VERSION` or call
 `romx_core::application_version()`, and the CLI exposes the same value through
@@ -129,7 +129,7 @@ builds and tests native arm64 and x86_64 packages for macOS, Linux, and Windows.
 The GUI release
 layouts are platform-native: macOS archives contain `romx-gui.app`, Linux
 archives contain the single `romx-gui` executable, and Windows archives contain
-the single `romx-gui.exe`. Pushing a tag such as `v0.2.1` additionally attaches
+the single `romx-gui.exe`. Pushing a tag such as `v0.2.2` additionally attaches
 the archives and SHA-256 files to the GitHub release. A manual workflow run
 creates downloadable Actions artifacts without publishing a release.
 

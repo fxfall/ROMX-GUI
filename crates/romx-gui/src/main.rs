@@ -526,15 +526,22 @@ fn retry_native_titlebar(weak: slint::Weak<MainWindow>, attempts_left: u8) {
     });
 }
 
-fn decode_preview_path(path: &Path) -> Result<DecodedPreview, Box<dyn std::error::Error>> {
-    let image = ImageReader::open(path)?.with_guessed_format()?.decode()?;
+fn decode_preview_path(path: &Path) -> Result<DecodedPreview, String> {
+    let image = ImageReader::open(path)
+        .map_err(|error| error.to_string())?
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?
+        .decode()
+        .map_err(|error| error.to_string())?;
     Ok(decoded_preview(image))
 }
 
-fn decode_preview_bytes(bytes: &[u8]) -> Result<DecodedPreview, Box<dyn std::error::Error>> {
+fn decode_preview_bytes(bytes: &[u8]) -> Result<DecodedPreview, String> {
     let image = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()?
-        .decode()?;
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?
+        .decode()
+        .map_err(|error| error.to_string())?;
     Ok(decoded_preview(image))
 }
 
@@ -562,18 +569,27 @@ fn decoded_preview_to_slint(preview: &DecodedPreview) -> Image {
     Image::from_rgb8(buffer)
 }
 
-fn preview_path_key(path: &Path) -> String {
-    let path = absolute_path(path);
-    let mut value = path.to_string_lossy().replace('\\', "/");
+fn normalized_path_string(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
     #[cfg(windows)]
     {
+        let mut value = value;
         if let Some(rest) = value.strip_prefix("//?/UNC/") {
             value = format!("//{rest}");
         } else if let Some(rest) = value.strip_prefix("//?/") {
             value = rest.to_owned();
         }
-        value = value.to_lowercase();
+        return value.to_lowercase();
     }
+    #[cfg(not(windows))]
+    {
+        value
+    }
+}
+
+fn preview_path_key(path: &Path) -> String {
+    let path = absolute_path(path);
+    let value = normalized_path_string(&path);
     let signature = fs::metadata(path)
         .ok()
         .map(|metadata| {
@@ -1030,18 +1046,7 @@ fn absolute_path(path: &Path) -> PathBuf {
 }
 
 fn path_identity(path: &Path) -> String {
-    let path = absolute_path(path);
-    let mut value = path.to_string_lossy().replace('\\', "/");
-    #[cfg(windows)]
-    {
-        if let Some(rest) = value.strip_prefix("//?/UNC/") {
-            value = format!("//{rest}");
-        } else if let Some(rest) = value.strip_prefix("//?/") {
-            value = rest.to_owned();
-        }
-        value = value.to_lowercase();
-    }
-    value
+    normalized_path_string(&absolute_path(path))
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
