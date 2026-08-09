@@ -35,7 +35,7 @@ fn pack_inspect_verify_and_extract_commands_work() {
     fs::write(
         &metadata,
         serde_json::to_vec(&json!({
-            "schema_version": "1.0",
+            "schema_version": "0.1.0",
             "name": "CLI Test",
             "platform": "gba",
             "payload_format": "gba"

@@ -1,6 +1,6 @@
-//! ROMX 1.0 core implementation.
+//! ROMX 0.1.0 core implementation.
 //!
-//! This crate follows the frozen ROMX 1.0 container and metadata contract.
+//! This crate follows the frozen ROMX 0.1.0 container and metadata contract.
 //! The binary reader is deliberately independent from filenames, playlists,
 //! image decoders, and emulators.  Image conversion remains available as an
 //! adapter for the desktop/CLI layer, while the ROMX writer itself accepts
@@ -28,7 +28,7 @@ pub use lpl::{
 
 pub const FOOTER_SIZE: usize = 128;
 pub const VERSION: u32 = 1;
-pub const SPEC_VERSION: &str = "1.0";
+pub const SPEC_VERSION: &str = "0.1.0";
 /// Current application release version, shared by Core, CLI, and GUI.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -85,7 +85,7 @@ pub struct Footer {
     pub rom: Region,
     pub metadata: Region,
     pub cover: Region,
-    /// Reserved bytes at footer offsets 0x38..0x58.  ROMX 1.0 does not store
+    /// Reserved bytes at footer offsets 0x38..0x58.  ROMX 0.1.0 does not store
     /// a payload SHA-256 in this field.
     pub reserved: [u8; 32],
     pub flags: u32,
@@ -175,7 +175,7 @@ impl Default for ValidationReport {
 
 #[derive(Debug, Clone)]
 pub struct PackOptions {
-    /// Disabled by default, as required by the ROMX 1.0 writer contract.
+    /// Disabled by default, as required by the ROMX 0.1.0 writer contract.
     pub body_sha256: bool,
     pub replace_existing: bool,
     pub crc32_override: Option<String>,
@@ -337,7 +337,7 @@ fn validate_ihdr(data: &[u8]) -> Option<CoverInfo> {
     valid_depth.then_some(CoverInfo { width, height })
 }
 
-/// Validate the structural PNG profile used by ROMX 1.0. Pixels are not
+/// Validate the structural PNG profile used by ROMX 0.1.0. Pixels are not
 /// decoded; chunk boundaries, CRCs, ordering, IHDR fields and limits are.
 pub fn validate_png_bytes(value: &[u8]) -> Result<CoverInfo, RomxError> {
     if value.len() > DEFAULT_MAX_COVER_SIZE as usize {
@@ -726,15 +726,13 @@ fn validate_cover_descriptor(value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
-    let Some(mime) = value_string(object, "mime_type") else {
-        return false;
-    };
-    if mime != "image/png" {
-        return false;
-    }
     for (key, value) in object {
         match key.as_str() {
-            "mime_type" => {}
+            "mime_type" => {
+                if value.as_str() != Some("image/png") {
+                    return false;
+                }
+            }
             "width" | "height" => {
                 if value.as_u64().is_none_or(|dimension| {
                     dimension == 0 || dimension > DEFAULT_MAX_COVER_DIMENSION as u64
@@ -802,7 +800,7 @@ fn validate_metadata_object(
         }
     }
     if value_string(object, "schema_version") != Some(SPEC_VERSION) {
-        return Err(RomxError::Metadata("schema_version must be 1.0".into()));
+        return Err(RomxError::Metadata("schema_version must be 0.1.0".into()));
     }
     let name = value_string(object, "name")
         .ok_or_else(|| RomxError::Metadata("metadata missing required field: name".into()))?;

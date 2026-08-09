@@ -18,7 +18,7 @@ const PNG: &[u8] = &[
 #[test]
 fn writer_uses_the_frozen_metadata_and_footer_contract() {
     let metadata = json!({
-        "schema_version": "1.0",
+        "schema_version": "0.1.0",
         "name": "Fixture",
         "platform": "gba",
         "payload_format": "gba",
@@ -44,7 +44,7 @@ fn writer_uses_the_frozen_metadata_and_footer_contract() {
 #[test]
 fn body_hash_is_opt_in_and_optional_regions_can_be_salvaged() {
     let metadata = json!({
-        "schema_version": "1.0",
+        "schema_version": "0.1.0",
         "name": "Fixture",
         "platform": "gb",
         "payload_format": "gb"
@@ -95,6 +95,22 @@ fn body_hash_is_opt_in_and_optional_regions_can_be_salvaged() {
 }
 
 #[test]
+fn empty_cover_descriptor_matches_the_frozen_schema() {
+    let metadata = json!({
+        "schema_version": "0.1.0",
+        "name": "Fixture",
+        "platform": "gba",
+        "payload_format": "gba",
+        "cover": {}
+    });
+    let bytes = pack_bytes(b"abc", Some(&metadata), None).unwrap();
+    assert_eq!(
+        read_bytes(&bytes).unwrap().metadata.unwrap()["cover"],
+        json!({})
+    );
+}
+
+#[test]
 fn duplicate_metadata_keys_are_rejected_by_path_writer() {
     let root = tempdir().unwrap();
     let rom = root.path().join("game.gb");
@@ -103,7 +119,7 @@ fn duplicate_metadata_keys_are_rejected_by_path_writer() {
     fs::write(&rom, b"abc").unwrap();
     fs::write(
         &metadata,
-        br#"{"schema_version":"1.0","name":"A","name":"B","platform":"gb","payload_format":"gb"}"#,
+        br#"{"schema_version":"0.1.0","name":"A","name":"B","platform":"gb","payload_format":"gb"}"#,
     )
     .unwrap();
     assert!(pack_to_path(&rom, Some(&metadata), None, &output).is_err());

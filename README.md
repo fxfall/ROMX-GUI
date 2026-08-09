@@ -58,11 +58,11 @@ values, and add the language to the Slint language selector.
 
 ## Workspace
 
-- `crates/romx-core`: Rust implementation of the frozen ROMX 1.0 / metadata 1.0 container, strict footer and region validation, optional body SHA-256, structural PNG validation, payload salvage, extraction, and LPL conversion.
+- `crates/romx-core`: Rust implementation of the frozen ROMX 0.1.0 container and metadata schema, strict footer and region validation, optional body SHA-256, structural PNG validation, payload salvage, extraction, and LPL conversion.
 - `crates/romx-cli`: command-line interface for Core file operations and LPL import/export.
 - `crates/romx-gui`: Slint + Rust desktop GUI. It calls `romx-core` directly and is intended to target macOS, Windows, and Linux.
 
-The current release line is `0.3`, represented as SemVer `0.3.1`. The single
+The current release line is `0.1`, represented as SemVer `0.1.0`. The single
 version source is `[workspace.package]` in the root `Cargo.toml`; all crates
 inherit it. Rust callers can read `romx_core::APP_VERSION` or call
 `romx_core::application_version()`, and the CLI exposes the same value through
@@ -72,8 +72,8 @@ inherit it. Rust callers can read `romx_core::APP_VERSION` or call
 
 The core exposes byte-oriented functions for GUI and CLI callers:
 
-- `pack_bytes` / `pack_to_path`: create the canonical `payload | metadata | cover | footer` container from an unchanged ROM, strict metadata 1.0, and an optional structurally valid PNG. Metadata `crc32` is regenerated from the original ROM.
-- `pack_bytes_with_crc32` / `pack_to_path_with_crc32`: the same operations with an explicit eight-digit CRC32 lookup override. ROMX 1.0 does not store a payload SHA-256 in the footer; the `0x38..0x58` field is reserved.
+- `pack_bytes` / `pack_to_path`: create the canonical `payload | metadata | cover | footer` container from an unchanged ROM, strict metadata 0.1.0, and an optional structurally valid PNG. Metadata `crc32` is regenerated from the original ROM.
+- `pack_bytes_with_crc32` / `pack_to_path_with_crc32`: the same operations with an explicit eight-digit CRC32 lookup override. ROMX 0.1.0 does not store a payload SHA-256 in the footer; the `0x38..0x58` field is reserved.
 - `pack_bytes_with_writer_options` / `pack_to_path_with_writer_options`: expose the writer options, including opt-in body SHA-256 and atomic publication.
 - `normalize_cover_bytes` / `normalize_cover_path`: accept PNG, JPG/JPEG, WebP, GIF, and BMP; preserve PNG bytes by default, or convert/resize any supported format to an exact PNG resolution.
 - `read_bytes` / `read_path`: validate the footer, complete body coverage, and optional body hash; invalid optional metadata/cover is ignored so the ROM payload can be salvaged.
@@ -148,7 +148,7 @@ builds and tests native arm64 and x86_64 packages for macOS, Linux, and Windows.
 The GUI release
 layouts are platform-native: macOS archives contain `romx-gui.app`, Linux
 archives contain the single `romx-gui` executable, and Windows archives contain
-the single `romx-gui.exe`. Pushing a tag such as `v0.3.1` additionally attaches
+the single `romx-gui.exe`. Pushing a tag such as `v0.1.0` additionally attaches
 the archives and SHA-256 files to the GitHub release. A manual workflow run
 creates downloadable Actions artifacts without publishing a release.
 

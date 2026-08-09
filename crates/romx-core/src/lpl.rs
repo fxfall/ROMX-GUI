@@ -1,6 +1,7 @@
 use crate::{
     classify_gb_payload, crc32, normalize_cover_path, normalize_crc32,
     pack_path_with_metadata_options, read_path, required_metadata, PackOptions, RomxError,
+    SPEC_VERSION,
 };
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -390,7 +391,7 @@ fn lplx_romx_metadata(
             object.insert("serial".into(), Value::String(value));
         }
     }
-    object.insert("schema_version".into(), Value::String("1.0".into()));
+    object.insert("schema_version".into(), Value::String(SPEC_VERSION.into()));
     metadata
 }
 

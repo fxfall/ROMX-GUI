@@ -19,7 +19,7 @@ const PNG: &[u8] = &[
 fn roundtrip_preserves_rom_metadata_and_png() {
     let rom = b"example-rom";
     let metadata = json!({
-        "schema_version": "1.0",
+        "schema_version": "0.1.0",
         "name": "Example",
         "platform": "gba",
         "payload_format": "gba"
@@ -40,7 +40,7 @@ fn roundtrip_preserves_rom_metadata_and_png() {
 fn custom_crc32_overrides_lookup_key_but_not_footer_integrity() {
     let rom = b"example-rom";
     let metadata = json!({
-        "schema_version": "1.0",
+        "schema_version": "0.1.0",
         "name": "Example",
         "platform": "gba",
         "payload_format": "gba",
@@ -58,7 +58,7 @@ fn custom_crc32_overrides_lookup_key_but_not_footer_integrity() {
 #[test]
 fn preview_reader_loads_only_footer_metadata_and_cover() {
     let metadata = json!({
-        "schema_version": "1.0",
+        "schema_version": "0.1.0",
         "name": "Preview",
         "platform": "gba",
         "payload_format": "gba"
@@ -110,7 +110,7 @@ fn cover_png_is_preserved_without_target_and_other_formats_are_png_converted() {
     );
 
     let metadata = json!({
-        "schema_version": "1.0",
+        "schema_version": "0.1.0",
         "name": "Cover metadata",
         "platform": "gba",
         "payload_format": "gba"
@@ -134,7 +134,7 @@ fn cover_png_is_preserved_without_target_and_other_formats_are_png_converted() {
 #[test]
 fn rejects_overlapping_regions() {
     let metadata =
-        json!({"schema_version":"1.0","name":"x","platform":"gba","payload_format":"gba"});
+        json!({"schema_version":"0.1.0","name":"x","platform":"gba","payload_format":"gba"});
     let mut bytes = pack_bytes(b"rom", Some(&metadata), None).unwrap();
     let footer_start = bytes.len() - 128;
     bytes[footer_start + 0x18..footer_start + 0x20].copy_from_slice(&0u64.to_le_bytes());

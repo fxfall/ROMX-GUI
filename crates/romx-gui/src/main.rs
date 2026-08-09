@@ -7,7 +7,7 @@ use rfd::FileDialog;
 use romx_core::{
     application_version, classify_gb_payload, export_lpl_with_output_handling,
     import_lpl_with_error_handling, plan_lpl_import, read_metadata_cover_path, read_path,
-    ExportLplOptions, ImportLplPlan, LPLX_METADATA_KEY, ROMX_LPLX_METADATA_FIELDS,
+    ExportLplOptions, ImportLplPlan, LPLX_METADATA_KEY, ROMX_LPLX_METADATA_FIELDS, SPEC_VERSION,
 };
 use serde_json::{Map, Value};
 use slint::{Image, ModelRc, SharedPixelBuffer, SharedString, VecModel};
@@ -841,7 +841,7 @@ fn build_metadata_with_base(
         .as_object()
         .ok_or("Metadata root must be a JSON object")?;
     let mut object = Map::new();
-    object.insert("schema_version".into(), Value::String("1.0".into()));
+    object.insert("schema_version".into(), Value::String(SPEC_VERSION.into()));
     for key in ["developer", "origin"] {
         if let Some(value) = source
             .get(key)
@@ -972,7 +972,7 @@ fn copy_metadata_to_lpl_item(item: &mut Map<String, Value>, metadata: &Value) {
     let metadata_object = lplx_metadata_object_mut(item);
     metadata_object
         .entry("schema_version")
-        .or_insert_with(|| Value::String("1.0".into()));
+        .or_insert_with(|| Value::String(SPEC_VERSION.into()));
 }
 
 fn ensure_lplx_metadata(item: &mut Map<String, Value>, label: &str) {
@@ -995,7 +995,7 @@ fn ensure_lplx_metadata(item: &mut Map<String, Value>, label: &str) {
     }
     metadata
         .entry("schema_version")
-        .or_insert_with(|| Value::String("1.0".into()));
+        .or_insert_with(|| Value::String(SPEC_VERSION.into()));
     metadata
         .entry("name")
         .or_insert_with(|| Value::String(label.to_owned()));
