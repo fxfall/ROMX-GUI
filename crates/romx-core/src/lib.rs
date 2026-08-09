@@ -1277,7 +1277,10 @@ fn write_container_stream<R: Read, W: Write>(
     let mut body_sha256 = options.body_sha256.then(Sha256::new);
     let mut rom_crc32 = Crc32Hasher::new();
     let mut rom_size = 0u64;
-    let mut buffer = [0u8; 1024 * 1024];
+    // Keep the streaming buffer on the heap. Windows test and console
+    // threads have a relatively small default stack, and a 1 MiB stack
+    // array can overflow before the first ROM byte is written.
+    let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let count = reader.read(&mut buffer)?;
         if count == 0 {
