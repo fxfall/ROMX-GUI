@@ -1678,6 +1678,14 @@ fn parse_container(bytes: &[u8], verify_entries: bool) -> Result<Parsed<'_>, Rom
         ));
     }
     let metadata_offset = payload_size + index_size;
+    if footer.metadata.size > DEFAULT_MAX_METADATA_SIZE {
+        return Err(RomxError::Metadata(
+            "metadata exceeds the 1 MiB limit".into(),
+        ));
+    }
+    if footer.cover.size > DEFAULT_MAX_COVER_SIZE {
+        return Err(RomxError::Cover("cover exceeds the 32 MiB limit".into()));
+    }
     let cover_offset = metadata_offset
         .checked_add(footer.metadata.size as usize)
         .ok_or_else(|| RomxError::Invalid("metadata range overflow".into()))?;
@@ -1943,6 +1951,17 @@ fn read_preview_file(path: &Path) -> Result<RomxPreview, RomxError> {
         if mutable_offset != aligned {
             return Err(RomxError::Invalid(
                 "invalid immutable alignment padding".into(),
+            ));
+        }
+        if mutable_offset > immutable_end
+            && !all_zero(&read_file_range(
+                &mut file,
+                immutable_end,
+                (mutable_offset - immutable_end) as usize,
+            )?)
+        {
+            return Err(RomxError::Invalid(
+                "immutable alignment padding is non-zero".into(),
             ));
         }
         let header = read_file_range(&mut file, mutable_offset, 4096)?;
