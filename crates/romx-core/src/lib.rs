@@ -10,7 +10,7 @@ use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
@@ -1802,8 +1802,210 @@ pub fn read_path(path: &Path) -> Result<RomxDocument, RomxError> {
 pub fn read_metadata_cover_bytes(bytes: &[u8]) -> Result<RomxPreview, RomxError> {
     preview(parse_container(bytes, false)?)
 }
+
+fn read_file_range(file: &mut fs::File, offset: u64, size: usize) -> Result<Vec<u8>, RomxError> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0u8; size];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_preview_file(path: &Path) -> Result<RomxPreview, RomxError> {
+    let mut file = fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+    if file_size < FOOTER_SIZE as u64 {
+        return Err(RomxError::Invalid(
+            "file is shorter than the ROMX footer".into(),
+        ));
+    }
+    let footer_offset = file_size - FOOTER_SIZE as u64;
+    let footer_bytes = read_file_range(&mut file, footer_offset, FOOTER_SIZE)?;
+    let mut footer = Footer::decode(&footer_bytes)?;
+    let payload_size = footer.rom.size;
+    if payload_size == 0 || payload_size + RIDX_HEADER_SIZE as u64 > footer_offset {
+        return Err(RomxError::Invalid(
+            "payload size cannot locate a RIDX header".into(),
+        ));
+    }
+    let header = read_file_range(&mut file, payload_size, RIDX_HEADER_SIZE)?;
+    if &header[..4] != RIDX_MAGIC
+        || read_u16(&header, 4)? != RIDX_VERSION
+        || read_u16(&header, 6)? as usize != RIDX_HEADER_SIZE
+        || read_u32(&header, 12)? as usize != RIDX_ENTRY_SIZE
+        || read_u32(&header, 16)? != 0
+        || !all_zero(&header[0x18..])
+    {
+        return Err(RomxError::Invalid("invalid RIDX header".into()));
+    }
+    let count = read_u32(&header, 8)? as usize;
+    if count == 0 {
+        return Err(RomxError::Invalid("invalid RIDX entry count".into()));
+    }
+    let index_size =
+        RIDX_HEADER_SIZE
+            .checked_add(count.checked_mul(RIDX_ENTRY_SIZE).ok_or_else(|| {
+                RomxError::Invalid("RIDX entry count overflows index size".into())
+            })?)
+            .ok_or_else(|| RomxError::Invalid("RIDX size overflow".into()))?;
+    let index_end = payload_size
+        .checked_add(index_size as u64)
+        .ok_or_else(|| RomxError::Invalid("RIDX range overflow".into()))?;
+    if index_end > footer_offset {
+        return Err(RomxError::Invalid("RIDX exceeds immutable content".into()));
+    }
+    let mut index = read_file_range(&mut file, payload_size, index_size)?;
+    let index_crc = read_u32(&index, 0x14)?;
+    put_u32(&mut index, 0x14, 0);
+    if crc32_u32(&index) != index_crc {
+        return Err(RomxError::Invalid("RIDX CRC32 mismatch".into()));
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut paths = Vec::<String>::with_capacity(count);
+    let mut entrypoint = None;
+    for position in 0..count {
+        let base = RIDX_HEADER_SIZE + position * RIDX_ENTRY_SIZE;
+        let flags = read_u32(&index, base)?;
+        let format = read_u16(&index, base + 4)?;
+        let path_size = read_u16(&index, base + 6)? as usize;
+        let offset = read_u64(&index, base + 8)?;
+        let size = read_u64(&index, base + 16)?;
+        let value = read_u32(&index, base + 24)?;
+        if flags & !(ENTRYPOINT | HAS_CRC32) != 0
+            || read_u32(&index, base + 28)? != 0
+            || !(1..=RIDX_PATH_CAPACITY).contains(&path_size)
+            || !all_zero(&index[base + 0x20 + path_size..base + RIDX_ENTRY_SIZE])
+            || offset > payload_size
+            || size > payload_size - offset
+        {
+            return Err(RomxError::Invalid("invalid RIDX entry fields".into()));
+        }
+        let path = String::from_utf8(index[base + 0x20..base + 0x20 + path_size].to_vec())
+            .map_err(|_| RomxError::Invalid("RIDX path is not strict UTF-8".into()))?;
+        validate_virtual_path(&path)?;
+        if paths
+            .iter()
+            .any(|value: &String| value.to_lowercase() == path.to_lowercase())
+        {
+            return Err(RomxError::Invalid(
+                "RIDX paths collide after case folding".into(),
+            ));
+        }
+        paths.push(path.clone());
+        let is_entrypoint = flags & ENTRYPOINT != 0;
+        if is_entrypoint {
+            if entrypoint.is_some() || offset != 0 || size == 0 || format == 0 {
+                return Err(RomxError::Invalid(
+                    "entrypoint violates zero-offset or format rules".into(),
+                ));
+            }
+            entrypoint = Some(position);
+        }
+        entries.push(RidxEntry {
+            flags,
+            format_id: format,
+            path,
+            data_offset: offset,
+            data_size: size,
+            crc32: (flags & HAS_CRC32 != 0).then(|| format!("{value:08x}")),
+            entrypoint: is_entrypoint,
+        });
+    }
+    let _entrypoint = entrypoint
+        .ok_or_else(|| RomxError::Invalid("RIDX must contain exactly one entrypoint".into()))?;
+    if count == 1 && (entries[0].data_offset != 0 || entries[0].data_size != payload_size) {
+        return Err(RomxError::Invalid(
+            "single-file payload is not exact and contiguous".into(),
+        ));
+    }
+    let metadata_size = usize::try_from(footer.metadata.size)
+        .map_err(|_| RomxError::Invalid("metadata size is too large".into()))?;
+    if footer.metadata.size > DEFAULT_MAX_METADATA_SIZE {
+        return Err(RomxError::Metadata(
+            "metadata exceeds the 1 MiB limit".into(),
+        ));
+    }
+    let metadata_offset = index_end;
+    let cover_offset = metadata_offset
+        .checked_add(footer.metadata.size)
+        .ok_or_else(|| RomxError::Invalid("metadata range overflow".into()))?;
+    let immutable_end = cover_offset
+        .checked_add(footer.cover.size)
+        .ok_or_else(|| RomxError::Invalid("cover range overflow".into()))?;
+    let _immutable_size = if footer.mutable_capacity != 0 {
+        if footer.mutable_capacity % 4096 != 0
+            || footer.mutable_capacity < MIN_MUTABLE_CAPACITY
+            || footer.mutable_capacity > footer_offset
+        {
+            return Err(RomxError::Invalid("invalid mutable capacity".into()));
+        }
+        let mutable_offset = footer_offset - footer.mutable_capacity;
+        let aligned = (immutable_end + 4095) & !4095;
+        if mutable_offset != aligned {
+            return Err(RomxError::Invalid(
+                "invalid immutable alignment padding".into(),
+            ));
+        }
+        let header = read_file_range(&mut file, mutable_offset, 4096)?;
+        let stored = read_u32(&header, 0x34)?;
+        let mut checked = header;
+        put_u32(&mut checked, 0x34, 0);
+        if &checked[..4] != b"RMUT" || crc32_u32(&checked) != stored {
+            return Err(RomxError::Invalid("mutable header CRC32 mismatch".into()));
+        }
+        mutable_offset
+    } else {
+        if immutable_end != footer_offset {
+            return Err(RomxError::Invalid("unexpected bytes before footer".into()));
+        }
+        footer_offset
+    };
+    let cover_size = usize::try_from(footer.cover.size)
+        .map_err(|_| RomxError::Invalid("cover size is too large".into()))?;
+    if footer.cover.size > DEFAULT_MAX_COVER_SIZE {
+        return Err(RomxError::Cover("cover exceeds the 32 MiB limit".into()));
+    }
+    let metadata_bytes = if metadata_size == 0 {
+        None
+    } else {
+        Some(read_file_range(&mut file, metadata_offset, metadata_size)?)
+    };
+    let cover_bytes = if cover_size == 0 {
+        None
+    } else {
+        Some(read_file_range(&mut file, cover_offset, cover_size)?)
+    };
+    let metadata = metadata_bytes
+        .as_deref()
+        .map(parse_json_strict)
+        .transpose()?;
+    let cover = cover_bytes
+        .as_deref()
+        .map(|bytes| {
+            validate_png_bytes(bytes)?;
+            Ok::<_, RomxError>(bytes.to_vec())
+        })
+        .transpose()?;
+    footer.metadata.offset = if footer.metadata.size == 0 {
+        0
+    } else {
+        metadata_offset
+    };
+    footer.cover.offset = if footer.cover.size == 0 {
+        0
+    } else {
+        cover_offset
+    };
+    // Preview intentionally does not hash the payload.
+    Ok(RomxPreview {
+        footer,
+        metadata,
+        cover,
+        entries,
+    })
+}
+
 pub fn read_metadata_cover_path(path: &Path) -> Result<RomxPreview, RomxError> {
-    read_metadata_cover_bytes(&fs::read(path)?)
+    read_preview_file(path)
 }
 pub fn validate_bytes(bytes: &[u8]) -> Result<ValidationReport, RomxError> {
     let parsed = parse_container(bytes, false)?;
