@@ -1,7 +1,7 @@
 use crate::{
-    classify_gb_payload, crc32, format_id_for_extension, normalize_cover_path, normalize_crc32,
-    pack_path_with_metadata_options, platform_id_for_name, read_path, required_metadata,
-    PackOptions, RomxError, SPEC_VERSION,
+    classify_gb_payload, crc32, format_id_for_extension, launch_format_id_for_extension,
+    normalize_cover_path, normalize_crc32, pack_path_with_metadata_options, platform_id_for_name,
+    read_path, required_metadata, PackOptions, RomxError, SPEC_VERSION,
 };
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -835,6 +835,7 @@ where
                 crc32_override: options.crc32_override.clone(),
                 platform_id: platform_id_for_name(&item.platform),
                 entry_format_id: format_id_for_extension(&item.payload_format),
+                launch_format_id: launch_format_id_for_extension(&item.payload_format),
                 ..Default::default()
             };
             pack_path_with_metadata_options(

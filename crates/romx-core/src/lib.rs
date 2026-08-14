@@ -813,6 +813,21 @@ pub fn platform_name_from_id(id: u16) -> Option<&'static str> {
         _ => return None,
     })
 }
+pub fn launch_format_id_for_extension(extension: &str) -> u16 {
+    match extension
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cue" => 2,
+        "gdi" => 3,
+        "m3u" => 4,
+        "ccd" => 5,
+        "mds" => 6,
+        "toc" => 7,
+        _ => 1,
+    }
+}
 fn validate_string_array(v: &Value, max: usize, limit: usize) -> bool {
     let Some(a) = v.as_array() else { return false };
     if a.len() > max {
@@ -1447,6 +1462,15 @@ pub(crate) fn pack_path_with_metadata_options(
         .unwrap_or("payload.bin")
         .replace('\\', "/");
     let format = format_id_from_path(&entry);
+    let mut options = options.clone();
+    if options.launch_format_id == 1 {
+        options.launch_format_id = launch_format_id_for_extension(
+            Path::new(&entry)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+        );
+    }
     let cover = cover
         .map(|value| normalize_cover_bytes(value, options.cover_target))
         .transpose()?;
@@ -1457,7 +1481,7 @@ pub(crate) fn pack_path_with_metadata_options(
             writer,
             metadata,
             cover.as_deref(),
-            options,
+            &options,
             &entry,
             format,
         )?;
