@@ -35,8 +35,7 @@ use objc2_app_kit::{NSColor, NSView};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 const ROM_EXTENSIONS: &[&str] = &[
-    "gb", "gbc", "gba", "nes", "fds", "sfc", "smc", "nds", "3ds", "cci", "cia", "md", "gen", "smd",
-    "bin",
+    "gb", "gbc", "gba", "nes", "fds", "sfc", "smc", "nds", "3ds", "cci", "md", "gen", "smd", "bin",
 ];
 const ROMX_EXTENSIONS: &[&str] = &["romx"];
 struct LocaleCatalog {

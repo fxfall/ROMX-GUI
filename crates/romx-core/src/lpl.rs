@@ -8,8 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const SUPPORTED_FORMATS: &[&str] = &[
-    "gb", "gbc", "gba", "nes", "fds", "sfc", "smc", "nds", "3ds", "cci", "cia", "md", "gen", "smd",
-    "bin",
+    "gb", "gbc", "gba", "nes", "fds", "sfc", "smc", "nds", "3ds", "cci", "md", "gen", "smd", "bin",
 ];
 const COVER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
 
