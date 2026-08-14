@@ -1,7 +1,6 @@
 use romx_core::{
-    pack_bytes, pack_bytes_with_writer_options, pack_to_path, payload_sha256, read_bytes,
-    validate_bytes, validate_png_bytes, Crc32Status, Footer, PackOptions, Region, ValidationStatus,
-    FLAG_BODY_SHA256, FLAG_COVER, FLAG_METADATA,
+    pack_bytes, pack_bytes_with_writer_options, pack_to_path, validate_bytes, validate_png_bytes,
+    PackOptions, ValidationStatus,
 };
 use serde_json::json;
 use std::fs;
@@ -16,39 +15,28 @@ const PNG: &[u8] = &[
 ];
 
 #[test]
-fn writer_uses_the_frozen_metadata_and_footer_contract() {
-    let metadata = json!({
-        "schema_version": "0.1.0",
-        "name": "Fixture",
-        "platform": "gba",
-        "payload_format": "gba",
-        "origin_crc32": "00000000",
-        "description": "  compacted  "
-    });
+fn writer_uses_the_frozen_v020_contract() {
+    let metadata = json!({"schema_version":"0.2.0", "name":"Fixture", "origin_crc32":"00000000", "description":"compacted"});
     let bytes = pack_bytes(b"abc", Some(&metadata), Some(PNG)).unwrap();
-    let document = read_bytes(&bytes).unwrap();
-    assert_eq!(document.metadata.as_ref().unwrap()["name"], "Fixture");
+    let document = romx_core::read_bytes(&bytes).unwrap();
+    assert_eq!(document.footer.version, 2);
+    assert_eq!(
+        document.metadata.as_ref().unwrap()["schema_version"],
+        "0.2.0"
+    );
     assert_eq!(document.metadata.as_ref().unwrap()["crc32"], "352441c2");
     assert_eq!(
         document.metadata.as_ref().unwrap()["origin_crc32"],
-        "352441c2"
+        "00000000"
     );
-    assert!(document.metadata.as_ref().unwrap().get("label").is_none());
-    assert_eq!(document.footer.reserved, [0; 32]);
-    assert_eq!(document.footer.flags, FLAG_METADATA | FLAG_COVER);
-    assert_eq!(document.footer.body_sha256, [0; 32]);
+    assert_eq!(document.footer.reserved, [0; 44]);
     assert_eq!(validate_png_bytes(PNG).unwrap().width, 1);
     assert!(String::from_utf8(bytes).is_err());
 }
 
 #[test]
-fn body_hash_is_opt_in_and_optional_regions_can_be_salvaged() {
-    let metadata = json!({
-        "schema_version": "0.1.0",
-        "name": "Fixture",
-        "platform": "gb",
-        "payload_format": "gb"
-    });
+fn immutable_sha256_is_opt_in_and_validated() {
+    let metadata = json!({"schema_version":"0.2.0", "name":"Fixture"});
     let bytes = pack_bytes_with_writer_options(
         b"abc",
         Some(&metadata),
@@ -59,69 +47,35 @@ fn body_hash_is_opt_in_and_optional_regions_can_be_salvaged() {
         },
     )
     .unwrap();
-    let document = read_bytes(&bytes).unwrap();
-    assert_eq!(document.footer.flags, FLAG_METADATA | FLAG_BODY_SHA256);
-
-    let invalid_metadata = b"\xef\xbb\xbf{}";
-    let invalid_cover = b"not-a-png";
-    let mut body = Vec::new();
-    body.extend_from_slice(b"abc");
-    body.extend_from_slice(invalid_metadata);
-    body.extend_from_slice(invalid_cover);
-    let footer = Footer {
-        version: 1,
-        rom: Region { offset: 0, size: 3 },
-        metadata: Region {
-            offset: 3,
-            size: invalid_metadata.len() as u64,
-        },
-        cover: Region {
-            offset: 3 + invalid_metadata.len() as u64,
-            size: invalid_cover.len() as u64,
-        },
-        reserved: [0; 32],
-        flags: FLAG_METADATA | FLAG_COVER | FLAG_BODY_SHA256,
-        body_sha256: payload_sha256(&body),
-    };
-    body.extend_from_slice(&footer.encode());
-    let salvaged = read_bytes(&body).unwrap();
-    assert_eq!(salvaged.rom, b"abc");
-    assert!(salvaged.metadata.is_none());
-    assert!(salvaged.cover.is_none());
-    let report = validate_bytes(&body).unwrap();
-    assert_eq!(report.metadata, ValidationStatus::Invalid);
-    assert_eq!(report.cover, ValidationStatus::Invalid);
-    assert_eq!(report.metadata_crc32, Crc32Status::Invalid);
+    let report = validate_bytes(&bytes).unwrap();
+    assert_eq!(report.structure, ValidationStatus::Valid);
+    assert_eq!(report.body_sha256, ValidationStatus::Valid);
 }
 
 #[test]
-fn empty_cover_descriptor_matches_the_frozen_schema() {
-    let metadata = json!({
-        "schema_version": "0.1.0",
-        "name": "Fixture",
-        "platform": "gba",
-        "payload_format": "gba",
-        "cover": {}
-    });
-    let bytes = pack_bytes(b"abc", Some(&metadata), None).unwrap();
-    assert_eq!(
-        read_bytes(&bytes).unwrap().metadata.unwrap()["cover"],
-        json!({})
-    );
-}
-
-#[test]
-fn duplicate_metadata_keys_are_rejected_by_path_writer() {
+fn strict_metadata_and_duplicate_keys_are_rejected() {
     let root = tempdir().unwrap();
     let rom = root.path().join("game.gb");
     let metadata = root.path().join("metadata.json");
-    let output = root.path().join("game.gbx");
+    let output = root.path().join("game.romx");
     fs::write(&rom, b"abc").unwrap();
     fs::write(
         &metadata,
-        br#"{"schema_version":"0.1.0","name":"A","name":"B","platform":"gb","payload_format":"gb"}"#,
+        br#"{"schema_version":"0.2.0","name":"A","name":"B"}"#,
     )
     .unwrap();
     assert!(pack_to_path(&rom, Some(&metadata), None, &output).is_err());
     assert!(!output.exists());
+    assert!(pack_bytes(
+        b"abc",
+        Some(&json!({"schema_version":"0.1.0", "name":"old"})),
+        None
+    )
+    .is_err());
+    assert!(pack_bytes(
+        b"abc",
+        Some(&json!({"schema_version":"0.2.0", "name":"x", "platform":"gba"})),
+        None
+    )
+    .is_err());
 }

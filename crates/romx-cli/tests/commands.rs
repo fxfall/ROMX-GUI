@@ -29,16 +29,14 @@ fn pack_inspect_verify_and_extract_commands_work() {
     let rom = root.path().join("game.gba");
     let metadata = root.path().join("metadata.json");
     let cover = root.path().join("cover.png");
-    let packed = root.path().join("game.gbax");
+    let packed = root.path().join("game.romx");
     let extracted = root.path().join("extracted");
     fs::write(&rom, b"rom-bytes").unwrap();
     fs::write(
         &metadata,
         serde_json::to_vec(&json!({
-            "schema_version": "0.1.0",
+            "schema_version": "0.2.0",
             "name": "CLI Test",
-            "platform": "gba",
-            "payload_format": "gba"
         }))
         .unwrap(),
     )
@@ -71,7 +69,7 @@ fn pack_inspect_verify_and_extract_commands_work() {
     assert!(verify.status.success());
     assert!(String::from_utf8_lossy(&verify.stdout).contains("valid ROMX"));
 
-    let invalid = root.path().join("invalid.gbax");
+    let invalid = root.path().join("invalid.romx");
     fs::write(&invalid, b"not a ROMX container").unwrap();
     let rejected = romx(&[&invalid], &["verify"]);
     assert!(!rejected.status.success());
@@ -85,10 +83,7 @@ fn pack_inspect_verify_and_extract_commands_work() {
         .output()
         .unwrap();
     assert!(extract.status.success());
-    assert_eq!(
-        fs::read(extracted.join("payload.gba")).unwrap(),
-        b"rom-bytes"
-    );
+    assert_eq!(fs::read(extracted.join("game.gba")).unwrap(), b"rom-bytes");
     assert_eq!(fs::read(extracted.join("cover.png")).unwrap(), PNG);
 }
 
@@ -130,7 +125,7 @@ fn import_and_export_lpl_commands_work() {
         "{}",
         String::from_utf8_lossy(&import.stderr)
     );
-    assert!(romx_dir.join("1.gbx").is_file());
+    assert!(romx_dir.join("1.romx").is_file());
 
     let export = Command::new(env!("CARGO_BIN_EXE_romx"))
         .arg("export-lpl")

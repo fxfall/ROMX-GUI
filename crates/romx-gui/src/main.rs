@@ -5,9 +5,10 @@ slint::include_modules!();
 use image::ImageReader;
 use rfd::FileDialog;
 use romx_core::{
-    application_version, classify_gb_payload, export_lpl_with_output_handling,
-    import_lpl_with_error_handling, plan_lpl_import, read_metadata_cover_path, read_path,
-    ExportLplOptions, ImportLplPlan, LPLX_METADATA_KEY, ROMX_LPLX_METADATA_FIELDS, SPEC_VERSION,
+    application_version, classify_gb_payload, export_lpl_with_output_handling, format_extension,
+    import_lpl_with_error_handling, plan_lpl_import, platform_name_from_id,
+    read_metadata_cover_path, read_path, ExportLplOptions, ImportLplPlan, LPLX_METADATA_KEY,
+    ROMX_LPLX_METADATA_FIELDS, SPEC_VERSION,
 };
 use serde_json::{Map, Value};
 use slint::{Image, ModelRc, SharedPixelBuffer, SharedString, VecModel};
@@ -37,10 +38,7 @@ const ROM_EXTENSIONS: &[&str] = &[
     "gb", "gbc", "gba", "nes", "fds", "sfc", "smc", "nds", "3ds", "cci", "cia", "md", "gen", "smd",
     "bin",
 ];
-const ROMX_EXTENSIONS: &[&str] = &[
-    "gbx", "gbcx", "gbax", "nesx", "fdsx", "sfcx", "smcx", "ndsx", "3dsx", "ccix", "ciax", "mdx",
-    "genx", "smdx", "binx", "romx",
-];
+const ROMX_EXTENSIONS: &[&str] = &["romx"];
 struct LocaleCatalog {
     languages: Vec<HashMap<String, String>>,
 }
@@ -859,20 +857,6 @@ fn build_metadata_with_base(
     };
     object.insert("name".into(), Value::String(label));
 
-    let platform = window.get_platform().trim().to_owned();
-    object.insert(
-        "platform".into(),
-        Value::String(if supported_platform(&platform) {
-            platform
-        } else {
-            platform_for_path(&window.get_rom_path()).to_owned()
-        }),
-    );
-    if let Ok(format) = payload_format(&window.get_rom_path()) {
-        object.insert("payload_format".into(), Value::String(format));
-    } else if let Some(format) = source.get("payload_format").and_then(Value::as_str) {
-        object.insert("payload_format".into(), Value::String(format.to_owned()));
-    }
     object.insert("genre".into(), parse_genre(&window.get_genre()));
     let developer_value = window.get_developer();
     let developer = developer_value.trim();
@@ -1034,6 +1018,15 @@ fn create_single_lpl(
         Value::String(rom_path.to_string_lossy().into_owned()),
     );
     copy_metadata_to_lpl_item(&mut item, &metadata);
+    let platform = window.get_platform().trim().to_owned();
+    item.insert(
+        "platform".into(),
+        Value::String(if supported_platform(&platform) {
+            platform
+        } else {
+            platform_for_path(&rom_path.to_string_lossy()).to_owned()
+        }),
+    );
     if let Some(cover_path) = cover_reference.as_deref().filter(|path| path.exists()) {
         item.insert(
             "cover_path".into(),
@@ -1090,9 +1083,11 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
                     .unwrap_or_else(|| Value::Object(Map::new()));
                 workspace.borrow_mut().romx_metadata = Some(metadata.clone());
                 set_metadata_form(window, &metadata);
-                if !supported_platform(&metadata_text(&metadata, "platform")) {
-                    window.set_platform(platform_for_path(&path_string).into());
-                }
+                window.set_platform(
+                    platform_name_from_id(document.footer.platform_id)
+                        .unwrap_or_else(|| platform_for_path(&path_string))
+                        .into(),
+                );
                 if window.get_display_title().trim().is_empty() {
                     window.set_display_title(path_stem(&path_string).into());
                 }
@@ -1947,12 +1942,7 @@ fn lpl_file_entries(path: &str, kind: LplFileListKind) -> Vec<PathBuf> {
                         || path
                             .extension()
                             .and_then(|value| value.to_str())
-                            .map(|value| {
-                                value.eq_ignore_ascii_case("romx")
-                                    || ROM_EXTENSIONS.iter().any(|extension| {
-                                        value.eq_ignore_ascii_case(&format!("{extension}x"))
-                                    })
-                            })
+                            .map(|value| value.eq_ignore_ascii_case("romx"))
                             .unwrap_or(false)
                 }
             })
@@ -2252,16 +2242,20 @@ fn select_lpl_output(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>,
                     label
                 }
             };
-            let platform = metadata_string(metadata, "platform");
-            let payload_format = metadata_string(metadata, "payload_format");
+            let platform = platform_name_from_id(document.footer.platform_id)
+                .unwrap_or("ROMX")
+                .to_owned();
+            let payload_format = document
+                .entries
+                .iter()
+                .find(|entry| entry.entrypoint)
+                .and_then(|entry| format_extension(entry.format_id))
+                .unwrap_or("romx")
+                .to_owned();
             let description = metadata_string(metadata, "description");
             let mut info = format!(
                 "{} · ROM {} bytes · cover: {}",
-                if platform.is_empty() {
-                    "ROMX"
-                } else {
-                    &platform
-                },
+                &platform,
                 document.footer.rom.size,
                 if document.cover.is_some() {
                     "yes"
@@ -2357,16 +2351,20 @@ fn preview_unpack_romx(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>
             } else {
                 label
             };
-            let payload_format = metadata_string(metadata, "payload_format");
-            let platform = metadata_string(metadata, "platform");
+            let payload_format = document
+                .entries
+                .iter()
+                .find(|entry| entry.entrypoint)
+                .and_then(|entry| format_extension(entry.format_id))
+                .unwrap_or("romx")
+                .to_owned();
+            let platform = platform_name_from_id(document.footer.platform_id)
+                .unwrap_or("ROMX")
+                .to_owned();
             let description = metadata_string(metadata, "description");
             let mut info = format!(
                 "{} · ROM {} bytes · cover: {}",
-                if platform.is_empty() {
-                    "ROMX"
-                } else {
-                    &platform
-                },
+                &platform,
                 document.footer.rom.size,
                 if document.cover.is_some() {
                     "yes"
@@ -2794,15 +2792,7 @@ fn remove_lplx_metadata_value(item: &mut Map<String, Value>, key: &str) {
 
 fn lpl_item_metadata(item: &Map<String, Value>) -> Value {
     let mut metadata = Map::new();
-    for key in [
-        "name",
-        "genre",
-        "platform",
-        "payload_format",
-        "developer",
-        "release_date",
-        "origin",
-    ] {
+    for key in ["name", "genre", "developer", "release_date", "origin"] {
         if let Some(value) = lpl_item_value(item, key) {
             metadata.insert(key.into(), value.clone());
         }
@@ -3239,16 +3229,13 @@ fn prepare_single_input(
 
     let document =
         read_path(&input_path).map_err(|error| format!("Failed to read ROMX: {error}"))?;
-    let declared_format = document
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("payload_format"))
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase)
-        .ok_or_else(|| "ROMX metadata is missing payload_format".to_owned())?;
-    if !ROM_EXTENSIONS.contains(&declared_format.as_str()) {
-        return Err(format!("Unsupported format inside ROMX: {declared_format}"));
-    }
+    let entry_format = document
+        .entries
+        .iter()
+        .find(|entry| entry.entrypoint)
+        .and_then(|entry| format_extension(entry.format_id))
+        .ok_or_else(|| "ROMX entry format is not registered".to_owned())?;
+    let declared_format = entry_format.to_owned();
     let format = if matches!(declared_format.as_str(), "gb" | "gbc") {
         classify_gb_payload(&document.rom, Some(&declared_format))
             .map_err(|error| format!("Failed to read the ROM inside ROMX: {error}"))?
@@ -3407,7 +3394,7 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
         );
         return;
     }
-    let (format, source_path, temporary_payload) = match prepare_single_input(window, workspace) {
+    let (_format, source_path, temporary_payload) = match prepare_single_input(window, workspace) {
         Ok(value) => value,
         Err(error) => {
             set_status(window, &error, &error);
@@ -3435,7 +3422,7 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
         }
     };
     let save_path = PathBuf::from(save_path.trim());
-    let output_path = save_path.join(format!("{}.{}x", path_stem(&rom_path), format));
+    let output_path = save_path.join(format!("{}.romx", path_stem(&rom_path)));
     if output_path.exists() {
         workspace.borrow_mut().single_conflict = Some(PendingSingleConflict {
             lpl_path: temporary_lpl,

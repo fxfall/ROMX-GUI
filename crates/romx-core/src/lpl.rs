@@ -1,7 +1,7 @@
 use crate::{
-    classify_gb_payload, crc32, normalize_cover_path, normalize_crc32,
-    pack_path_with_metadata_options, read_path, required_metadata, PackOptions, RomxError,
-    SPEC_VERSION,
+    classify_gb_payload, crc32, format_id_for_extension, normalize_cover_path, normalize_crc32,
+    pack_path_with_metadata_options, platform_id_for_name, read_path, required_metadata,
+    PackOptions, RomxError, SPEC_VERSION,
 };
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -70,8 +70,6 @@ pub const OFFICIAL_LPL_ITEM_FIELDS: &[&str] = &[
 pub const ROMX_LPLX_METADATA_FIELDS: &[&str] = &[
     "schema_version",
     "name",
-    "platform",
-    "payload_format",
     "serial",
     "developer",
     "publisher",
@@ -367,17 +365,6 @@ fn lplx_romx_metadata(
         .filter(|value| !value.is_empty())
     {
         object.insert("name".into(), Value::String(name.to_owned()));
-    }
-    if let Some(platform) = supported_platform(lplx_metadata_value(item, "platform")) {
-        object.insert("platform".into(), Value::String(platform.to_owned()));
-    }
-    if let Some(payload_format) =
-        supported_payload_format(lplx_metadata_value(item, "payload_format"))
-    {
-        object.insert(
-            "payload_format".into(),
-            Value::String(payload_format.to_owned()),
-        );
     }
     // `label` and `crc32` are official LPL fields and stay at the item root,
     // but their corresponding ROMX values still participate in conversion.
@@ -846,6 +833,8 @@ where
             let output_path = output_dir.join(filename);
             let pack_options = PackOptions {
                 crc32_override: options.crc32_override.clone(),
+                platform_id: platform_id_for_name(&item.platform),
+                entry_format_id: format_id_for_extension(&item.payload_format),
                 ..Default::default()
             };
             pack_path_with_metadata_options(
@@ -913,7 +902,7 @@ fn collect_romx_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(),
         } else if path
             .extension()
             .and_then(|value| value.to_str())
-            .is_some_and(|extension| extension.to_lowercase().ends_with('x'))
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("romx"))
         {
             output.push(path);
         }
@@ -1001,7 +990,7 @@ fn planned_romx_filename(item: &PlannedLplItem) -> String {
         .and_then(|value| value.to_str())
         .map(safe_filename)
         .unwrap_or_else(|| "untitled".into());
-    format!("{stem}.{}x", item.payload_format)
+    format!("{stem}.romx")
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), RomxError> {
@@ -1141,12 +1130,13 @@ where
             } else {
                 None
             };
-            let payload_format = document
-                .metadata
-                .as_ref()
-                .and_then(|value| value.get("payload_format"))
-                .and_then(Value::as_str)
-                .unwrap_or("rom");
+            let entry_format_id = document
+                .entries
+                .iter()
+                .find(|entry| entry.entrypoint)
+                .map(|entry| entry.format_id)
+                .unwrap_or(0);
+            let payload_format = crate::format_extension(entry_format_id).unwrap_or("bin");
             let source_stem = romx_path
                 .file_stem()
                 .and_then(|value| value.to_str())
@@ -1193,12 +1183,8 @@ where
                 .and_then(Value::as_str)
                 .and_then(|value| normalize_crc32(value).ok())
                 .unwrap_or_else(|| crc32(&document.rom));
-            let platform = document
-                .metadata
-                .as_ref()
-                .and_then(|value| value.get("platform"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let platform =
+                crate::platform_name_from_id(document.footer.platform_id).unwrap_or_default();
             let mut item = Map::new();
             item.insert("path".into(), Value::String(item_path));
             let label = manifest_item

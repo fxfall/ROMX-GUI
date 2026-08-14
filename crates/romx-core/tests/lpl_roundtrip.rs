@@ -148,8 +148,8 @@ fn lplx_carries_romx_metadata_and_core_but_lpl_export_is_official_only() {
     let document = read_path(&imported.output_files[0]).unwrap();
     let metadata = document.metadata.as_ref().unwrap();
     assert_eq!(metadata["name"], "Playlist Label");
-    assert_eq!(metadata["platform"], "gba");
-    assert_eq!(metadata["payload_format"], "gba");
+    assert_eq!(document.footer.platform_id, 3);
+    assert_eq!(document.entries[0].format_id, 3);
     assert_eq!(metadata["developer"], "ROMX Developer");
     assert_eq!(metadata["genre"], json!(["RPG"]));
     assert_eq!(metadata["cover"]["mime_type"], "image/png");
@@ -237,7 +237,7 @@ fn plan_can_skip_missing_entries_while_preserving_rom_names() {
     assert_eq!(report.total_items, 2);
     assert_eq!(report.imported, 1);
     assert_eq!(report.skipped, 1);
-    assert!(output.join("present.gbx").is_file());
+    assert!(output.join("present.romx").is_file());
 }
 
 #[test]
@@ -292,10 +292,10 @@ fn temporary_outputs_can_be_committed_one_by_one_with_original_names() {
     .unwrap();
     assert_eq!(report.imported, 2);
     assert_eq!(report.output_files, committed);
-    assert!(output.join("Game One.gbx").is_file());
-    assert!(output.join("Game Two.gbx").is_file());
-    assert!(!output.join("Game One.gbx.tmp").exists());
-    assert!(!output.join("Game Two.gbx.tmp").exists());
+    assert!(output.join("Game One.romx").is_file());
+    assert!(output.join("Game Two.romx").is_file());
+    assert!(!output.join("Game One.romx.tmp").exists());
+    assert!(!output.join("Game Two.romx.tmp").exists());
 }
 
 #[test]

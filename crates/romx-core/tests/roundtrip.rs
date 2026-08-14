@@ -19,10 +19,8 @@ const PNG: &[u8] = &[
 fn roundtrip_preserves_rom_metadata_and_png() {
     let rom = b"example-rom";
     let metadata = json!({
-        "schema_version": "0.1.0",
+        "schema_version": "0.2.0",
         "name": "Example",
-        "platform": "gba",
-        "payload_format": "gba"
     });
     let bytes = pack_bytes(rom, Some(&metadata), Some(PNG)).unwrap();
     let document = read_bytes(&bytes).unwrap();
@@ -40,10 +38,8 @@ fn roundtrip_preserves_rom_metadata_and_png() {
 fn custom_crc32_overrides_lookup_key_but_not_footer_integrity() {
     let rom = b"example-rom";
     let metadata = json!({
-        "schema_version": "0.1.0",
+        "schema_version": "0.2.0",
         "name": "Example",
-        "platform": "gba",
-        "payload_format": "gba",
         "crc32": "deadbeef"
     });
     let bytes = pack_bytes_with_crc32(rom, Some(&metadata), None, Some("A1B2C3D4")).unwrap();
@@ -58,10 +54,8 @@ fn custom_crc32_overrides_lookup_key_but_not_footer_integrity() {
 #[test]
 fn preview_reader_loads_only_footer_metadata_and_cover() {
     let metadata = json!({
-        "schema_version": "0.1.0",
+        "schema_version": "0.2.0",
         "name": "Preview",
-        "platform": "gba",
-        "payload_format": "gba"
     });
     let bytes = pack_bytes(&vec![7u8; 4096], Some(&metadata), Some(PNG)).unwrap();
     let preview = read_metadata_cover_bytes(&bytes).unwrap();
@@ -70,7 +64,7 @@ fn preview_reader_loads_only_footer_metadata_and_cover() {
     assert_eq!(preview.cover.as_deref(), Some(PNG));
 
     let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("preview.gbax");
+    let path = root.path().join("preview.romx");
     std::fs::write(&path, bytes).unwrap();
     let from_path = read_metadata_cover_path(&path).unwrap();
     assert_eq!(from_path.footer, preview.footer);
@@ -110,10 +104,8 @@ fn cover_png_is_preserved_without_target_and_other_formats_are_png_converted() {
     );
 
     let metadata = json!({
-        "schema_version": "0.1.0",
+        "schema_version": "0.2.0",
         "name": "Cover metadata",
-        "platform": "gba",
-        "payload_format": "gba"
     });
     let packed = pack_bytes_with_options(
         b"rom",
@@ -133,11 +125,10 @@ fn cover_png_is_preserved_without_target_and_other_formats_are_png_converted() {
 
 #[test]
 fn rejects_overlapping_regions() {
-    let metadata =
-        json!({"schema_version":"0.1.0","name":"x","platform":"gba","payload_format":"gba"});
+    let metadata = json!({"schema_version":"0.2.0","name":"x"});
     let mut bytes = pack_bytes(b"rom", Some(&metadata), None).unwrap();
     let footer_start = bytes.len() - 128;
-    bytes[footer_start + 0x18..footer_start + 0x20].copy_from_slice(&0u64.to_le_bytes());
+    bytes[footer_start + 0x08..footer_start + 0x10].copy_from_slice(&0u64.to_le_bytes());
     assert!(read_bytes(&bytes).is_err());
 }
 
