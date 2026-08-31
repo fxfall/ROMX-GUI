@@ -1,7 +1,9 @@
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
 use romx_core::{
-    export_lpl, import_lpl, import_lpl_with_output_handling, plan_lpl_import, read_path,
-    ExportLplOptions, ImportLplOptions,
+    detect_save_bundles, export_lpl, format_id_for_extension, import_lpl,
+    import_lpl_with_output_handling, pack_to_path_with_writer_options, plan_lpl_import, read_path,
+    ExportLplOptions, ImportLplOptions, MutableSaveBundle, MutableSaveFile, PackOptions,
+    RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -213,6 +215,47 @@ fn lpl_import_finds_and_normalizes_non_png_covers() {
 }
 
 #[test]
+fn lpl_import_can_reserve_mutable_space_for_frontends() {
+    let root = tempdir().unwrap();
+    let rom_path = root.path().join("game.gba");
+    fs::write(&rom_path, b"gba-rom").unwrap();
+    let lpl_path = root.path().join("02-GBA.lpl");
+    fs::write(
+        &lpl_path,
+        serde_json::to_vec(&json!({
+            "items": [{"path": "/game.gba", "label": "Game"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = root.path().join("romx");
+    let report = import_lpl(
+        &lpl_path,
+        &output,
+        &ImportLplOptions {
+            force_rom_dir: Some(root.path().to_owned()),
+            mutable_capacity: RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let document = read_path(&report.output_files[0]).unwrap();
+    assert_eq!(
+        document.footer.mutable_capacity,
+        RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY
+    );
+    let mutable_offset = report.output_files[0].metadata().unwrap().len()
+        - 128
+        - RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY;
+    let bytes = fs::read(&report.output_files[0]).unwrap();
+    assert_eq!(
+        &bytes[mutable_offset as usize..mutable_offset as usize + 4],
+        b"RMUT"
+    );
+}
+
+#[test]
 fn plan_can_skip_missing_entries_while_preserving_rom_names() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("present.gb"), b"rom").unwrap();
@@ -237,7 +280,7 @@ fn plan_can_skip_missing_entries_while_preserving_rom_names() {
     assert_eq!(report.total_items, 2);
     assert_eq!(report.imported, 1);
     assert_eq!(report.skipped, 1);
-    assert!(output.join("present.romx").is_file());
+    assert!(output.join("present.gb.romx").is_file());
 }
 
 #[test]
@@ -292,10 +335,10 @@ fn temporary_outputs_can_be_committed_one_by_one_with_original_names() {
     .unwrap();
     assert_eq!(report.imported, 2);
     assert_eq!(report.output_files, committed);
-    assert!(output.join("Game One.romx").is_file());
-    assert!(output.join("Game Two.romx").is_file());
-    assert!(!output.join("Game One.romx.tmp").exists());
-    assert!(!output.join("Game Two.romx.tmp").exists());
+    assert!(output.join("Game One.gb.romx").is_file());
+    assert!(output.join("Game Two.gb.romx").is_file());
+    assert!(!output.join("Game One.gb.romx.tmp").exists());
+    assert!(!output.join("Game Two.gb.romx.tmp").exists());
 }
 
 #[test]
@@ -351,4 +394,80 @@ fn standalone_absolute_lpl_paths_resolve_rom_and_retroarch_cover() {
     let report = import_lpl(&lpl_path, &root.path().join("romx"), &options).unwrap();
     let document = read_path(&report.output_files[0]).unwrap();
     assert_eq!(document.cover.as_deref(), Some(PNG));
+}
+
+#[test]
+fn lpl_import_accepts_disc_payload_extensions() {
+    let root = tempdir().unwrap();
+    let rom_path = root.path().join("disc.iso");
+    fs::write(&rom_path, b"disc-image").unwrap();
+    let lpl_path = root.path().join("PlayStation.lpl");
+    fs::write(
+        &lpl_path,
+        serde_json::to_vec(&json!({
+            "version": "1.5",
+            "items": [{"path": rom_path, "label": "Disc image"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let plan = plan_lpl_import(&lpl_path, &ImportLplOptions::default()).unwrap();
+    assert_eq!(plan.items[0].payload_format, "iso");
+    assert_eq!(plan.items[0].platform, "playstation");
+
+    let output = root.path().join("romx");
+    let report = import_lpl(&lpl_path, &output, &ImportLplOptions::default()).unwrap();
+    let document = read_path(&report.output_files[0]).unwrap();
+    assert_eq!(
+        document.entries[0].format_id,
+        format_id_for_extension("iso")
+    );
+}
+
+#[test]
+fn lpl_export_writes_multiple_normal_save_files_for_frontend_use() {
+    let root = tempdir().unwrap();
+    let rom = root.path().join("game.gba");
+    fs::write(&rom, b"gba-rom").unwrap();
+    let save_one = root.path().join("slot1.sav");
+    let save_two = root.path().join("slot2.sav");
+    fs::write(&save_one, b"one").unwrap();
+    fs::write(&save_two, b"two").unwrap();
+    let romx = root.path().join("game.gba.romx");
+    let options = PackOptions {
+        mutable_capacity: RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY,
+        mutable_entry_capacity: 8,
+        mutable_save_bundles: vec![
+            MutableSaveBundle {
+                key: "slot1".into(),
+                files: vec![MutableSaveFile {
+                    path: "slot1.sav".into(),
+                    source: save_one,
+                }],
+            },
+            MutableSaveBundle {
+                key: "slot2".into(),
+                files: vec![MutableSaveFile {
+                    path: "slot2.sav".into(),
+                    source: save_two,
+                }],
+            },
+        ],
+        ..Default::default()
+    };
+    pack_to_path_with_writer_options(&rom, None, None, &romx, &options).unwrap();
+
+    let export_root = root.path().join("export");
+    let report = export_lpl(&romx, &export_root, &ExportLplOptions::default()).unwrap();
+    assert_eq!(
+        fs::read(report.save_dir.join("game.gba/slot1.sav")).unwrap(),
+        b"one"
+    );
+    assert_eq!(
+        fs::read(report.save_dir.join("game.gba/slot2.sav")).unwrap(),
+        b"two"
+    );
+    let bundles = detect_save_bundles(&report.save_dir.join("game.gba"), "gba", "gba").unwrap();
+    assert_eq!(bundles.len(), 2);
 }

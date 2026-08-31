@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use romx_core::{
-    export_lpl, extract_to_dir, import_lpl, pack_to_path_with_options, read_metadata_cover_path,
-    validate_path, ExportLplOptions, ImportLplOptions,
+    export_lpl, extract_to_dir, import_lpl, inspect_payload_profile, pack_to_path_with_options,
+    read_metadata_cover_path, validate_path, ExportLplOptions, ImportLplOptions,
 };
 use serde_json::json;
 use std::error::Error;
@@ -29,6 +29,8 @@ enum Command {
     Validate { romx: PathBuf },
     /// Validate a ROMX container, including regions, optional metadata/cover, and body SHA-256.
     Verify { romx: PathBuf },
+    /// Read platform, embedded metadata, and artwork from an original ROM payload without packing it.
+    Probe { payload: PathBuf },
     /// Extract the payload, metadata, and optional cover from a ROMX container.
     Extract(ExtractArgs),
     /// Import a RetroArch LPL into sequential ROMX files.
@@ -118,6 +120,9 @@ struct ExportLplArgs {
     /// Write extracted PNG covers to this exact directory.
     #[arg(long)]
     cover_dir: Option<PathBuf>,
+    /// Write extracted logical SAVE objects to this exact directory.
+    #[arg(long)]
+    save_dir: Option<PathBuf>,
     /// Virtual ROM path prefix stored in exported LPL entries.
     #[arg(long)]
     lpl_rom_prefix: Option<String>,
@@ -178,6 +183,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 "metadata_size": footer.metadata.size,
                 "cover_offset": footer.cover.offset,
                 "cover_size": footer.cover.size,
+                "mutable_capacity": footer.mutable_capacity,
                 "flags": footer.flags,
                 "reserved": hex(&footer.reserved),
                 "body_sha256": hex(&footer.body_sha256),
@@ -208,6 +214,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             validate_path(&romx)?;
             println!("valid ROMX: {}", romx.display());
         }
+        Command::Probe { payload } => {
+            let profile = inspect_payload_profile(&payload)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "path": payload,
+                    "payload_format": profile.payload_format,
+                    "platform": profile.platform,
+                    "metadata": profile.metadata,
+                    "embedded_cover_count": profile.covers.len(),
+                }))?
+            );
+        }
         Command::Extract(args) => {
             let payload = extract_to_dir(&args.romx, &args.output)?;
             println!("extracted payload: {}", payload.display());
@@ -223,6 +242,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 crc32_override: args.crc32,
                 temporary_output: false,
                 cover_target: parse_cover_size(args.cover_size.as_deref())?,
+                mutable_capacity: 0,
+                mutable_entry_capacity: 0,
+                mutable_save_bundles: Vec::new(),
+                mutable_region: None,
             };
             let report = import_lpl(&args.lpl, &args.output, &options)?;
             println!(
@@ -239,6 +262,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 lpl_path: args.lpl_path,
                 rom_dir: args.rom_dir,
                 cover_dir: args.cover_dir,
+                save_dir: args.save_dir,
                 lpl_rom_prefix: args.lpl_rom_prefix,
                 lpl_cover_prefix: None,
                 cover_set: args.cover_set,

@@ -1,8 +1,13 @@
 use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgb};
 use romx_core::{
     classify_gb_payload, crc32, normalize_cover_bytes, pack_bytes, pack_bytes_with_crc32,
-    pack_bytes_with_options, read_bytes, read_metadata_cover_bytes, read_metadata_cover_path,
-    FLAG_COVER, FLAG_METADATA,
+    pack_bytes_with_options, pack_bytes_with_writer_options, read_bytes, read_metadata_cover_bytes,
+    read_metadata_cover_path, recommended_mutable_capacity,
+    recommended_mutable_capacity_for_save_bytes, recommended_mutable_capacity_for_save_count,
+    recommended_mutable_entry_capacity, MutableSaveBundle, MutableSaveFile, PackOptions,
+    DEFAULT_SAVE_OBJECT_CAPACITY, FLAG_COVER, FLAG_METADATA,
+    RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY, RECOMMENDED_DISC_MUTABLE_CAPACITY,
+    RECOMMENDED_NDS_MUTABLE_CAPACITY,
 };
 use serde_json::json;
 use std::io::Cursor;
@@ -32,6 +37,133 @@ fn roundtrip_preserves_rom_metadata_and_png() {
         document.footer.flags & (FLAG_METADATA | FLAG_COVER),
         FLAG_METADATA | FLAG_COVER
     );
+}
+
+#[test]
+fn mutable_capacity_uses_romx_guidance_and_roundtrips() {
+    assert_eq!(
+        recommended_mutable_capacity("gba", "gba"),
+        RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY
+    );
+    assert_eq!(
+        recommended_mutable_capacity("gba", "iso"),
+        RECOMMENDED_DISC_MUTABLE_CAPACITY
+    );
+    assert_eq!(
+        recommended_mutable_capacity("nds", "nds"),
+        RECOMMENDED_NDS_MUTABLE_CAPACITY
+    );
+
+    let options = PackOptions {
+        mutable_capacity: RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY,
+        ..Default::default()
+    };
+    let bytes = pack_bytes_with_writer_options(b"mutable-rom", None, None, &options).unwrap();
+    let document = read_bytes(&bytes).unwrap();
+    assert_eq!(
+        document.footer.mutable_capacity,
+        RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY
+    );
+}
+
+#[test]
+fn mutable_capacity_uses_save_bytes_and_directory_header() {
+    assert_eq!(recommended_mutable_entry_capacity(0), 8);
+    assert_eq!(recommended_mutable_entry_capacity(1), 8);
+    assert_eq!(recommended_mutable_entry_capacity(7), 16);
+    assert_eq!(recommended_mutable_entry_capacity(14), 16);
+
+    let save_bytes = DEFAULT_SAVE_OBJECT_CAPACITY * 9;
+    let capacity = recommended_mutable_capacity_for_save_bytes(
+        RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY,
+        9,
+        save_bytes,
+    );
+    assert_eq!(capacity, 4_993_024);
+    assert_eq!(capacity % 4096, 0);
+    assert_eq!(
+        recommended_mutable_capacity_for_save_count(RECOMMENDED_NDS_MUTABLE_CAPACITY, 7),
+        RECOMMENDED_NDS_MUTABLE_CAPACITY
+    );
+
+    let options = PackOptions {
+        mutable_capacity: capacity,
+        mutable_entry_capacity: recommended_mutable_entry_capacity(9),
+        ..Default::default()
+    };
+    let bytes = pack_bytes_with_writer_options(b"multi-save-rom", None, None, &options).unwrap();
+    let mutable_offset = bytes.len() - 128 - capacity as usize;
+    let entry_count = u32::from_le_bytes(
+        bytes[mutable_offset + 12..mutable_offset + 16]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(entry_count, 16);
+    read_bytes(&bytes).unwrap();
+}
+
+#[test]
+fn mutable_save_bundle_is_written_as_a_readable_romx_object() {
+    let root = tempfile::tempdir().unwrap();
+    let save = root.path().join("中文存档.sav");
+    std::fs::write(&save, vec![0x5au8; 512 * 1024]).unwrap();
+    let options = PackOptions {
+        mutable_capacity: RECOMMENDED_NDS_MUTABLE_CAPACITY,
+        mutable_entry_capacity: 8,
+        mutable_save_bundles: vec![MutableSaveBundle {
+            key: "中文存档".into(),
+            files: vec![MutableSaveFile {
+                path: "中文存档.sav".into(),
+                source: save,
+            }],
+        }],
+        ..Default::default()
+    };
+    let bytes = pack_bytes_with_writer_options(b"nds-payload", None, None, &options).unwrap();
+    let mutable_offset = bytes.len() - 128 - RECOMMENDED_NDS_MUTABLE_CAPACITY as usize;
+    let entry_offset = mutable_offset + 4096;
+    assert_eq!(&bytes[entry_offset..entry_offset + 4], b"MENT");
+    assert_eq!(
+        u16::from_le_bytes(
+            bytes[entry_offset + 4..entry_offset + 6]
+                .try_into()
+                .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        u16::from_le_bytes(
+            bytes[entry_offset + 6..entry_offset + 8]
+                .try_into()
+                .unwrap()
+        ),
+        1
+    );
+    let key_size = u32::from_le_bytes(
+        bytes[entry_offset + 0x0c..entry_offset + 0x10]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    assert_eq!(
+        &bytes[entry_offset + 0x40..entry_offset + 0x40 + key_size],
+        "中文存档".as_bytes()
+    );
+    let data_offset = u64::from_le_bytes(
+        bytes[entry_offset + 0x10..entry_offset + 0x18]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let bundle_offset = mutable_offset + data_offset;
+    assert_eq!(&bytes[bundle_offset..bundle_offset + 4], b"RMBL");
+    assert_eq!(
+        u32::from_le_bytes(
+            bytes[bundle_offset + 0x10..bundle_offset + 0x14]
+                .try_into()
+                .unwrap()
+        ),
+        1
+    );
+    assert_eq!(read_bytes(&bytes).unwrap().rom, b"nds-payload");
 }
 
 #[test]

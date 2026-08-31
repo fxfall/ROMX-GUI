@@ -15,14 +15,35 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
+mod frontend;
+mod identity;
+mod libretro;
 mod lpl;
+mod probe;
+mod save;
 
+pub use frontend::{check_frontend_compatibility, FrontendCompatibilityReport};
+pub use identity::{identity_from_document, identity_from_path, RomxIdentity};
+pub use libretro::{
+    download_libretro_thumbnail, libretro_dat_url, libretro_lookup, libretro_lookup_candidates,
+    libretro_lookup_result, libretro_match_mode, libretro_playlist_name, LibretroLookup,
+};
 pub use lpl::{
     export_lpl, export_lpl_with_output_handling, import_lpl, import_lpl_with_error_handling,
     import_lpl_with_output_handling, import_lpl_with_progress, is_official_lpl_item_field,
     is_official_lpl_root_field, plan_lpl_import, ExportLplOptions, ExportLplReport,
     ImportLplOptions, ImportLplPlan, ImportLplReport, PlannedLplItem, LPLX_METADATA_KEY,
     OFFICIAL_LPL_ITEM_FIELDS, OFFICIAL_LPL_ROOT_FIELDS, ROMX_LPLX_METADATA_FIELDS,
+};
+pub use probe::{
+    extract_embedded_info, infer_payload_format, inspect_payload_profile, EmbeddedCover,
+    EmbeddedInfo, PayloadProfile,
+};
+pub use save::{
+    detect_save_bundles, extract_mutable_save_object, extract_mutable_save_objects,
+    inspect_mutable_path, is_supported_save_file, read_mutable_save_objects, save_profile,
+    MutableRegionInfo, MutableSaveFileData, MutableSaveObject, SaveGrouping, SaveInventory,
+    SaveProfile,
 };
 
 pub const FOOTER_SIZE: usize = 128;
@@ -46,6 +67,151 @@ pub const HAS_CRC32: u32 = 2;
 pub const HASH_NONE: u32 = 0;
 pub const HASH_SHA256: u32 = 1;
 pub const MIN_MUTABLE_CAPACITY: u64 = 12 * 1024;
+/// ROMX payload extensions defined by the 0.2.0 format registry.
+///
+/// Keeping this list in the core makes file dialogs and LPL validation use the
+/// same registry instead of maintaining separate, easy-to-drift allowlists.
+pub const SUPPORTED_FORMAT_EXTENSIONS: &[&str] = &[
+    "gb", "gbc", "gba", "nes", "unf", "unif", "fds", "sfc", "smc", "nds", "3ds", "cci", "cxi",
+    "app", "iso", "cso", "zso", "chd", "pbp", "cdi", "gcm", "wbfs", "rvz", "wia", "wad", "cue",
+    "gdi", "m3u", "ccd", "mds", "toc", "bin", "wav", "flac", "img", "mdf", "sbi", "sub", "ecm",
+    "z64", "n64", "v64", "md", "gen", "smd", "32x", "sms", "gg", "pce", "elf", "prx", "msu", "pcm",
+];
+
+pub const RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY: u64 = 512 * 1024;
+pub const RECOMMENDED_UNKNOWN_CARTRIDGE_MUTABLE_CAPACITY: u64 = 1024 * 1024;
+pub const RECOMMENDED_NDS_MUTABLE_CAPACITY: u64 = 16 * 1024 * 1024;
+pub const RECOMMENDED_DISC_MUTABLE_CAPACITY: u64 = 2 * 1024 * 1024;
+pub const RECOMMENDED_PS2_MUTABLE_CAPACITY: u64 = 32 * 1024 * 1024;
+pub const RECOMMENDED_DIRECTORY_SAVE_MUTABLE_CAPACITY: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_MUTABLE_ENTRY_CAPACITY: u32 = 8;
+pub const DEFAULT_SAVE_OBJECT_CAPACITY: u64 = 512 * 1024;
+const CARTRIDGE_MUTABLE_OVERHEAD: u64 = 256 * 1024;
+const NDS_MUTABLE_OVERHEAD: u64 = 2 * 1024 * 1024;
+const MUTABLE_ENTRY_SIZE: u64 = RIDX_ENTRY_SIZE as u64;
+const MUTABLE_HEADER_SIZE: u64 = 4096;
+const MUTABLE_ALIGNMENT: u64 = 4096;
+const MUTABLE_KEY_CAPACITY: usize = 448;
+const MUTABLE_BUNDLE_HEADER_SIZE: u64 = 64;
+const MUTABLE_BUNDLE_ENTRY_SIZE: u64 = 64;
+const MUTABLE_BUNDLE_PATH_CAPACITY: usize = 1024;
+// Keep a small per-object margin so a later libromx write can change a
+// bundle path (for example from a user supplied Chinese filename to the
+// frontend's canonical `<rom-stem>.sav`) without consuming a new slot.
+const MUTABLE_SAVE_OBJECT_HEADROOM: u64 = 64 * 1024;
+
+/// One file stored inside a ROMX SAVE bundle.
+///
+/// `path` is the portable UTF-8 path exposed to the frontend.  `source` is
+/// only used while packing and is never stored in the ROMX container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutableSaveFile {
+    pub path: String,
+    pub source: PathBuf,
+}
+
+/// A named ROMX SAVE object.  The key is the user-visible save-slot label;
+/// each object may contain one file (normal battery saves) or a directory
+/// tree (for example a PSP savedata directory).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutableSaveBundle {
+    pub key: String,
+    pub files: Vec<MutableSaveFile>,
+}
+
+/// Return the mutable directory slot count needed for a save directory.
+///
+/// ROMX mutable directories use eight-slot allocation units.  Two additional
+/// slots are kept available for the standard CHEAT and STATS objects, so a
+/// directory containing N save slots is rounded up to the next eight-slot
+/// boundary without ever shrinking the default eight slots.
+pub fn recommended_mutable_entry_capacity(save_count: usize) -> u32 {
+    let required = save_count
+        .saturating_add(2)
+        .max(DEFAULT_MUTABLE_ENTRY_CAPACITY as usize);
+    let rounded = required.saturating_add(7) / 8 * 8;
+    u32::try_from(rounded).unwrap_or(u32::MAX - (u32::MAX % 8))
+}
+
+/// Calculate a mutable capacity from the measured local SAVE bytes.
+///
+/// ROMX 0.2.0's guidance reserves the detected save capacity plus a profile
+/// overhead and the mutable header/directory.  The platform recommendation is
+/// still a floor, so a normal NDS save set (for example seven 512 KiB saves)
+/// remains within the standard 16 MiB reservation instead of multiplying that
+/// reservation once per file.
+pub fn recommended_mutable_capacity_for_save_bytes(
+    base: u64,
+    save_count: usize,
+    save_bytes: u64,
+) -> u64 {
+    let estimated_bytes = DEFAULT_SAVE_OBJECT_CAPACITY.saturating_mul(save_count as u64);
+    let detected_capacity = save_bytes.max(estimated_bytes);
+    let overhead = if base == RECOMMENDED_NDS_MUTABLE_CAPACITY {
+        NDS_MUTABLE_OVERHEAD
+    } else {
+        CARTRIDGE_MUTABLE_OVERHEAD
+    };
+    let entry_capacity = u64::from(recommended_mutable_entry_capacity(save_count));
+    let directory_end =
+        MUTABLE_HEADER_SIZE.saturating_add(entry_capacity.saturating_mul(MUTABLE_ENTRY_SIZE));
+    let minimum = detected_capacity
+        .saturating_add(overhead)
+        .saturating_add(directory_end);
+    let capacity = base.max(minimum).max(MIN_MUTABLE_CAPACITY);
+    let remainder = capacity % MUTABLE_ALIGNMENT;
+    if remainder == 0 {
+        capacity
+    } else {
+        capacity
+            .checked_add(MUTABLE_ALIGNMENT - remainder)
+            .unwrap_or(u64::MAX - (u64::MAX % MUTABLE_ALIGNMENT))
+    }
+}
+
+/// Estimate a mutable capacity when only a save-object count is available.
+/// Callers that can inspect the files should prefer
+/// [`recommended_mutable_capacity_for_save_bytes`].
+pub fn recommended_mutable_capacity_for_save_count(base: u64, save_count: usize) -> u64 {
+    recommended_mutable_capacity_for_save_bytes(base, save_count, 0)
+}
+
+/// Return the non-normative mutable capacity recommended by ROMX 0.2.0 §7.
+///
+/// This is the default floor used when no measured local save directory is
+/// selected. A caller with local data can raise it with
+/// [`recommended_mutable_capacity_for_save_bytes`].
+pub fn recommended_mutable_capacity(platform: &str, extension: &str) -> u64 {
+    let platform = platform.trim().to_ascii_lowercase();
+    let extension = extension.trim_start_matches('.').to_ascii_lowercase();
+
+    match platform.as_str() {
+        "ps2" => return RECOMMENDED_PS2_MUTABLE_CAPACITY,
+        "psp" | "gamecube" | "wii" | "3ds" => return RECOMMENDED_DIRECTORY_SAVE_MUTABLE_CAPACITY,
+        "playstation" | "ps1" | "pce-cd" | "sega-cd" | "saturn" | "dreamcast" => {
+            return RECOMMENDED_DISC_MUTABLE_CAPACITY
+        }
+        "arcade" => return RECOMMENDED_UNKNOWN_CARTRIDGE_MUTABLE_CAPACITY,
+        _ => {}
+    }
+
+    match extension.as_str() {
+        "nds" => RECOMMENDED_NDS_MUTABLE_CAPACITY,
+        "3ds" | "cci" | "cxi" | "app" => RECOMMENDED_DIRECTORY_SAVE_MUTABLE_CAPACITY,
+        "iso" | "cso" | "zso" | "chd" | "pbp" | "cdi" | "gcm" | "wbfs" | "rvz" | "wia" | "wad"
+        | "cue" | "gdi" | "m3u" | "ccd" | "mds" | "toc" | "wav" | "flac" | "img" | "mdf"
+        | "sbi" | "sub" | "ecm" => RECOMMENDED_DISC_MUTABLE_CAPACITY,
+        "gb" | "gbc" | "gba" | "nes" | "unf" | "unif" | "fds" | "sfc" | "smc" | "z64" | "n64"
+        | "v64" | "md" | "gen" | "smd" | "32x" | "sms" | "gg" | "pce" => {
+            RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY
+        }
+        _ => match platform.as_str() {
+            "gb" | "gbc" | "gba" | "nes" | "snes" | "genesis" | "md" | "sms" | "gg" | "pce"
+            | "n64" => RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY,
+            _ => RECOMMENDED_UNKNOWN_CARTRIDGE_MUTABLE_CAPACITY,
+        },
+    }
+}
 const MAGIC: &[u8; 4] = b"ROMX";
 const RIDX_MAGIC: &[u8; 4] = b"RIDX";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -163,6 +329,17 @@ pub struct ValidationReport {
     pub computed_cover_sha256: [u8; 32],
     pub cover_info: Option<CoverInfo>,
 }
+
+#[derive(Debug, Clone)]
+pub struct RomxInspection {
+    pub identity: RomxIdentity,
+    pub validation: ValidationReport,
+    pub mutable: MutableRegionInfo,
+    pub payload_size: u64,
+    pub entry_count: usize,
+    pub has_metadata: bool,
+    pub has_cover: bool,
+}
 impl Default for ValidationReport {
     fn default() -> Self {
         Self {
@@ -195,6 +372,18 @@ pub struct PackOptions {
     pub entry_format_id: u16,
     pub include_entry_crc32: bool,
     pub mutable_capacity: u64,
+    /// Number of mutable directory entries to reserve. Zero uses the
+    /// standard eight-entry profile.
+    pub mutable_entry_capacity: u32,
+    /// SAVE objects to initialize in the mutable region.  The source files
+    /// are read while packing; an empty vector keeps the region's directory
+    /// empty so a later client can allocate objects through libromx.
+    pub mutable_save_bundles: Vec<MutableSaveBundle>,
+    /// An existing complete mutable region to preserve byte-for-byte while
+    /// editing metadata or cover. Its length must equal mutable_capacity.
+    /// This keeps namespaces unknown to this crate (for example CHEAT/STATS)
+    /// intact during frontend edits.
+    pub mutable_region: Option<Vec<u8>>,
 }
 impl Default for PackOptions {
     fn default() -> Self {
@@ -208,6 +397,9 @@ impl Default for PackOptions {
             entry_format_id: 0,
             include_entry_crc32: true,
             mutable_capacity: 0,
+            mutable_entry_capacity: 0,
+            mutable_save_bundles: Vec::new(),
+            mutable_region: None,
         }
     }
 }
@@ -235,6 +427,27 @@ pub(crate) const CRC32_TABLE: [u32; 256] = build_crc32_table();
 
 pub fn crc32(value: &[u8]) -> String {
     format!("{:08x}", crc32_u32(value))
+}
+
+/// Calculate a ROM CRC32 without loading the complete payload into memory.
+///
+/// This is used by the GUI's online matcher and by large-file workflows where
+/// a streaming checksum avoids an additional payload-sized allocation.
+pub fn crc32_path(path: &Path) -> Result<String, RomxError> {
+    let mut file = fs::File::open(path)?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut checksum = 0xffff_ffffu32;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        for byte in &buffer[..count] {
+            let index = ((checksum ^ u32::from(*byte)) & 0xff) as usize;
+            checksum = (checksum >> 8) ^ CRC32_TABLE[index];
+        }
+    }
+    Ok(format!("{:08x}", checksum ^ 0xffff_ffff))
 }
 fn crc32_u32(value: &[u8]) -> u32 {
     let mut crc = 0xffff_ffff;
@@ -364,7 +577,7 @@ pub fn validate_png_bytes(value: &[u8]) -> Result<CoverInfo, RomxError> {
                     || saw_idat
                     || matches!(color, 0 | 4)
                     || length == 0
-                    || length % 3 != 0
+                    || !length.is_multiple_of(3)
                     || length > 768
                 {
                     return Err(png_error("PNG PLTE chunk is invalid"));
@@ -1174,26 +1387,268 @@ fn make_ridx(
     Ok(index)
 }
 
-fn make_empty_mutable(capacity: u64) -> Result<Vec<u8>, RomxError> {
+fn align_mutable_bundle(value: u64) -> Result<u64, RomxError> {
+    value
+        .checked_add(63)
+        .map(|value| value & !63)
+        .ok_or_else(|| RomxError::Invalid("mutable bundle alignment overflow".into()))
+}
+
+fn validate_mutable_save_key(key: &str) -> Result<(), RomxError> {
+    if key.is_empty() {
+        return Err(RomxError::Invalid(
+            "mutable SAVE key must not be empty".into(),
+        ));
+    }
+    if key.len() > MUTABLE_KEY_CAPACITY {
+        return Err(RomxError::Invalid(
+            "mutable SAVE key exceeds the 448-byte limit".into(),
+        ));
+    }
+    if key == "."
+        || key == ".."
+        || key.contains('/')
+        || key.contains('\\')
+        || key.as_bytes().contains(&0)
+    {
+        return Err(RomxError::Invalid(
+            "mutable SAVE key contains a path separator or dot component".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mutable_bundle_path(path: &str) -> Result<(), RomxError> {
+    if path.is_empty()
+        || path.len() > MUTABLE_BUNDLE_PATH_CAPACITY
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains('\\')
+        || path.as_bytes().contains(&0)
+    {
+        return Err(RomxError::Invalid(
+            "mutable SAVE bundle path is not portable".into(),
+        ));
+    }
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(RomxError::Invalid(
+                "mutable SAVE bundle path contains an unsafe component".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct PackedMutableSaveBundle {
+    key: String,
+    bytes: Vec<u8>,
+    crc32: u32,
+}
+
+fn build_mutable_save_bundle(
+    bundle: &MutableSaveBundle,
+) -> Result<PackedMutableSaveBundle, RomxError> {
+    validate_mutable_save_key(&bundle.key)?;
+    if bundle.files.len() > u32::MAX as usize {
+        return Err(RomxError::Invalid(
+            "mutable SAVE bundle has too many files".into(),
+        ));
+    }
+
+    struct Input {
+        path: String,
+        bytes: Vec<u8>,
+        crc32: u32,
+        data_offset: u64,
+    }
+    let mut inputs = Vec::with_capacity(bundle.files.len());
+    for file in &bundle.files {
+        validate_mutable_bundle_path(&file.path)?;
+        let metadata = fs::symlink_metadata(&file.source)?;
+        if !metadata.is_file() {
+            return Err(RomxError::Invalid(format!(
+                "mutable SAVE source is not a regular file: {}",
+                file.source.display()
+            )));
+        }
+        let bytes = fs::read(&file.source)?;
+        inputs.push(Input {
+            path: file.path.clone(),
+            crc32: crc32_u32(&bytes),
+            bytes,
+            data_offset: 0,
+        });
+    }
+    inputs.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    for pair in inputs.windows(2) {
+        if pair[0].path.eq_ignore_ascii_case(&pair[1].path) {
+            return Err(RomxError::Invalid(
+                "mutable SAVE bundle paths collide after ASCII case folding".into(),
+            ));
+        }
+    }
+
+    let entry_count = inputs.len() as u64;
+    let path_table_offset = MUTABLE_BUNDLE_HEADER_SIZE
+        .checked_add(
+            entry_count
+                .checked_mul(MUTABLE_BUNDLE_ENTRY_SIZE)
+                .ok_or_else(|| RomxError::Invalid("mutable bundle directory overflow".into()))?,
+        )
+        .ok_or_else(|| RomxError::Invalid("mutable bundle path table overflow".into()))?;
+    let mut path_cursor = path_table_offset;
+    for input in &inputs {
+        path_cursor = path_cursor
+            .checked_add(input.path.len() as u64)
+            .ok_or_else(|| RomxError::Invalid("mutable bundle path table overflow".into()))?;
+    }
+    let data_offset = align_mutable_bundle(path_cursor)?;
+    let mut data_cursor = data_offset;
+    for input in &mut inputs {
+        input.data_offset = data_cursor;
+        data_cursor = data_cursor
+            .checked_add(input.bytes.len() as u64)
+            .ok_or_else(|| RomxError::Invalid("mutable bundle data overflow".into()))?;
+        data_cursor = align_mutable_bundle(data_cursor)?;
+    }
+    let bundle_size = data_cursor;
+    let output_size = usize::try_from(bundle_size)
+        .map_err(|_| RomxError::Invalid("mutable SAVE bundle is too large".into()))?;
+    let mut output = vec![0u8; output_size];
+
+    output[..4].copy_from_slice(b"RMBL");
+    put_u16(&mut output, 4, 1);
+    put_u16(&mut output, 6, MUTABLE_BUNDLE_HEADER_SIZE as u16);
+    put_u16(&mut output, 8, 1); // ROMX_MUTABLE_NAMESPACE_SAVE
+    put_u16(&mut output, 0x0a, 0);
+    put_u32(&mut output, 0x0c, MUTABLE_BUNDLE_HEADER_SIZE as u32);
+    put_u32(
+        &mut output,
+        0x10,
+        u32::try_from(entry_count)
+            .map_err(|_| RomxError::Invalid("mutable SAVE bundle entry count overflow".into()))?,
+    );
+    put_u32(&mut output, 0x14, 0);
+    put_u64(&mut output, 0x18, MUTABLE_BUNDLE_HEADER_SIZE);
+    put_u64(&mut output, 0x20, path_table_offset);
+    put_u64(&mut output, 0x28, data_offset);
+    put_u64(&mut output, 0x30, bundle_size);
+    put_u32(&mut output, 0x38, 0);
+    let header_crc = crc32_u32(&output[..MUTABLE_BUNDLE_HEADER_SIZE as usize]);
+    put_u32(&mut output, 0x38, header_crc);
+
+    let mut path_cursor = path_table_offset;
+    for (index, input) in inputs.iter().enumerate() {
+        let directory_offset = MUTABLE_BUNDLE_HEADER_SIZE
+            .checked_add((index as u64) * MUTABLE_BUNDLE_ENTRY_SIZE)
+            .ok_or_else(|| RomxError::Invalid("mutable bundle directory overflow".into()))?;
+        let directory_offset = usize::try_from(directory_offset)
+            .map_err(|_| RomxError::Invalid("mutable bundle directory is too large".into()))?;
+        put_u64(&mut output, directory_offset, path_cursor);
+        put_u32(
+            &mut output,
+            directory_offset + 8,
+            u32::try_from(input.path.len())
+                .map_err(|_| RomxError::Invalid("mutable SAVE path is too long".into()))?,
+        );
+        put_u64(&mut output, directory_offset + 0x10, input.data_offset);
+        put_u64(
+            &mut output,
+            directory_offset + 0x18,
+            input.bytes.len() as u64,
+        );
+        put_u32(&mut output, directory_offset + 0x20, input.crc32);
+        let path_start = usize::try_from(path_cursor)
+            .map_err(|_| RomxError::Invalid("mutable bundle path table is too large".into()))?;
+        output[path_start..path_start + input.path.len()].copy_from_slice(input.path.as_bytes());
+        path_cursor += input.path.len() as u64;
+    }
+    for input in &inputs {
+        let data_start = usize::try_from(input.data_offset)
+            .map_err(|_| RomxError::Invalid("mutable bundle data is too large".into()))?;
+        output[data_start..data_start + input.bytes.len()].copy_from_slice(&input.bytes);
+    }
+
+    Ok(PackedMutableSaveBundle {
+        key: bundle.key.clone(),
+        crc32: crc32_u32(&output),
+        bytes: output,
+    })
+}
+
+fn build_mutable_entry(
+    key: &str,
+    data_offset: u64,
+    data_capacity: u64,
+    data_size: u64,
+    data_crc32: u32,
+) -> Result<Vec<u8>, RomxError> {
+    validate_mutable_save_key(key)?;
+    let mut entry = vec![0u8; RIDX_ENTRY_SIZE];
+    entry[..4].copy_from_slice(b"MENT");
+    put_u16(&mut entry, 4, 1); // ACTIVE
+    put_u16(&mut entry, 6, 1); // SAVE namespace
+    put_u32(&mut entry, 8, 0);
+    put_u32(&mut entry, 0x0c, key.len() as u32);
+    put_u64(&mut entry, 0x10, data_offset);
+    put_u64(&mut entry, 0x18, data_capacity);
+    put_u64(&mut entry, 0x20, data_size);
+    put_u64(&mut entry, 0x28, 1); // first generation
+    put_u64(&mut entry, 0x30, 0); // modified time is optional
+    put_u32(&mut entry, 0x38, data_crc32);
+    entry[0x40..0x40 + key.len()].copy_from_slice(key.as_bytes());
+    put_u32(&mut entry, 0x3c, 0);
+    let crc = crc32_u32(&entry);
+    put_u32(&mut entry, 0x3c, crc);
+    Ok(entry)
+}
+
+fn make_empty_mutable(
+    capacity: u64,
+    requested_entry_capacity: u32,
+    save_bundles: &[MutableSaveBundle],
+) -> Result<Vec<u8>, RomxError> {
     if capacity == 0 {
+        if !save_bundles.is_empty() {
+            return Err(RomxError::Invalid(
+                "SAVE bundles require a reserved mutable region".into(),
+            ));
+        }
         return Ok(Vec::new());
     }
-    if capacity % 4096 != 0 || capacity < MIN_MUTABLE_CAPACITY {
+    if !capacity.is_multiple_of(4096) || capacity < MIN_MUTABLE_CAPACITY {
         return Err(RomxError::Invalid(
             "mutable capacity must be a 4096-byte multiple and at least 12288".into(),
         ));
     }
     const HEADER: usize = 4096;
-    const ENTRY: usize = 512;
-    const COUNT: usize = 8;
-    let directory = ENTRY * COUNT;
+    const ENTRY: usize = RIDX_ENTRY_SIZE;
+    let count = if requested_entry_capacity == 0 {
+        DEFAULT_MUTABLE_ENTRY_CAPACITY
+    } else {
+        requested_entry_capacity
+    } as usize;
+    if count < DEFAULT_MUTABLE_ENTRY_CAPACITY as usize || !count.is_multiple_of(8) {
+        return Err(RomxError::Invalid(
+            "mutable entry capacity must be a multiple of 8 and at least 8".into(),
+        ));
+    }
+    let directory = ENTRY
+        .checked_mul(count)
+        .ok_or_else(|| RomxError::Invalid("mutable directory size overflow".into()))?;
     let data_offset = HEADER + directory;
+    if capacity < data_offset as u64 + MUTABLE_ALIGNMENT {
+        return Err(RomxError::Invalid(
+            "mutable capacity does not leave room for mutable data".into(),
+        ));
+    }
     let mut header = vec![0u8; HEADER];
     header[..4].copy_from_slice(b"RMUT");
     put_u16(&mut header, 4, 1);
     put_u16(&mut header, 6, HEADER as u16);
     put_u32(&mut header, 8, ENTRY as u32);
-    put_u32(&mut header, 12, COUNT as u32);
+    put_u32(&mut header, 12, count as u32);
     put_u64(&mut header, 16, HEADER as u64);
     put_u64(&mut header, 24, directory as u64);
     put_u64(&mut header, 32, data_offset as u64);
@@ -1201,8 +1656,66 @@ fn make_empty_mutable(capacity: u64) -> Result<Vec<u8>, RomxError> {
     put_u32(&mut header, 0x34, 0);
     let checksum = crc32_u32(&header);
     put_u32(&mut header, 0x34, checksum);
-    let mut output = vec![0u8; capacity as usize];
+    if save_bundles.len() > count {
+        return Err(RomxError::Invalid(
+            "mutable directory has fewer slots than SAVE bundles".into(),
+        ));
+    }
+    let packed_bundles = save_bundles
+        .iter()
+        .map(build_mutable_save_bundle)
+        .collect::<Result<Vec<_>, _>>()?;
+    // Keep the uniqueness check independent of input ordering so GUI-created
+    // labels remain deterministic and safe.
+    for (index, left) in packed_bundles.iter().enumerate() {
+        if packed_bundles[index + 1..]
+            .iter()
+            .any(|right| left.key.eq_ignore_ascii_case(&right.key))
+        {
+            return Err(RomxError::Invalid(
+                "mutable SAVE keys collide after ASCII case folding".into(),
+            ));
+        }
+    }
+    let output_size = usize::try_from(capacity)
+        .map_err(|_| RomxError::Invalid("mutable capacity is too large".into()))?;
+    let mut output = vec![0u8; output_size];
     output[..HEADER].copy_from_slice(&header);
+    let mut data_cursor = data_offset as u64;
+    for (slot_index, bundle) in packed_bundles.iter().enumerate() {
+        let data_capacity = align_mutable_bundle(
+            (bundle.bytes.len() as u64)
+                .checked_add(MUTABLE_SAVE_OBJECT_HEADROOM)
+                .ok_or_else(|| RomxError::Invalid("mutable SAVE object size overflow".into()))?,
+        )?;
+        if data_capacity < bundle.bytes.len() as u64
+            || data_cursor > capacity
+            || data_capacity > capacity - data_cursor
+        {
+            return Err(RomxError::Invalid(
+                "mutable capacity cannot hold the initialized SAVE bundles".into(),
+            ));
+        }
+        let data_start = usize::try_from(data_cursor)
+            .map_err(|_| RomxError::Invalid("mutable data offset is too large".into()))?;
+        output[data_start..data_start + bundle.bytes.len()].copy_from_slice(&bundle.bytes);
+        let entry = build_mutable_entry(
+            &bundle.key,
+            data_cursor,
+            data_capacity,
+            bundle.bytes.len() as u64,
+            bundle.crc32,
+        )?;
+        let entry_start = HEADER
+            .checked_add(
+                ENTRY
+                    .checked_mul(slot_index)
+                    .ok_or_else(|| RomxError::Invalid("mutable directory overflow".into()))?,
+            )
+            .ok_or_else(|| RomxError::Invalid("mutable directory overflow".into()))?;
+        output[entry_start..entry_start + ENTRY].copy_from_slice(&entry);
+        data_cursor += data_capacity;
+    }
     Ok(output)
 }
 
@@ -1288,7 +1801,20 @@ fn write_container_stream<R: Read, W: Write>(
         }
     }
     let immutable_end = cover_offset + cover.map_or(0, |value| value.len() as u64);
-    let mutable = make_empty_mutable(options.mutable_capacity)?;
+    let mutable = if let Some(existing) = options.mutable_region.as_deref() {
+        if options.mutable_capacity == 0 || existing.len() as u64 != options.mutable_capacity {
+            return Err(RomxError::Invalid(
+                "preserved mutable region does not match mutable_capacity".into(),
+            ));
+        }
+        existing.to_vec()
+    } else {
+        make_empty_mutable(
+            options.mutable_capacity,
+            options.mutable_entry_capacity,
+            &options.mutable_save_bundles,
+        )?
+    };
     if !mutable.is_empty() {
         let aligned = (immutable_end + 4095) & !4095;
         if aligned > immutable_end {
@@ -2087,6 +2613,51 @@ pub fn validate_bytes(bytes: &[u8]) -> Result<ValidationReport, RomxError> {
 pub fn validate_path(path: &Path) -> Result<ValidationReport, RomxError> {
     validate_bytes(&fs::read(path)?)
 }
+
+/// Return the complete mutable region, including namespaces that this crate
+/// does not interpret. This is intended for lossless frontend edits.
+pub fn read_mutable_region(path: &Path) -> Result<Option<Vec<u8>>, RomxError> {
+    let bytes = fs::read(path)?;
+    let parsed = parse_container(&bytes, false)?;
+    if let Some(metadata) = parsed.metadata {
+        parse_json_strict(metadata)?;
+    }
+    if let Some(cover) = parsed.cover {
+        validate_png_bytes(cover)?;
+    }
+    if parsed.footer.mutable_capacity == 0 {
+        return Ok(None);
+    }
+    let capacity = usize::try_from(parsed.footer.mutable_capacity)
+        .map_err(|_| RomxError::Invalid("mutable capacity is too large".into()))?;
+    if bytes.len() < FOOTER_SIZE + capacity {
+        return Err(RomxError::Invalid("mutable region is truncated".into()));
+    }
+    let offset = bytes.len() - FOOTER_SIZE - capacity;
+    Ok(Some(bytes[offset..offset + capacity].to_vec()))
+}
+
+/// Read the information a frontend needs for an inspect/details screen.
+/// This deliberately keeps the payload bytes out of the returned structure;
+/// callers can use read_path only when they actually need to extract or
+/// repack the payload.
+pub fn inspect_romx_path(path: &Path) -> Result<RomxInspection, RomxError> {
+    let bytes = fs::read(path)?;
+    let document = read_bytes(&bytes)?;
+    let validation = validate_bytes(&bytes)?;
+    let mutable =
+        save::read_mutable_save_objects_with_capacity(&bytes, document.footer.mutable_capacity)?;
+    let identity = identity_from_document(&document)?;
+    Ok(RomxInspection {
+        identity,
+        validation,
+        mutable,
+        payload_size: document.footer.rom.size,
+        entry_count: document.entries.len(),
+        has_metadata: document.metadata.is_some(),
+        has_cover: document.cover.is_some(),
+    })
+}
 fn atomic_extract(path: &Path, bytes: &[u8]) -> Result<(), RomxError> {
     write_atomic_stream(path, true, |file| {
         file.write_all(bytes)?;
@@ -2123,6 +2694,11 @@ pub fn extract_to_dir(path: &Path, output: &Path) -> Result<PathBuf, RomxError> 
     if let Some(cover) = document.cover {
         atomic_extract(&output.join("cover.png"), &cover)?;
     }
+    // SAVE objects are part of the user-facing ROMX payload even though they
+    // live outside the immutable ROM/RIDX regions.  Export them below a
+    // dedicated directory so the result can be fed back to the platform-aware
+    // save scanner or copied into a frontend's save root.
+    extract_mutable_save_objects(path, &output.join("saves"))?;
     Ok(payload)
 }
 pub fn required_metadata(

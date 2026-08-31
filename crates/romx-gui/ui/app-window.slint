@@ -1,5 +1,6 @@
 import {
     Button,
+    CheckBox,
     ComboBox,
     GroupBox,
     HorizontalBox,
@@ -9,13 +10,29 @@ import {
     VerticalBox,
 } from "std-widgets.slint";
 
+export global RomxTheme {
+    out property <color> canvas: #f4f6fb;
+    out property <color> card: #ffffff;
+    out property <color> card-muted: #f8f9fc;
+    out property <color> border: #e4e7ec;
+    out property <color> text: #182230;
+    out property <color> text-muted: #667085;
+    out property <color> text-subtle: #98a2b3;
+    out property <color> accent: #4f46e5;
+    out property <color> accent-soft: #eef2ff;
+    out property <color> success-soft: #ecfdf3;
+}
+
 export component MainWindow inherits Window {
     title: "ROMX";
     no-frame: false;
-    background: #ffffff;
-    preferred-width: 980px;
-    preferred-height: 720px;
-    min-width: 820px;
+    background: RomxTheme.canvas;
+    // The work area is intentionally a three-column layout. Keep enough
+    // room for the cover, source/list controls, and metadata form at the
+    // default size while still allowing the window to be resized smaller.
+    preferred-width: 1120px;
+    preferred-height: 820px;
+    min-width: 1000px;
     min-height: 600px;
 
     in-out property <int> active_page: 0;
@@ -28,7 +45,14 @@ export component MainWindow inherits Window {
     in-out property <string> cover_path;
     in-out property <string> metadata_path;
     in-out property <string> save_path;
+    // Optional local save directory used to size the ROMX mutable region.
+    in-out property <string> mutable_save_path;
+    in-out property <string> romx_diagnostic;
     in-out property <image> cover_preview;
+    in-out property <[string]> embedded_cover_options;
+    in-out property <int> embedded_cover_index: -1;
+    in-out property <image> match_cover_preview;
+    in-out property <bool> match_cover_available: false;
 
     // Editable metadata mirrors the LPLX/ROMX metadata contract.
     in-out property <string> display_title;
@@ -37,9 +61,16 @@ export component MainWindow inherits Window {
     in-out property <string> developer;
     in-out property <string> release_date;
     in-out property <string> origin;
+    in-out property <string> custom_crc;
+    in-out property <string> custom_serial;
+    in-out property <string> identity_mode;
 
     in-out property <int> resolution_index: 0;
     in-out property <string> custom_resolution: "512 × 512";
+    // ROMX files produced by the GUI are consumed by libromx, which stores
+    // SAVE/CHEAT/STATS objects in the mutable region.  Keep reservation on by
+    // default; users can still opt out for intentionally compact containers.
+    in-out property <bool> reserve_mutable: true;
     in-out property <bool> conflict_visible: false;
     in-out property <string> conflict_path;
     in-out property <bool> error_visible: false;
@@ -55,9 +86,22 @@ export component MainWindow inherits Window {
     in-out property <int> conversion_imported: 0;
     in-out property <int> conversion_skipped: 0;
 
+    in-out property <bool> online_match_running: false;
+    in-out property <bool> match_visible: false;
+    in-out property <string> match_title;
+    in-out property <string> match_message;
+    in-out property <int> match_record_count: -1;
+    in-out property <[string]> match_fields;
+    in-out property <[bool]> match_field_selected;
+    in-out property <length> match_window_x: 210px;
+    in-out property <length> match_window_y: 80px;
+    in-out property <length> match_drag_origin_x: 210px;
+    in-out property <length> match_drag_origin_y: 80px;
+
     in-out property <string> unpack_input_path;
     in-out property <string> unpack_rom_dir;
     in-out property <string> unpack_cover_dir;
+    in-out property <string> unpack_save_dir;
     in-out property <string> unpack_lpl_dir;
     in-out property <string> unpack_lpl_rom_path;
     in-out property <string> unpack_lpl_cover_path;
@@ -82,15 +126,34 @@ export component MainWindow inherits Window {
 
     pure callback translate(string, int) -> string;
     callback language_changed();
+    callback platform_changed();
+    callback embedded_cover_changed(index: int);
 
     changed language_index => {
         root.language_changed();
+    }
+
+    changed platform => {
+        root.platform_changed();
+    }
+
+    changed embedded_cover_index => {
+        if root.embedded_cover_index >= 0 {
+            root.embedded_cover_changed(root.embedded_cover_index);
+        }
     }
 
     callback open_rom_clicked();
     callback open_cover_clicked();
     callback open_metadata_clicked();
     callback open_save_path_clicked();
+    callback open_mutable_save_path_clicked();
+    callback online_match_clicked();
+    callback match_field_toggled(index: int, checked: bool);
+    callback match_select_all_clicked();
+    callback match_write_clicked();
+    callback match_write_all_clicked();
+    callback match_cancel_clicked();
     callback open_lpl_clicked();
     callback open_lpl_rom_dir_clicked();
     callback open_lpl_image_dir_clicked();
@@ -118,6 +181,7 @@ export component MainWindow inherits Window {
     callback open_unpack_folder_clicked();
     callback open_unpack_rom_dir_clicked();
     callback open_unpack_cover_dir_clicked();
+    callback open_unpack_save_dir_clicked();
     callback open_unpack_lpl_dir_clicked();
     callback unpack_romx_file_clicked(index: int);
     callback unpack_file_convert_clicked();
@@ -127,287 +191,218 @@ export component MainWindow inherits Window {
     callback window_close_clicked();
 
     Rectangle {
-        background: #f6f7f9;
+        background: RomxTheme.canvas;
         width: parent.width;
         height: parent.height;
     }
 
-    // Unified navigation: pack/unpack and their matching sub-pages live here.
+    // The main navigation is horizontal so the work area can use the full
+    // window width. The three navigation levels still update the same state
+    // and callbacks as the original sidebar.
     Rectangle {
         x: 0px;
         y: 0px;
-        width: 184px;
-        height: parent.height;
-        background: #202938;
+        width: parent.width;
+        height: 78px;
+        background: RomxTheme.card;
+        border-color: RomxTheme.border;
+        border-width: 1px;
 
-        VerticalBox {
-            x: 0px;
-            y: 16px;
-            width: parent.width - 0px;
-            height: parent.height - 32px;
-            spacing: 6px;
+        HorizontalBox {
+            x: 18px;
+            y: 8px;
+            width: parent.width - 36px;
+            height: 56px;
+            spacing: 12px;
 
-            Text {
-                text: "ROMX v" + root.app_version;
-                color: #ffffff;
-                font-size: 22px;
-                font-weight: 700;
-                height: 34px;
+            HorizontalBox {
+                width: 194px;
+                height: 42px;
+                spacing: 10px;
+                Rectangle {
+                    width: 38px;
+                    height: 38px;
+                    background: RomxTheme.accent;
+                    border-radius: 11px;
+                    Text {
+                        text: "R";
+                        color: #ffffff;
+                        font-size: 21px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: parent.width;
+                        height: parent.height;
+                    }
+                }
+                VerticalBox {
+                    spacing: 0px;
+                    Text {
+                        text: "ROMX";
+                        color: RomxTheme.text;
+                        font-size: 18px;
+                        font-weight: 700;
+                        height: 22px;
+                    }
+                    Text {
+                        text: "v" + root.app_version + " · Container toolkit";
+                        color: RomxTheme.text-muted;
+                        font-size: 11px;
+                        height: 18px;
+                    }
+                }
             }
-
             Text {
                 text: root.translate("pack", root.language_index);
-                color: #9da8b8;
-                font-size: 18px;
-                height: 22px;
+                color: RomxTheme.text-muted;
+                font-size: 12px;
+                font-weight: 600;
+                width: 48px;
+                wrap: word-wrap;
                 vertical-alignment: center;
             }
-            VerticalBox {
-                x: 8px;
-                width: parent.width - 30px;
-                spacing: 4px;
-                Button {
-                    text: root.translate("game_file", root.language_index);
-                    width: parent.width;
-                    height: 30px;
-                    clicked => {
-                        root.active_page = 0;
-                        root.pack_subpage = 0;
-                    }
-                }
-                Button {
-                    text: root.translate("lpl_file", root.language_index);
-                    width: parent.width;
-                    height: 30px;
-                    clicked => {
-                        root.active_page = 0;
-                        root.pack_subpage = 1;
-                    }
+            Button {
+                text: root.translate("game_file", root.language_index);
+                width: 110px;
+                height: 34px;
+                primary: root.active_page == 0 && root.pack_subpage == 0;
+                clicked => {
+                    root.active_page = 0;
+                    root.pack_subpage = 0;
                 }
             }
-
+            Button {
+                text: root.translate("lpl_file", root.language_index);
+                width: 100px;
+                height: 34px;
+                primary: root.active_page == 0 && root.pack_subpage == 1;
+                clicked => {
+                    root.active_page = 0;
+                    root.pack_subpage = 1;
+                }
+            }
+            Rectangle {
+                width: 1px;
+                height: 28px;
+                background: RomxTheme.border;
+            }
             Text {
                 text: root.translate("unpack", root.language_index);
-                color: #9da8b8;
-                font-size: 18px;
-                height: 22px;
+                color: RomxTheme.text-muted;
+                font-size: 12px;
+                font-weight: 600;
+                width: 70px;
+                wrap: word-wrap;
                 vertical-alignment: center;
             }
-            VerticalBox {
-                x: 8px;
-                width: parent.width - 30px;
-                spacing: 4px;
-                Button {
-                    text: root.translate("romx_file_folder", root.language_index);
-                    width: parent.width;
-                    height: 30px;
-                    clicked => {
-                        root.active_page = 1;
-                    }
+            Button {
+                text: root.translate("romx_file_folder", root.language_index);
+                width: 150px;
+                height: 34px;
+                primary: root.active_page == 1;
+                clicked => {
+                    root.active_page = 1;
                 }
             }
-
-            Rectangle { vertical-stretch: 1; }
-            VerticalBox {
-                x: 8px;
-                width: parent.width - 30px;
-                spacing: 4px;
-                ComboBox {
-                    model: [root.translate("language_en", root.language_index), root.translate("language_zh", root.language_index)];
-                    current-index <=> root.language_index;
-                    width: parent.width;
-                    height: 30px;
-                }
-            }
-            Text {
-                text: root.translate("app_subtitle", root.language_index);
-                color: #9da8b8;
-                font-size: 11px;
-                wrap: word-wrap;
+            Rectangle { horizontal-stretch: 1; }
+            ComboBox {
+                model: [
+                    root.translate("language_en", root.language_index),
+                    root.translate("language_zh", root.language_index)
+                ];
+                current-index <=> root.language_index;
+                width: 126px;
+                height: 34px;
             }
         }
     }
 
-    if root.active_page == 0 && root.pack_subpage == 0: ScrollView {
-        x: 204px;
-        y: 16px;
-        width: parent.width - 224px;
-        height: parent.height - 80px;
-        viewport-width: 700px;
-        VerticalBox {
-            x: 0px;
-            y: 0px;
-            width: 700px;
-            height: 697px;
-            spacing: 10px;
+    Rectangle {
+        x: 14px;
+        y: 94px;
+        width: parent.width - 28px;
+        height: parent.height - 166px;
+        background: transparent;
 
-            HorizontalBox {
-                height: 300px;
-                spacing: 12px;
+        HorizontalBox {
+            width: parent.width;
+            height: parent.height;
+            spacing: 14px;
 
-                Rectangle {
-                    width: 450px;
-                    height: 300px;
-                    Text {
-                        x: 0px;
-                        y: 0px;
-                        height: 20px;
-                        text: root.translate("files", root.language_index);
-                        font-size: 15px;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                    }
-                    VerticalBox {
-                        x: 0px;
-                        y: 30px;
-                        width: 418px;
-                        height: 230px;
-                        spacing: 1px;
-                        if !root.editing_lpl_file: Text { text: root.translate("game_path", root.language_index); height: 15px; vertical-alignment: center; }
-                        if !root.editing_lpl_file: HorizontalBox {
-                            width: 418px;
-                            height: 48px;
-                            spacing: 10px;
-                            LineEdit {
-                                text <=> root.rom_path;
-                                placeholder-text: root.translate("choose_rom_romx", root.language_index);
-                                width: 340px;
-                                height: 30px;
-                            }
-                            Button {
-                                text: root.translate("open", root.language_index);
-                                width: 66px;
-                                height: 30px;
-                                clicked => { root.open_rom_clicked(); }
-                            }
-                        }
-                        if root.editing_lpl_file: Rectangle {
-                            width: 418px;
-                            height: 48px;
-                            background: #eef0f3;
-                            border-radius: 6px;
-                            HorizontalBox {
-                                padding: 8px;
-                                spacing: 8px;
-                                Text {
-                                    text: root.translate("progress", root.language_index) + " " + root.conversion_current + "/" + root.conversion_total + "  " + root.translate("success", root.language_index) + " " + root.conversion_imported + "  " + root.translate("skipped", root.language_index) + " " + root.conversion_skipped;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 1;
-                                }
-                                Button {
-                                    text: root.translate("cancel", root.language_index);
-                                    width: 60px;
-                                    height: 30px;
-                                    enabled: root.conversion_running;
-                                    clicked => { root.cancel_conversion_clicked(); }
-                                }
-                            }
-                        }
-                        Text { text: root.translate("cover_image", root.language_index); height: 15px; vertical-alignment: center; }
-                        HorizontalBox {
-                            width: 418px;
-                            height: 48px;
-                            spacing: 10px;
-                            LineEdit {
-                                text <=> root.cover_path;
-                                placeholder-text: root.translate("choose_cover_optional", root.language_index);
-                                width: 340px;
-                                height: 30px;
-                            }
-                            Button {
-                                text: root.translate("open", root.language_index);
-                                width: 66px;
-                                height: 30px;
-                                clicked => { root.open_cover_clicked(); }
-                            }
-                        }
-                        Text { text: root.translate("metadata_json", root.language_index); height: 15px; vertical-alignment: center; }
-                        HorizontalBox {
-                            width: 418px;
-                            height: 48px;
-                            spacing: 10px;
-                            LineEdit {
-                                text <=> root.metadata_path;
-                                placeholder-text: root.translate("choose_metadata_optional", root.language_index);
-                                width: 340px;
-                                height: 30px;
-                            }
-                            Button {
-                                text: root.translate("open", root.language_index);
-                                width: 66px;
-                                height: 30px;
-                                clicked => { root.open_metadata_clicked(); }
-                            }
-                        }
-                        Text { text: root.translate("output_folder", root.language_index); height: 15px; vertical-alignment: center; }
-                        HorizontalBox {
-                            width: 418px;
-                            height: 48px;
-                            spacing: 10px;
-                            LineEdit {
-                                text <=> root.save_path;
-                                placeholder-text: root.translate("choose_romx_output_folder", root.language_index);
-                                width: 340px;
-                                height: 30px;
-                            }
-                            Button {
-                                text: root.translate("open", root.language_index);
-                                width: 66px;
-                                height: 30px;
-                                clicked => { root.open_save_path_clicked(); }
-                            }
-                        }
-                    }
-                }
+            // Shared cover/artwork area. The source path controls remain in
+            // the center panel; this column is for preview and image options.
+            Rectangle {
+                // Keep the cover column fixed so all pages share the same
+                // center/right column geometry.
+                horizontal-stretch: 0;
+                preferred-width: 270px;
+                min-width: 0px;
+                height: parent.height;
+                background: RomxTheme.card;
+                border-color: RomxTheme.border;
+                border-width: 1px;
+                border-radius: 14px;
+                drop-shadow-color: #172b4d12;
+                drop-shadow-blur: 14px;
+                drop-shadow-offset-y: 4px;
+                clip: true;
 
                 VerticalBox {
-                    width: 238px;
-                    height: 200px;
-                    spacing: 0px;
+                    padding: 12px;
+                    spacing: 8px;
 
+                    Text {
+                        text: root.translate("cover_preview", root.language_index);
+                        color: RomxTheme.text;
+                        font-size: 16px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                        height: 24px;
+                    }
                     Rectangle {
-                        width: 238px;
-                        height: 250px;
-                        background: #eef0f3;
-                        border-radius: 8px;
-                        VerticalBox {
-                            padding: 9px;
-                            spacing: 5px;
-                            Text {
-                                text: root.translate("cover_preview", root.language_index);
-                                font-size: 15px;
-                                font-weight: 700;
-                                height: 20px;
-                            }
-                            Rectangle {
-                                vertical-stretch: 1;
-                                background: #ffffff;
-                                border-radius: 6px;
-                                Image {
-                                    source: root.cover_preview;
-                                    image-fit: contain;
-                                    width: parent.width;
-                                    height: parent.height;
-                                }
-                            }
-                            Text {
-                                text: "PNG / JPG / WebP / GIF / BMP";
-                                color: #777f8c;
-                                font-size: 10px;
-                                height: 14px;
-                            }
+                        height: 230px;
+                        background: RomxTheme.card-muted;
+                        border-color: RomxTheme.border;
+                        border-width: 1px;
+                        border-radius: 11px;
+                        Image {
+                            source: root.cover_preview;
+                            image-fit: contain;
+                            x: 6px;
+                            y: 6px;
+                            width: parent.width - 12px;
+                            height: parent.height - 12px;
                         }
                     }
-
-                    GroupBox {
+                    if root.embedded_cover_options.length > 1: ComboBox {
+                        model: root.embedded_cover_options;
+                        current-index <=> root.embedded_cover_index;
+                        height: 32px;
+                    }
+                    Text {
+                        text: root.embedded_cover_options.length > 1
+                            ? root.translate("embedded_cover_choice", root.language_index)
+                            : "PNG / JPG / WebP / GIF / BMP";
+                        color: RomxTheme.text-muted;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                        height: 28px;
+                    }
+                    if root.active_page == 0: GroupBox {
                         title: root.translate("cover_resolution", root.language_index);
-                        width: 238px;
-                        height: 70px;
+                        height: 72px;
                         VerticalBox {
-                            padding: 7px;
+                            padding: 6px;
                             spacing: 5px;
                             if root.resolution_index != 5: ComboBox {
-                                model: [root.translate("resolution_original", root.language_index), "256 × 224", "320 × 240", "512 × 512", "640 × 480", root.translate("resolution_custom", root.language_index)];
+                                model: [
+                                    root.translate("resolution_original", root.language_index),
+                                    "256 × 224",
+                                    "320 × 240",
+                                    "512 × 512",
+                                    "640 × 480",
+                                    root.translate("resolution_custom", root.language_index)
+                                ];
                                 current-index <=> root.resolution_index;
                                 height: 30px;
                             }
@@ -418,524 +413,904 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                }
-            }
-
-            Rectangle {
-                width: 700px;
-                height: 275px;
-                Text {
-                    x: 0px;
-                    y: 0px;
-                    height: 80px;
-                    text: root.translate("custom_game_metadata", root.language_index);
-                    font-size: 15px;
-                    font-weight: 600;
-                    vertical-alignment: center;
-                }
-                VerticalBox {
-                    x: 0px;
-                    y: 60px;
-                    width: 700px;
-                    height: 205px;
-                    spacing: 5px;
-                    HorizontalBox {
-                        height: 30px;
-                        Text { text: root.translate("display_title", root.language_index); height: 30px; width: 160px; vertical-alignment: center; }
-                        LineEdit { text <=> root.display_title; placeholder-text: root.translate("display_title_placeholder", root.language_index); width: 350px; height: 30px; }
-                    }
-                    HorizontalBox {
-                        height: 30px;
-                        Text { text: root.translate("genre", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        LineEdit { text <=> root.genre; placeholder-text: root.translate("genre_placeholder", root.language_index); width: 350px; height: 30px; }
-                    }
-                    HorizontalBox {
-                        height: 30px;
-                        Text { text: root.translate("platform", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        ComboBox {
-                            model: ["gb", "gbc", "gba", "nes", "snes", "nds", "3ds", "genesis"];
-                            current-value <=> root.platform;
-                            width: 190px;
-                            height: 30px;
-                        }
-                    }
-                    HorizontalBox {
-                        height: 30px;
-                        Text { text: root.translate("developer", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        LineEdit { text <=> root.developer; placeholder-text: root.translate("developer", root.language_index); width: 350px; height: 30px; }
-                    }
-                    HorizontalBox {
-                        height: 30px;
-                        Text { text: root.translate("release_date", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        LineEdit { text <=> root.release_date; placeholder-text: root.translate("release_date", root.language_index); width: 350px; height: 30px; }
-                    }
-                    HorizontalBox {
-                        height: 30px;
-                        Text { text: root.translate("origin", root.language_index); width: 160px; height: 30px; vertical-alignment: center; }
-                        LineEdit { text <=> root.origin; placeholder-text: root.translate("origin_placeholder", root.language_index); width: 350px; height: 30px; }
-                    }
-                }
-            }
-        }
-    }
-
-    if root.active_page == 0 && root.pack_subpage == 0 && root.editing_lpl_file: HorizontalBox {
-        x: parent.width - 230px;
-        y: parent.height - 96px;
-        width: 214px;
-        height: 34px;
-        spacing: 8px;
-        Button {
-            text: root.translate("save", root.language_index);
-            width: 100px;
-            height: 30px;
-            clicked => { root.save_lpl_edit_clicked(); }
-        }
-        Button {
-            text: root.translate("back", root.language_index);
-            width: 100px;
-            height: 30px;
-            clicked => { root.return_lpl_edit_clicked(); }
-        }
-    }
-
-    if root.active_page == 0 && root.pack_subpage == 1: Rectangle {
-        x: 204px;
-        y: 16px;
-        width: parent.width - 224px;
-        height: parent.height - 80px;
-        background: #ffffff;
-        border-radius: 8px;
-        VerticalBox {
-            x: 0px;
-            y: 0px;
-            width: 700px;
-            height: parent.height;
-            spacing: 10px;
-
-            HorizontalBox {
-                height: 270px;
-                spacing: 30px;
-
-                VerticalBox {
-                    width: 418px;
-                    height: 270px;
-                    spacing: 3px;
-                    Text { text: root.translate("lpl_file_path", root.language_index); height: 15px; vertical-alignment: center; }
-                    HorizontalBox {
-                        cross-axis-alignment: start;
-                        width: 418px;
-                        height: 46px;
-                        spacing: 10px;
-                        LineEdit {
-                            text <=> root.lpl_path;
-                            placeholder-text: root.translate("choose_lpl_file", root.language_index);
-                            width: 340px;
-                            height: 30px;
-                        }
-                        Button {
-                            text: root.translate("open", root.language_index);
-                            width: 66px;
-                            height: 30px;
-                            clicked => { root.open_lpl_clicked(); }
-                        }
-                    }
-                    Text { text: root.translate("rom_folder_path", root.language_index); height: 15px; vertical-alignment: center; }
-                    HorizontalBox {
-                        cross-axis-alignment: start;
-                        width: 418px;
-                        height: 46px;
-                        spacing: 10px;
-                        LineEdit {
-                            text <=> root.lpl_rom_dir;
-                            placeholder-text: root.translate("choose_rom_folder", root.language_index);
-                            width: 340px;
-                            height: 30px;
-                        }
-                        Button {
-                            text: root.translate("open", root.language_index);
-                            width: 66px;
-                            height: 30px;
-                            clicked => { root.open_lpl_rom_dir_clicked(); }
-                        }
-                    }
-                    Text { text: root.translate("image_folder", root.language_index); height: 15px; vertical-alignment: center; }
-                    HorizontalBox {
-                        cross-axis-alignment: start;
-                        width: 418px;
-                        height: 46px;
-                        spacing: 10px;
-                        LineEdit {
-                            text <=> root.lpl_image_dir;
-                            placeholder-text: root.translate("choose_image_folder", root.language_index);
-                            width: 340px;
-                            height: 30px;
-                        }
-                        Button {
-                            text: root.translate("open", root.language_index);
-                            width: 66px;
-                            height: 30px;
-                            clicked => { root.open_lpl_image_dir_clicked(); }
-                        }
-                    }
-                    Text { text: root.translate("output_folder", root.language_index); height: 15px; vertical-alignment: center; }
-                    HorizontalBox {
-                        cross-axis-alignment: start;
-                        width: 418px;
-                        height: 46px;
-                        spacing: 10px;
-                        LineEdit {
-                            text <=> root.lpl_save_path;
-                            placeholder-text: root.translate("choose_output_folder", root.language_index);
-                            width: 340px;
-                            height: 30px;
-                        }
-                        Button {
-                            text: root.translate("open", root.language_index);
-                            width: 66px;
-                            height: 30px;
-                            clicked => { root.open_lpl_save_path_clicked(); }
-                        }
-                    }
-                }
-
-                Rectangle {
-                    width: 270px;
-                    height: 270px;
-                    background: #eef0f3;
-                    border-radius: 8px;
-                    VerticalBox {
-                        padding: 8px;
+                    if root.active_page == 0: HorizontalBox {
+                        height: 52px;
                         spacing: 6px;
-                        Text {
-                            text: root.translate("info_preview", root.language_index);
-                            font-size: 15px;
-                            font-weight: 600;
-                            height: 22px;
+                        CheckBox {
+                            text: "";
+                            checked <=> root.reserve_mutable;
+                            width: 20px;
+                            height: 24px;
                         }
                         Rectangle {
-                            height: 150px;
-                            background: #ffffff;
-                            border-radius: 6px;
-                            Image {
-                                source: root.cover_preview;
-                                image-fit: contain;
-                                width: parent.width;
-                                height: parent.height;
-                            }
-                        }
-                        Text {
-                            text: root.lpl_work_path == ""
-                                ? root.translate("select_lpl_preview", root.language_index)
-                                : root.lpl_detail_title;
-                            font-size: 12px;
-                            font-weight: 600;
-                            height: 20px;
-                        }
-                        Text { text: root.lpl_detail_format; color: #667085; height: 18px; }
-                        Text {
-                            text: root.lpl_work_path == ""
-                                ? root.translate("select_lpl_preview_info", root.language_index)
-                                : root.lpl_detail_info;
-                            color: #667085;
-                            wrap: word-wrap;
-                            vertical-stretch: 1;
-                        }
-                    }
-                }
-            }
-
-            HorizontalBox {
-                height: parent.height - 280px;
-                spacing: 40px;
-
-                Rectangle {
-                    width: 344px;
-                    background: #ffffff;
-                    border-radius: 8px;
-                    VerticalBox {
-                        padding: 10px;
-                        spacing: 6px;
-                        Text {
-                            text: root.translate("rom_folder_preview", root.language_index);
-                            font-size: 15px;
-                            font-weight: 600;
-                            height: 22px;
-                        }
-                        Rectangle {
-                            vertical-stretch: 1;
-                            background: #f8fafc;
-                            border-radius: 6px;
-                            ListView {
-                                width: parent.width;
-                                height: parent.height;
-                                for item[index] in root.lpl_rom_files: Rectangle {
-                                    width: parent.width;
-                                    height: 28px;
-                                    background: index == root.lpl_rom_selected ? #dbeafe : (Math.mod(index, 2) == 0 ? #f8fafc : #f1f5f9);
-                                    Text {
-                                        x: 8px;
-                                        text: item;
-                                        color: #344054;
-                                        vertical-alignment: center;
-                                        width: parent.width - 16px;
-                                        overflow: elide;
-                                    }
-                                    TouchArea {
-                                        clicked => { root.lpl_rom_file_clicked(index); }
-                                    }
-                                }
-                            }
-                            if root.lpl_rom_files.length == 0: Text {
-                                text: root.translate("no_rom_files", root.language_index);
-                                color: #98a2b3;
-                                horizontal-alignment: center;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: root.translate("reserve_mutable", root.language_index);
+                                color: RomxTheme.text-muted;
+                                wrap: word-wrap;
                                 vertical-alignment: center;
                                 width: parent.width;
                                 height: parent.height;
                             }
+                            TouchArea {
+                                clicked => { root.reserve_mutable = !root.reserve_mutable; }
+                            }
                         }
                     }
-                }
-
-                Rectangle {
-                    width: 344px;
-                    background: #ffffff;
-                    border-radius: 8px;
-                    VerticalBox {
-                        padding: 10px;
-                        spacing: 6px;
-                        Text {
-                            text: root.translate("output_folder_preview", root.language_index);
-                            font-size: 15px;
-                            font-weight: 600;
-                            height: 22px;
-                        }
-                        Rectangle {
-                            vertical-stretch: 1;
-                            background: #f8fafc;
-                            border-radius: 6px;
-                            ListView {
-                                width: parent.width;
-                                height: parent.height;
-                                for item[index] in root.lpl_output_files: Rectangle {
-                                    width: parent.width;
-                                    height: 28px;
-                                    background: index == root.lpl_output_selected ? #dbeafe : (Math.mod(index, 2) == 0 ? #f8fafc : #f1f5f9);
-                                    Text {
-                                        x: 8px;
-                                        text: item;
-                                        color: #344054;
-                                        vertical-alignment: center;
-                                        width: parent.width - 16px;
-                                        overflow: elide;
-                                    }
-                                    TouchArea {
-                                        clicked => { root.lpl_output_file_clicked(index); }
-                                    }
-                                }
-                            }
-                            if root.lpl_output_files.length == 0: Text {
-                                text: root.translate("no_romx_output_files", root.language_index);
-                                color: #98a2b3;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                                width: parent.width;
-                                height: parent.height;
-                            }
-                        }
+                    Rectangle { vertical-stretch: 1; }
+                    if root.display_title != "": Text {
+                        text: root.display_title;
+                        color: RomxTheme.text-muted;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        height: 52px;
                     }
                 }
             }
-        }
-    }
 
-    if root.active_page == 1: Rectangle {
-        x: 204px;
-        y: 16px;
-        width: parent.width - 224px;
-        height: parent.height - 80px;
-        background: #ffffff;
-        border-radius: 8px;
-        VerticalBox {
-            x: 0px;
-            y: 0px;
-            width: 700px;
-            height: parent.height;
-            spacing: 10px;
-
-            HorizontalBox {
-                height: 270px;
-                spacing: 30px;
+            // Single-file packing/editing page.
+            if root.active_page == 0 && root.pack_subpage == 0: Rectangle {
+                horizontal-stretch: 0;
+                preferred-width: 384px;
+                min-width: 0px;
+                height: parent.height;
+                background: RomxTheme.card;
+                border-color: RomxTheme.border;
+                border-width: 1px;
+                border-radius: 14px;
+                drop-shadow-color: #172b4d12;
+                drop-shadow-blur: 14px;
+                drop-shadow-offset-y: 4px;
+                clip: true;
 
                 VerticalBox {
-                    width: 418px;
-                    height: 270px;
-                    spacing: 3px;
-                    Text { text: root.translate("input_file_folder", root.language_index); height: 15px; vertical-alignment: center; }
-                    HorizontalBox {
-                        cross-axis-alignment: start;
-                        width: 418px;
-                        height: 46px;
-                        spacing: 6px;
-                        LineEdit {
-                            text <=> root.unpack_input_path;
-                            placeholder-text: root.translate("choose_romx_file_folder", root.language_index);
-                            width: 270px;
-                            height: 30px;
+                    padding: 14px;
+                    spacing: 8px;
+                    Text {
+                        text: root.translate("files", root.language_index);
+                        color: RomxTheme.text;
+                        font-size: 18px;
+                        font-weight: 700;
+                        height: 26px;
+                    }
+                    if root.editing_lpl_file: Rectangle {
+                        background: RomxTheme.accent-soft;
+                        border-radius: 6px;
+                        height: 48px;
+                        HorizontalBox {
+                            padding: 8px;
+                            spacing: 8px;
+                            Text {
+                                text: root.translate("progress", root.language_index) + " "
+                                    + root.conversion_current + "/" + root.conversion_total + "  "
+                                    + root.translate("success", root.language_index) + " " + root.conversion_imported + "  "
+                                    + root.translate("skipped", root.language_index) + " " + root.conversion_skipped;
+                                color: RomxTheme.text-muted;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Button {
+                                text: root.translate("cancel", root.language_index);
+                                width: 68px;
+                                height: 30px;
+                                enabled: root.conversion_running;
+                                clicked => { root.cancel_conversion_clicked(); }
+                            }
                         }
-                        Button { text: root.translate("file", root.language_index); width: 64px; height: 30px; clicked => { root.open_unpack_file_clicked(); } }
-                        Button { text: root.translate("folder", root.language_index); width: 64px; height: 30px; clicked => { root.open_unpack_folder_clicked(); } }
                     }
-                    Text { text: root.translate("rom_output_folder", root.language_index); height: 15px; vertical-alignment: center; }
-                    HorizontalBox {
-                        cross-axis-alignment: start;
-                        width: 418px;
-                        height: 46px;
-                        spacing: 10px;
-                        LineEdit { text <=> root.unpack_rom_dir; placeholder-text: root.translate("default_rom_output", root.language_index); width: 340px; height: 30px; }
-                        Button { text: root.translate("open", root.language_index); width: 66px; height: 30px; clicked => { root.open_unpack_rom_dir_clicked(); } }
-                    }
-                    Text { text: root.translate("cover_output_folder", root.language_index); height: 15px; vertical-alignment: center; }
-                    HorizontalBox {
-                        cross-axis-alignment: start;
-                        width: 418px;
-                        height: 46px;
-                        spacing: 10px;
-                        LineEdit { text <=> root.unpack_cover_dir; placeholder-text: root.translate("default_cover_output", root.language_index); width: 340px; height: 30px; }
-                        Button { text: root.translate("open", root.language_index); width: 66px; height: 30px; clicked => { root.open_unpack_cover_dir_clicked(); } }
-                    }
-                    Text { text: root.translate("lpl_content_root", root.language_index); height: 15px; vertical-alignment: center; }
-                    HorizontalBox {
-                        cross-axis-alignment: start;
-                        width: 418px;
-                        height: 46px;
-                        spacing: 10px;
-                        LineEdit { text <=> root.unpack_lpl_dir; placeholder-text: root.translate("choose_content_root", root.language_index); width: 340px; height: 30px; }
-                        Button { text: root.translate("open", root.language_index); width: 66px; height: 30px; clicked => { root.open_unpack_lpl_dir_clicked(); } }
-                    }
-                }
-
-                Rectangle {
-                    width: 270px;
-                    height: 270px;
-                    background: #eef0f3;
-                    border-radius: 8px;
-                    VerticalBox {
-                        padding: 8px;
-                        spacing: 6px;
-                        Text { text: root.translate("preview", root.language_index); font-size: 15px; font-weight: 600; height: 22px; }
-                        Rectangle {
-                            height: 150px;
-                            background: #ffffff;
-                            border-radius: 6px;
-                            Image { source: root.cover_preview; image-fit: contain; width: parent.width; height: parent.height; }
-                        }
-                        Text {
-                            text: root.unpack_input_path == ""
-                                ? root.translate("select_romx_source", root.language_index)
-                                : root.lpl_detail_title;
-                            font-size: 12px;
-                            font-weight: 600;
-                            height: 20px;
-                        }
-                        Text { text: root.lpl_detail_format; color: #667085; height: 18px; }
-                        Text {
-                            text: root.unpack_input_path == ""
-                                ? root.translate("select_romx_source_info", root.language_index)
-                                : root.lpl_detail_info;
-                            color: #667085;
-                            wrap: word-wrap;
-                            vertical-stretch: 1;
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalBox {
+                            width: parent.width;
+                            spacing: 12px;
+                            if !root.editing_lpl_file: VerticalBox {
+                                spacing: 2px;
+                                Text { text: root.translate("game_path", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    height: 38px;
+                                    LineEdit {
+                                        text <=> root.rom_path;
+                                        placeholder-text: root.translate("choose_rom_romx", root.language_index);
+                                        horizontal-stretch: 1;
+                                        height: 34px;
+                                    }
+                                    Button {
+                                        text: root.translate("open", root.language_index);
+                                        width: 72px;
+                                        height: 34px;
+                                        clicked => { root.open_rom_clicked(); }
+                                    }
+                                }
+                            }
+                            VerticalBox {
+                                spacing: 2px;
+                                Text { text: root.translate("cover_image", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    height: 38px;
+                                    LineEdit {
+                                        text <=> root.cover_path;
+                                        placeholder-text: root.translate("choose_cover_optional", root.language_index);
+                                        horizontal-stretch: 1;
+                                        height: 34px;
+                                    }
+                                    Button {
+                                        text: root.translate("open", root.language_index);
+                                        width: 72px;
+                                        height: 34px;
+                                        clicked => { root.open_cover_clicked(); }
+                                    }
+                                }
+                            }
+                            VerticalBox {
+                                spacing: 2px;
+                                Text { text: root.translate("metadata_json", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    height: 38px;
+                                    LineEdit {
+                                        text <=> root.metadata_path;
+                                        placeholder-text: root.translate("choose_metadata_optional", root.language_index);
+                                        horizontal-stretch: 1;
+                                        height: 34px;
+                                    }
+                                    Button {
+                                        text: root.translate("open", root.language_index);
+                                        width: 72px;
+                                        height: 34px;
+                                        clicked => { root.open_metadata_clicked(); }
+                                    }
+                                }
+                            }
+                            VerticalBox {
+                                spacing: 2px;
+                                Text { text: root.translate("output_folder", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    height: 38px;
+                                    LineEdit {
+                                        text <=> root.save_path;
+                                        placeholder-text: root.translate("choose_romx_output_folder", root.language_index);
+                                        horizontal-stretch: 1;
+                                        height: 34px;
+                                    }
+                                    Button {
+                                        text: root.translate("open", root.language_index);
+                                        width: 72px;
+                                        height: 34px;
+                                        clicked => { root.open_save_path_clicked(); }
+                                    }
+                                }
+                            }
+                            VerticalBox {
+                                spacing: 2px;
+                                Text { text: root.translate("save_folder", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    height: 38px;
+                                    LineEdit {
+                                        text <=> root.mutable_save_path;
+                                        placeholder-text: root.translate("choose_save_folder_optional", root.language_index);
+                                        horizontal-stretch: 1;
+                                        height: 34px;
+                                    }
+                                    Button {
+                                        text: root.translate("open", root.language_index);
+                                        width: 72px;
+                                        height: 34px;
+                                        clicked => { root.open_mutable_save_path_clicked(); }
+                                    }
+                                }
+                            }
+                            if root.romx_diagnostic != "": Rectangle {
+                                background: RomxTheme.card-muted;
+                                border-radius: 6px;
+                                height: 76px;
+                                Text {
+                                    text: root.romx_diagnostic;
+                                    x: 8px;
+                                    y: 6px;
+                                    width: parent.width - 16px;
+                                    height: parent.height - 12px;
+                                    color: #475467;
+                                    wrap: word-wrap;
+                                    overflow: elide;
+                                }
+                            }
+                            if root.editing_lpl_file: Text {
+                                text: root.lpl_selected_path;
+                                    color: RomxTheme.text-muted;
+                                wrap: word-wrap;
+                                height: 40px;
+                            }
                         }
                     }
                 }
             }
 
-            HorizontalBox {
-                height: parent.height - 280px;
-                spacing: 40px;
+            // Metadata editing stays on the right, with a scrollable form.
+            if root.active_page == 0 && root.pack_subpage == 0: Rectangle {
+                preferred-width: 384px;
+                horizontal-stretch: 0;
+                min-width: 0px;
+                height: parent.height;
+                background: RomxTheme.card;
+                border-color: RomxTheme.border;
+                border-width: 1px;
+                border-radius: 14px;
+                drop-shadow-color: #172b4d12;
+                drop-shadow-blur: 14px;
+                drop-shadow-offset-y: 4px;
+                clip: true;
 
-                Rectangle {
-                    width: 344px;
-                    background: #ffffff;
-                    border-radius: 8px;
-                    VerticalBox {
-                        padding: 10px;
-                        spacing: 6px;
-                        Text { text: root.translate("romx_folder_preview", root.language_index); font-size: 15px; font-weight: 600; height: 22px; }
-                        Rectangle {
-                            vertical-stretch: 1;
-                            background: #f8fafc;
-                            border-radius: 6px;
-                            ListView {
-                                width: parent.width;
-                                height: parent.height;
-                                for item[index] in root.unpack_romx_files: Rectangle {
-                                    width: parent.width;
-                                    height: 28px;
-                                    background: index == root.unpack_romx_selected ? #dbeafe : (Math.mod(index, 2) == 0 ? #f8fafc : #f1f5f9);
-                                    Text { x: 8px; text: item; color: #344054; vertical-alignment: center; width: parent.width - 16px; overflow: elide; }
-                                    TouchArea { clicked => { root.unpack_romx_file_clicked(index); } }
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 8px;
+                    Text {
+                        text: root.translate("custom_game_metadata", root.language_index);
+                        color: RomxTheme.text;
+                        font-size: 18px;
+                        font-weight: 700;
+                        height: 28px;
+                    }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalBox {
+                            width: parent.width;
+                            spacing: 10px;
+                            HorizontalBox {
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+                                min-width: 0px;
+                                height: 34px;
+                                Text { text: root.translate("display_title", root.language_index); width: 130px; horizontal-alignment: left; vertical-alignment: center; }
+                                LineEdit { text <=> root.display_title; placeholder-text: root.translate("display_title_placeholder", root.language_index); horizontal-stretch: 1; min-width: 0px; height: 32px; }
+                            }
+                            HorizontalBox {
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+                                min-width: 0px;
+                                height: 34px;
+                                Text { text: root.translate("genre", root.language_index); width: 130px; horizontal-alignment: left; vertical-alignment: center; }
+                                LineEdit { text <=> root.genre; placeholder-text: root.translate("genre_placeholder", root.language_index); horizontal-stretch: 1; min-width: 0px; height: 32px; }
+                            }
+                            HorizontalBox {
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+                                min-width: 0px;
+                                height: 34px;
+                                Text { text: root.translate("platform", root.language_index); width: 130px; horizontal-alignment: left; vertical-alignment: center; }
+                                ComboBox {
+                                    model: ["gb", "gbc", "gba", "nes", "snes", "n64", "nds", "3ds", "genesis", "sms", "gg", "pce", "playstation", "ps2", "psp", "gamecube", "wii", "arcade", "scummvm", "dos", "amiga"];
+                                    current-value <=> root.platform;
+                                    horizontal-stretch: 1;
+                                    min-width: 0px;
+                                    height: 32px;
                                 }
                             }
-                            if root.unpack_romx_files.length == 0: Text {
-                                text: root.translate("no_romx_files", root.language_index);
-                                color: #98a2b3;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                                width: parent.width;
-                                height: parent.height;
+                            HorizontalBox {
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+                                min-width: 0px;
+                                height: 34px;
+                                Text { text: root.translate("developer", root.language_index); width: 130px; horizontal-alignment: left; vertical-alignment: center; }
+                                LineEdit { text <=> root.developer; placeholder-text: root.translate("developer", root.language_index); horizontal-stretch: 1; min-width: 0px; height: 32px; }
+                            }
+                            HorizontalBox {
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+                                min-width: 0px;
+                                height: 34px;
+                                Text { text: root.translate("release_date", root.language_index); width: 130px; horizontal-alignment: left; vertical-alignment: center; }
+                                LineEdit { text <=> root.release_date; placeholder-text: root.translate("release_date", root.language_index); horizontal-stretch: 1; min-width: 0px; height: 32px; }
+                            }
+                            HorizontalBox {
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+                                min-width: 0px;
+                                height: 34px;
+                                Text { text: root.translate("origin", root.language_index); width: 130px; horizontal-alignment: left; vertical-alignment: center; }
+                                LineEdit { text <=> root.origin; placeholder-text: root.translate("origin_placeholder", root.language_index); horizontal-stretch: 1; min-width: 0px; height: 32px; }
+                            }
+                            HorizontalBox {
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+                                min-width: 0px;
+                                height: 34px;
+                                Text { text: root.translate("custom_crc", root.language_index); width: 130px; horizontal-alignment: left; vertical-alignment: center; }
+                                LineEdit {
+                                    text <=> root.custom_crc;
+                                    placeholder-text: root.translate("custom_crc_placeholder", root.language_index);
+                                    horizontal-stretch: 1;
+                                    min-width: 0px;
+                                    height: 32px;
+                                    enabled: root.identity_mode == "crc32";
+                                }
+                            }
+                            HorizontalBox {
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+                                min-width: 0px;
+                                height: 34px;
+                                Text { text: root.translate("custom_serial", root.language_index); width: 130px; horizontal-alignment: left; vertical-alignment: center; }
+                                LineEdit {
+                                    text <=> root.custom_serial;
+                                    placeholder-text: root.translate("custom_serial_placeholder", root.language_index);
+                                    horizontal-stretch: 1;
+                                    min-width: 0px;
+                                    height: 32px;
+                                    enabled: root.identity_mode == "serial";
+                                }
+                            }
+                        }
+                    }
+                    Button {
+                        text: root.online_match_running
+                            ? root.translate("online_matching", root.language_index)
+                            : root.translate("online_match", root.language_index);
+                        height: 34px;
+                        enabled: !root.online_match_running;
+                        clicked => { root.online_match_clicked(); }
+                    }
+                }
+            }
+
+            // LPL list page: keep the source controls in the center and place
+            // the two folder previews in a dedicated right-hand column.
+            if root.active_page == 0 && root.pack_subpage == 1: Rectangle {
+                horizontal-stretch: 0;
+                preferred-width: 384px;
+                min-width: 0px;
+                height: parent.height;
+                background: RomxTheme.card;
+                border-color: RomxTheme.border;
+                border-width: 1px;
+                border-radius: 14px;
+                drop-shadow-color: #172b4d12;
+                drop-shadow-blur: 14px;
+                drop-shadow-offset-y: 4px;
+                clip: true;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 12px;
+                    VerticalBox {
+                        spacing: 2px;
+                        Text { text: root.translate("lpl_file_path", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                        HorizontalBox {
+                            height: 38px;
+                            spacing: 8px;
+                            LineEdit { text <=> root.lpl_path; placeholder-text: root.translate("choose_lpl_file", root.language_index); horizontal-stretch: 1; height: 34px; }
+                            Button { text: root.translate("open", root.language_index); width: 72px; height: 34px; clicked => { root.open_lpl_clicked(); } }
+                        }
+                    }
+                    VerticalBox {
+                        spacing: 2px;
+                        Text { text: root.translate("rom_folder_path", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                        HorizontalBox {
+                            height: 38px;
+                            spacing: 8px;
+                            LineEdit { text <=> root.lpl_rom_dir; placeholder-text: root.translate("choose_rom_folder", root.language_index); horizontal-stretch: 1; height: 34px; }
+                            Button { text: root.translate("open", root.language_index); width: 72px; height: 34px; clicked => { root.open_lpl_rom_dir_clicked(); } }
+                        }
+                    }
+                    VerticalBox {
+                        spacing: 2px;
+                        Text { text: root.translate("image_folder", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                        HorizontalBox {
+                            height: 38px;
+                            spacing: 8px;
+                            LineEdit { text <=> root.lpl_image_dir; placeholder-text: root.translate("choose_image_folder", root.language_index); horizontal-stretch: 1; height: 34px; }
+                            Button { text: root.translate("open", root.language_index); width: 72px; height: 34px; clicked => { root.open_lpl_image_dir_clicked(); } }
+                        }
+                    }
+                    VerticalBox {
+                        spacing: 2px;
+                        Text { text: root.translate("output_folder", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                        HorizontalBox {
+                            height: 38px;
+                            spacing: 8px;
+                            LineEdit { text <=> root.lpl_save_path; placeholder-text: root.translate("choose_output_folder", root.language_index); horizontal-stretch: 1; height: 34px; }
+                            Button { text: root.translate("open", root.language_index); width: 72px; height: 34px; clicked => { root.open_lpl_save_path_clicked(); } }
+                        }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+
+            if root.active_page == 0 && root.pack_subpage == 1: Rectangle {
+                preferred-width: 384px;
+                horizontal-stretch: 0;
+                min-width: 0px;
+                height: parent.height;
+                background: RomxTheme.card;
+                border-color: RomxTheme.border;
+                border-width: 1px;
+                border-radius: 14px;
+                drop-shadow-color: #172b4d12;
+                drop-shadow-blur: 14px;
+                drop-shadow-offset-y: 4px;
+                clip: true;
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 8px;
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: RomxTheme.card-muted;
+                        border-radius: 6px;
+                        VerticalBox {
+                            padding: 8px;
+                            Text { text: root.translate("rom_folder_preview", root.language_index); font-size: 16px; font-weight: 700; height: 24px; }
+                            Rectangle {
+                                vertical-stretch: 1;
+                                background: #ffffff;
+                                border-radius: 5px;
+                                ListView {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    for item[index] in root.lpl_rom_files: Rectangle {
+                                        width: parent.width;
+                                        height: 28px;
+                                        background: index == root.lpl_rom_selected ? RomxTheme.accent-soft : (Math.mod(index, 2) == 0 ? RomxTheme.card : RomxTheme.canvas);
+                                        Text { x: 8px; text: item; color: RomxTheme.text-muted; vertical-alignment: center; width: parent.width - 16px; overflow: elide; }
+                                        TouchArea { clicked => { root.lpl_rom_file_clicked(index); } }
+                                    }
+                                }
+                                if root.lpl_rom_files.length == 0: Text {
+                                    text: root.translate("no_rom_files", root.language_index);
+                                    color: RomxTheme.text-subtle;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    width: parent.width;
+                                    height: parent.height;
+                                }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: RomxTheme.card-muted;
+                        border-radius: 6px;
+                        VerticalBox {
+                            padding: 8px;
+                            Text { text: root.translate("output_folder_preview", root.language_index); font-size: 16px; font-weight: 700; height: 24px; }
+                            Rectangle {
+                                vertical-stretch: 1;
+                                background: #ffffff;
+                                border-radius: 5px;
+                                ListView {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    for item[index] in root.lpl_output_files: Rectangle {
+                                        width: parent.width;
+                                        height: 28px;
+                                        background: index == root.lpl_output_selected ? RomxTheme.accent-soft : (Math.mod(index, 2) == 0 ? RomxTheme.card : RomxTheme.canvas);
+                                        Text { x: 8px; text: item; color: RomxTheme.text-muted; vertical-alignment: center; width: parent.width - 16px; overflow: elide; }
+                                        TouchArea { clicked => { root.lpl_output_file_clicked(index); } }
+                                    }
+                                }
+                                if root.lpl_output_files.length == 0: Text {
+                                    text: root.translate("no_romx_output_files", root.language_index);
+                                    color: RomxTheme.text-subtle;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    width: parent.width;
+                                    height: parent.height;
+                                }
                             }
                         }
                     }
                 }
+            }
 
-                Rectangle {
-                    width: 344px;
-                    background: #ffffff;
-                    border-radius: 8px;
+            // Unpack page: keep the file controls/list compact and omit the
+            // duplicate right-hand information preview.
+            if root.active_page == 1: Rectangle {
+                horizontal-stretch: 0;
+                preferred-width: 384px;
+                min-width: 0px;
+                height: parent.height;
+                background: RomxTheme.card;
+                border-color: RomxTheme.border;
+                border-width: 1px;
+                border-radius: 14px;
+                drop-shadow-color: #172b4d12;
+                drop-shadow-blur: 14px;
+                drop-shadow-offset-y: 4px;
+                clip: true;
+
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 12px;
                     VerticalBox {
-                        padding: 10px;
+                        spacing: 2px;
+                        Text { text: root.translate("input_file_folder", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                        HorizontalBox {
+                            height: 38px;
+                            spacing: 8px;
+                            LineEdit { text <=> root.unpack_input_path; placeholder-text: root.translate("choose_romx_file_folder", root.language_index); horizontal-stretch: 1; height: 34px; }
+                            Button { text: root.translate("file", root.language_index); width: 64px; height: 34px; clicked => { root.open_unpack_file_clicked(); } }
+                            Button { text: root.translate("folder", root.language_index); width: 72px; height: 34px; clicked => { root.open_unpack_folder_clicked(); } }
+                        }
+                    }
+                    VerticalBox {
+                        spacing: 2px;
+                        Text { text: root.translate("rom_output_folder", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                        HorizontalBox {
+                            height: 38px;
+                            spacing: 8px;
+                            LineEdit { text <=> root.unpack_rom_dir; placeholder-text: root.translate("default_rom_output", root.language_index); horizontal-stretch: 1; height: 34px; }
+                            Button { text: root.translate("open", root.language_index); width: 72px; height: 34px; clicked => { root.open_unpack_rom_dir_clicked(); } }
+                        }
+                    }
+                    VerticalBox {
+                        spacing: 2px;
+                        Text { text: root.translate("cover_output_folder", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                        HorizontalBox {
+                            height: 38px;
+                            spacing: 8px;
+                            LineEdit { text <=> root.unpack_cover_dir; placeholder-text: root.translate("default_cover_output", root.language_index); horizontal-stretch: 1; height: 34px; }
+                            Button { text: root.translate("open", root.language_index); width: 72px; height: 34px; clicked => { root.open_unpack_cover_dir_clicked(); } }
+                        }
+                    }
+                    VerticalBox {
+                        spacing: 2px;
+                        Text { text: root.translate("save_output_folder", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                        HorizontalBox {
+                            height: 38px;
+                            spacing: 8px;
+                            LineEdit { text <=> root.unpack_save_dir; placeholder-text: root.translate("default_save_output", root.language_index); horizontal-stretch: 1; height: 34px; }
+                            Button { text: root.translate("open", root.language_index); width: 72px; height: 34px; clicked => { root.open_unpack_save_dir_clicked(); } }
+                        }
+                    }
+                    VerticalBox {
+                        spacing: 2px;
+                        Text { text: root.translate("lpl_content_root", root.language_index); color: RomxTheme.text-muted; height: 20px; }
+                        HorizontalBox {
+                            height: 38px;
+                            spacing: 8px;
+                            LineEdit { text <=> root.unpack_lpl_dir; placeholder-text: root.translate("choose_content_root", root.language_index); horizontal-stretch: 1; height: 34px; }
+                            Button { text: root.translate("open", root.language_index); width: 72px; height: 34px; clicked => { root.open_unpack_lpl_dir_clicked(); } }
+                        }
+                    }
+                    HorizontalBox {
+                        vertical-stretch: 1;
                         spacing: 8px;
-                        Text { text: root.translate("custom_lpl_paths", root.language_index); font-size: 15px; font-weight: 600; height: 22px; }
-                        Text { text: root.translate("rom_path", root.language_index); height: 18px; }
-                        LineEdit {
-                            text <=> root.unpack_lpl_rom_path;
-                            placeholder-text: root.translate("default_lpl_rom_path", root.language_index);
-                            height: 30px;
-                        }
-                        Text { text: root.translate("cover_path", root.language_index); height: 18px; }
-                        LineEdit {
-                            text <=> root.unpack_lpl_cover_path;
-                            placeholder-text: root.translate("default_lpl_cover_path", root.language_index);
-                            height: 30px;
-                        }
-                        Text {
-                            text: root.translate("custom_lpl_paths_hint", root.language_index);
-                            color: #667085;
-                            wrap: word-wrap;
-                            vertical-stretch: 1;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: RomxTheme.card-muted;
+                            border-radius: 6px;
+                            VerticalBox {
+                                padding: 8px;
+                                Text { text: root.translate("romx_folder_preview", root.language_index); font-size: 16px; font-weight: 700; height: 24px; }
+                                Rectangle {
+                                    vertical-stretch: 1;
+                                    background: #ffffff;
+                                    border-radius: 5px;
+                                    ListView {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        for item[index] in root.unpack_romx_files: Rectangle {
+                                            width: parent.width;
+                                            height: 28px;
+                                            background: index == root.unpack_romx_selected ? RomxTheme.accent-soft : (Math.mod(index, 2) == 0 ? RomxTheme.card : RomxTheme.canvas);
+                                            Text { x: 8px; text: item; color: RomxTheme.text-muted; vertical-alignment: center; width: parent.width - 16px; overflow: elide; }
+                                            TouchArea { clicked => { root.unpack_romx_file_clicked(index); } }
+                                        }
+                                    }
+                                    if root.unpack_romx_files.length == 0: Text {
+                                        text: root.translate("no_romx_files", root.language_index);
+                                        color: RomxTheme.text-subtle;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        width: parent.width;
+                                        height: parent.height;
+                                    }
+                                }
+                            }
                         }
                     }
+                }
+            }
+
+            // Keep the unpack page's custom LPL path controls, but remove only
+            // the duplicate ROM/ROMX information preview above them.
+            if root.active_page == 1: Rectangle {
+                preferred-width: 384px;
+                horizontal-stretch: 0;
+                min-width: 0px;
+                height: parent.height;
+                background: RomxTheme.card;
+                border-color: RomxTheme.border;
+                border-width: 1px;
+                border-radius: 14px;
+                drop-shadow-color: #172b4d12;
+                drop-shadow-blur: 14px;
+                drop-shadow-offset-y: 4px;
+                clip: true;
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 8px;
+                    Text { text: root.translate("custom_lpl_paths", root.language_index); color: RomxTheme.text; font-size: 16px; font-weight: 700; height: 24px; }
+                    Text { text: root.translate("rom_path", root.language_index); height: 18px; }
+                    LineEdit { text <=> root.unpack_lpl_rom_path; placeholder-text: root.translate("default_lpl_rom_path", root.language_index); height: 32px; }
+                    Text { text: root.translate("cover_path", root.language_index); height: 18px; }
+                    LineEdit { text <=> root.unpack_lpl_cover_path; placeholder-text: root.translate("default_lpl_cover_path", root.language_index); height: 32px; }
+                    Text { text: root.translate("custom_lpl_paths_hint", root.language_index); color: RomxTheme.text-muted; wrap: word-wrap; vertical-stretch: 1; }
+                }
+            }
+        }
+    }
+
+    // The bottom action strip is shared by all three pages.
+    Rectangle {
+        x: 14px;
+        y: parent.height - 62px;
+        width: parent.width - 28px;
+        height: 48px;
+        background: RomxTheme.card;
+        border-color: RomxTheme.border;
+        border-width: 1px;
+        border-radius: 14px;
+        drop-shadow-color: #172b4d12;
+        drop-shadow-blur: 12px;
+        drop-shadow-offset-y: 3px;
+        clip: true;
+        HorizontalBox {
+            x: 10px;
+            y: 7px;
+            width: parent.width - 20px;
+            height: 34px;
+            spacing: 8px;
+            cross-axis-alignment: center;
+            // Keep the status on the left while the action group remains in
+            // the right-hand operation area of the shared action strip.
+            Rectangle {
+                horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
+                height: 32px;
+                Rectangle {
+                    x: 2px;
+                    y: 12px;
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: root.conversion_running ? #f79009 : #12b76a;
+                }
+                if root.conversion_running: Text {
+                    text: root.translate("progress", root.language_index) + " "
+                        + root.conversion_current + "/" + root.conversion_total + "  "
+                        + root.translate("success", root.language_index) + " " + root.conversion_imported + "  "
+                        + root.translate("skipped", root.language_index) + " " + root.conversion_skipped;
+                    color: RomxTheme.text-muted;
+                    vertical-alignment: center;
+                    x: 16px;
+                    width: parent.width - 16px;
+                    height: parent.height;
+                    overflow: elide;
+                }
+                if !root.conversion_running: Text {
+                    text: root.status_text == ""
+                        || root.status_text == root.translate("ready", 0)
+                        || root.status_text == root.translate("ready", 1)
+                        ? root.translate("ready", root.language_index)
+                        : root.status_text;
+                    color: RomxTheme.text-muted;
+                    vertical-alignment: center;
+                    x: 16px;
+                    width: parent.width - 16px;
+                    height: parent.height;
+                    overflow: elide;
+                }
+            }
+            HorizontalBox {
+                spacing: 8px;
+                height: 32px;
+                cross-axis-alignment: center;
+                if root.conversion_running: Button {
+                    text: root.translate("cancel", root.language_index);
+                    width: 74px;
+                    height: 30px;
+                    clicked => { root.cancel_conversion_clicked(); }
+                }
+                if !root.conversion_running && root.editing_lpl_file: Button {
+                    text: root.translate("save", root.language_index);
+                    width: 92px;
+                    height: 30px;
+                    clicked => { root.save_lpl_edit_clicked(); }
+                }
+                if !root.conversion_running && root.editing_lpl_file: Button {
+                    text: root.translate("back", root.language_index);
+                    width: 92px;
+                    height: 30px;
+                    clicked => { root.return_lpl_edit_clicked(); }
+                }
+                if !root.conversion_running && !root.editing_lpl_file && root.active_page == 0 && root.pack_subpage == 1 && root.lpl_selected_path != "": Button {
+                    text: root.translate("edit_game_info", root.language_index);
+                    width: 116px;
+                    height: 30px;
+                    clicked => { root.edit_lpl_file_clicked(); }
+                }
+                if !root.conversion_running && !root.editing_lpl_file && root.active_page == 0: Button {
+                    text: root.translate("convert", root.language_index);
+                    width: 104px;
+                    height: 30px;
+                    primary: true;
+                    clicked => { root.convert_clicked(); }
+                }
+                if !root.conversion_running && root.active_page == 1: Button {
+                    text: root.translate("file_convert", root.language_index);
+                    width: 108px;
+                    height: 30px;
+                    primary: true;
+                    clicked => { root.unpack_file_convert_clicked(); }
+                }
+                if !root.conversion_running && root.active_page == 1: Button {
+                    text: root.translate("batch_convert", root.language_index);
+                    width: 124px;
+                    height: 30px;
+                    clicked => { root.unpack_batch_convert_clicked(); }
+                }
+            }
+        }
+    }
+    if root.match_visible: Rectangle {
+        x: root.match_window_x;
+        y: root.match_window_y;
+        width: 760px;
+        height: 540px;
+        background: RomxTheme.card;
+        border-radius: 16px;
+        border-color: RomxTheme.border;
+        border-width: 1px;
+        drop-shadow-color: #172b4d26;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 10px;
+
+        // A blank area of the result panel can be dragged to keep the
+        // original ROM information visible behind it.
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            pointer-event(event) => {
+                if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                    root.match_drag_origin_x = root.match_window_x;
+                    root.match_drag_origin_y = root.match_window_y;
+                }
+            }
+            moved => {
+                root.match_window_x = max(0px, root.match_drag_origin_x + self.mouse-x - self.pressed-x);
+                root.match_window_y = max(0px, root.match_drag_origin_y + self.mouse-y - self.pressed-y);
+            }
+        }
+
+        VerticalBox {
+            padding: 18px;
+            spacing: 10px;
+            Rectangle {
+                height: 42px;
+                background: transparent;
+                Text {
+                    text: root.match_title;
+                    font-size: 22px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    width: parent.width;
+                    height: parent.height;
+                }
+            }
+            Text {
+                text: root.match_message;
+                color: RomxTheme.text-muted;
+                wrap: word-wrap;
+                height: 34px;
+            }
+            HorizontalBox {
+                vertical-stretch: 1;
+                spacing: 12px;
+                Rectangle {
+                    width: 430px;
+                    background: RomxTheme.card-muted;
+                    border-radius: 10px;
+                    if root.match_fields.length > 0: ListView {
+                        x: 10px;
+                        y: 10px;
+                        width: parent.width - 20px;
+                        height: parent.height - 20px;
+                        for field[index] in root.match_fields: CheckBox {
+                            text: field;
+                            width: parent.width - 8px;
+                            height: 38px;
+                            checked: root.match_field_selected[index];
+                            toggled => {
+                                root.match_field_toggled(index, !root.match_field_selected[index]);
+                            }
+                        }
+                    }
+                    if root.match_fields.length == 0: Text {
+                        text: root.translate("no_online_match", root.language_index);
+                        color: RomxTheme.text-muted;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: parent.width;
+                        height: parent.height;
+                    }
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: RomxTheme.card-muted;
+                    border-radius: 10px;
+                    Image {
+                        source: root.match_cover_preview;
+                        image-fit: contain;
+                        x: 10px;
+                        y: 10px;
+                        width: parent.width - 20px;
+                        height: parent.height - 20px;
+                    }
+                    if !root.match_cover_available: Text {
+                        text: root.translate("online_cover_not_found", root.language_index);
+                        color: RomxTheme.text-muted;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: parent.width;
+                        height: parent.height;
+                    }
+                }
+            }
+            HorizontalBox {
+                height: 44px;
+                spacing: 12px;
+                Button {
+                    text: root.translate("select_all", root.language_index);
+                    horizontal-stretch: 1;
+                    height: 38px;
+                    enabled: root.match_fields.length > 0;
+                    clicked => { root.match_select_all_clicked(); }
+                }
+                Button {
+                    text: root.translate("write_selected", root.language_index);
+                    horizontal-stretch: 1;
+                    height: 38px;
+                    enabled: root.match_fields.length > 0;
+                    primary: true;
+                    clicked => { root.match_write_clicked(); }
+                }
+                Button {
+                    text: root.translate("write_all", root.language_index);
+                    horizontal-stretch: 1;
+                    height: 38px;
+                    enabled: root.match_fields.length > 0;
+                    clicked => { root.match_write_all_clicked(); }
+                }
+                Button {
+                    text: root.translate("cancel", root.language_index);
+                    horizontal-stretch: 1;
+                    height: 38px;
+                    clicked => { root.match_cancel_clicked(); }
                 }
             }
         }
     }
 
     if root.preflight_visible: Rectangle {
-        x: 184px;
+        x: 0px;
         y: 0px;
-        width: parent.width - 184px;
+        width: parent.width;
         height: parent.height;
-        background: #66000000;
+        background: #18223066;
         Rectangle {
             x: (parent.width - 620px) / 2;
             y: (parent.height - 430px) / 2;
             width: 620px;
             height: 430px;
-            background: #ffffff;
-            border-radius: 10px;
+            background: RomxTheme.card;
+            border-radius: 16px;
+            drop-shadow-color: #172b4d26;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 10px;
             VerticalBox {
                 padding: 18px;
                 spacing: 10px;
@@ -949,8 +1324,8 @@ export component MainWindow inherits Window {
                 }
                 Rectangle {
                     vertical-stretch: 1;
-                    background: #f6f7f9;
-                    border-radius: 6px;
+                    background: RomxTheme.card-muted;
+                    border-radius: 10px;
                     if root.preflight_stage == 0: Text {
                         text: root.preflight_scanning
                             ? root.translate("scanning_entries", root.language_index)
@@ -960,7 +1335,7 @@ export component MainWindow inherits Window {
                         width: parent.width - 24px;
                         height: parent.height - 20px;
                         wrap: word-wrap;
-                        color: #344054;
+                        color: RomxTheme.text-muted;
                     }
                     if root.preflight_stage == 1: Text {
                         text: root.preflight_report;
@@ -970,7 +1345,7 @@ export component MainWindow inherits Window {
                         height: parent.height - 20px;
                         wrap: word-wrap;
                         overflow: elide;
-                        color: #344054;
+                        color: RomxTheme.text-muted;
                     }
                 }
                 HorizontalBox {
@@ -1009,18 +1384,21 @@ export component MainWindow inherits Window {
     }
 
     if root.conflict_visible: Rectangle {
-        x: 184px;
+        x: 0px;
         y: 0px;
-        width: parent.width - 184px;
+        width: parent.width;
         height: parent.height;
-        background: #66000000;
+        background: #18223066;
         Rectangle {
             x: (parent.width - 620px) / 2;
             y: (parent.height - 220px) / 2;
             width: 620px;
             height: 220px;
-            background: #ffffff;
-            border-radius: 10px;
+            background: RomxTheme.card;
+            border-radius: 16px;
+            drop-shadow-color: #172b4d26;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 10px;
             VerticalBox {
                 padding: 18px;
                 spacing: 10px;
@@ -1032,7 +1410,7 @@ export component MainWindow inherits Window {
                 }
                 Text {
                     text: root.conflict_path;
-                    color: #667085;
+                    color: RomxTheme.text-muted;
                     overflow: elide;
                     height: 24px;
                 }
@@ -1051,18 +1429,21 @@ export component MainWindow inherits Window {
     }
 
     if root.error_visible: Rectangle {
-        x: 184px;
+        x: 0px;
         y: 0px;
-        width: parent.width - 184px;
+        width: parent.width;
         height: parent.height;
-        background: #66000000;
+        background: #18223066;
         Rectangle {
             x: (parent.width - 500px) / 2;
             y: (parent.height - 220px) / 2;
             width: 500px;
             height: 220px;
-            background: #ffffff;
-            border-radius: 10px;
+            background: RomxTheme.card;
+            border-radius: 16px;
+            drop-shadow-color: #172b4d26;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 10px;
             VerticalBox {
                 padding: 18px;
                 spacing: 10px;
@@ -1078,74 +1459,4 @@ export component MainWindow inherits Window {
         }
     }
 
-    Rectangle {
-        x: 204px;
-        y: parent.height - 54px;
-        width: parent.width - 224px;
-        height: 38px;
-        background: #e9edf2;
-        border-radius: 8px;
-        if !root.conversion_running: Text {
-            text: root.status_text == ""
-                || root.status_text == root.translate("ready", 0)
-                || root.status_text == root.translate("ready", 1)
-                ? root.translate("ready", root.language_index)
-                : root.status_text;
-            color: #3f4a59;
-            vertical-alignment: center;
-            x: 12px;
-            width: root.active_page == 1 ? parent.width - 250px : parent.width - 150px;
-        }
-        if root.conversion_running: HorizontalBox {
-            x: 12px;
-            y: 4px;
-            width: parent.width - 24px;
-            height: 30px;
-            spacing: 8px;
-            Text {
-                text: root.translate("progress", root.language_index) + " " + root.conversion_current + "/" + root.conversion_total + "  " + root.translate("success", root.language_index) + " " + root.conversion_imported + "  " + root.translate("skipped", root.language_index) + " " + root.conversion_skipped;
-                color: #3f4a59;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-            }
-            Button {
-                text: root.translate("cancel", root.language_index);
-                width: 72px;
-                height: 30px;
-                clicked => { root.cancel_conversion_clicked(); }
-            }
-        }
-        if !root.conversion_running && root.active_page == 0: Button {
-            text: root.translate("convert", root.language_index);
-            x: parent.width - 112px;
-            y: 4px;
-            width: 96px;
-            height: 30px;
-            clicked => { root.convert_clicked(); }
-        }
-        if !root.conversion_running && root.active_page == 0 && root.pack_subpage == 1 && root.lpl_selected_path != "": Button {
-            text: root.translate("edit_game_info", root.language_index);
-            x: parent.width - 224px;
-            y: 4px;
-            width: 104px;
-            height: 30px;
-            clicked => { root.edit_lpl_file_clicked(); }
-        }
-        if !root.conversion_running && root.active_page == 1: Button {
-            text: root.translate("file_convert", root.language_index);
-            x: parent.width - 240px;
-            y: 4px;
-            width: 104px;
-            height: 30px;
-            clicked => { root.unpack_file_convert_clicked(); }
-        }
-        if !root.conversion_running && root.active_page == 1: Button {
-            text: root.translate("batch_convert", root.language_index);
-            x: parent.width - 132px;
-            y: 4px;
-            width: 120px;
-            height: 30px;
-            clicked => { root.unpack_batch_convert_clicked(); }
-        }
-    }
 }

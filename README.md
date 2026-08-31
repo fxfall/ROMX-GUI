@@ -79,13 +79,17 @@ The core exposes byte-oriented functions for GUI and CLI callers:
 - `read_bytes` / `read_path`: validate the ROMX 0.2.0 footer, RIDX, entry coverage, strict metadata/PNG, and optional immutable hash.
 - `validate_bytes` / `validate_path`: return component-level validation status, calculated payload CRC32/SHA-256, and cover information.
 - `read_metadata_cover_bytes` / `read_metadata_cover_path`: lightweight preview readers that load only the footer, metadata, and optional cover; they intentionally skip the ROM payload and payload/body hash checks.
-- `extract_to_dir`: write the embedded payload, metadata, and cover to a directory.
+- `extract_to_dir`: write the embedded payload, metadata, cover, and logical SAVE objects to a directory. Single-file saves remain ordinary files; multi-file and PSP savedata remain directory trees.
+- `save_profile` / `detect_save_bundles` / `inspect_mutable_path`: apply platform-aware save boundaries. PSP marker directories such as `PARAM.SFO`, directory-per-save platforms, and single-file battery saves are handled by the core rather than by a frontend.
+- `read_mutable_save_objects` / `extract_mutable_save_object` / `extract_mutable_save_objects`: inspect or export SAVE objects from the ROMX mutable region while validating bundle and directory CRC32 values.
+- `read_mutable_region`: retain the complete mutable byte region, including namespaces unknown to the current client, for lossless metadata/cover edits.
+- `inspect_romx_path`, `identity_from_path`, and `check_frontend_compatibility`: provide frontend-ready diagnostics, stable IDs, and platform/format/core checks without loading a ROM payload into the GUI.
 - `required_metadata`: create a schema-versioned metadata object for a GUI form.
 - `classify_gb_payload`: apply the `0xC0`/`0x80` Game Boy CGB-flag policy.
 - `crc32` / `normalize_crc32`: calculate or validate the RetroArch/database lookup key; body SHA-256 is an optional container integrity check, while payload SHA-256 is a derived API value.
 - `plan_lpl_import`: resolve every LPL item to its ROM and optional thumbnail without copying large payloads; intended for GUI import previews.
 - `import_lpl`: convert an `.lpl` or extended `.lplx` and its ROM/thumbnail tree to sequential `.romx` files plus a manifest. Playlist platform and format information are stored in the ROMX footer/RIDX fields, while formal metadata remains limited to the 0.2.0 schema.
-- `export_lpl`: extract a ROMX directory to a RetroArch-compatible ROM, thumbnail, and playlist tree. The generated `.lpl` is filtered to RetroArch's official root/item fields; ROMX-only metadata and custom thumbnail path keys are not written into the playlist.
+- `export_lpl`: extract a ROMX directory to a RetroArch-compatible ROM, thumbnail, playlist, and per-game SAVE tree. The generated `.lpl` is filtered to RetroArch's official root/item fields; ROMX-only metadata and custom thumbnail path keys are not written into the playlist. Use `ExportLplOptions::save_dir` or the CLI `--save-dir` to select the SAVE root.
 
 ### RetroArch playlist fields
 
@@ -202,4 +206,11 @@ Import and export RetroArch playlists:
 ./target/release/romx export-lpl \
   ./build/romx/00-GB \
   --output ./build/retroarch
+
+# The exporter also writes per-game SAVE files/directories below saves/00-GB.
+# Override that root when integrating with an existing frontend layout.
+./target/release/romx export-lpl \
+  ./build/romx/00-GB \
+  --output ./build/retroarch \
+  --save-dir ./build/retroarch/saves/00-GB
 ```

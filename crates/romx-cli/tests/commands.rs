@@ -125,7 +125,7 @@ fn import_and_export_lpl_commands_work() {
         "{}",
         String::from_utf8_lossy(&import.stderr)
     );
-    assert!(romx_dir.join("1.romx").is_file());
+    assert!(romx_dir.join("1.gb.romx").is_file());
 
     let export = Command::new(env!("CARGO_BIN_EXE_romx"))
         .arg("export-lpl")

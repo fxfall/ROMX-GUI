@@ -1,15 +1,15 @@
 use crate::{
-    classify_gb_payload, crc32, format_id_for_extension, launch_format_id_for_extension,
-    normalize_cover_path, normalize_crc32, pack_path_with_metadata_options, platform_id_for_name,
-    read_path, required_metadata, PackOptions, RomxError, SPEC_VERSION,
+    classify_gb_payload, crc32, format_id_for_extension, identity_from_path,
+    launch_format_id_for_extension, normalize_cover_path, normalize_crc32,
+    pack_path_with_metadata_options, platform_id_for_name, read_mutable_save_objects, read_path,
+    required_metadata, MutableSaveBundle, PackOptions, RomxError, RomxIdentity, SPEC_VERSION,
+    SUPPORTED_FORMAT_EXTENSIONS,
 };
 use serde_json::{json, Map, Value};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const SUPPORTED_FORMATS: &[&str] = &[
-    "gb", "gbc", "gba", "nes", "fds", "sfc", "smc", "nds", "3ds", "cci", "md", "gen", "smd", "bin",
-];
 const COVER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
 
 /// Fields understood by RetroArch's JSON playlist reader/writer at the
@@ -126,6 +126,18 @@ pub struct ImportLplOptions {
     pub crc32_override: Option<String>,
     /// Optional exact output resolution for imported covers.
     pub cover_target: Option<(u32, u32)>,
+    /// Optional fixed mutable-region capacity for generated ROMX files.
+    /// Zero keeps the compact profile and omits the mutable region.
+    pub mutable_capacity: u64,
+    /// Optional mutable directory slot count. Zero uses the standard profile.
+    pub mutable_entry_capacity: u32,
+    /// SAVE bundles to initialize in each generated ROMX. The GUI uses this
+    /// for the single-file workflow; playlist conversion normally leaves it
+    /// empty.
+    pub mutable_save_bundles: Vec<MutableSaveBundle>,
+    /// Preserve an existing complete mutable region during a single-item
+    /// frontend edit. New SAVE bundles are used when this is absent.
+    pub mutable_region: Option<Vec<u8>>,
 }
 
 impl Default for ImportLplOptions {
@@ -140,6 +152,10 @@ impl Default for ImportLplOptions {
             temporary_output: false,
             crc32_override: None,
             cover_target: None,
+            mutable_capacity: 0,
+            mutable_entry_capacity: 0,
+            mutable_save_bundles: Vec::new(),
+            mutable_region: None,
         }
     }
 }
@@ -186,6 +202,10 @@ pub struct ExportLplOptions {
     pub lpl_path: Option<PathBuf>,
     pub rom_dir: Option<PathBuf>,
     pub cover_dir: Option<PathBuf>,
+    /// Root for exported logical SAVE objects. Each ROMX gets a child named
+    /// after its exported ROM, and each object is either a normal save file or
+    /// a directory tree according to its stored shape.
+    pub save_dir: Option<PathBuf>,
     pub lpl_rom_prefix: Option<String>,
     /// Legacy compatibility option. Cover files are still written to
     /// `cover_dir`, but no cover-path key is emitted because RetroArch's
@@ -204,6 +224,7 @@ impl Default for ExportLplOptions {
             lpl_path: None,
             rom_dir: None,
             cover_dir: None,
+            save_dir: None,
             lpl_rom_prefix: None,
             lpl_cover_prefix: None,
             cover_set: "Named_Snaps".into(),
@@ -221,6 +242,7 @@ pub struct ExportLplReport {
     pub lpl_path: PathBuf,
     pub rom_dir: PathBuf,
     pub cover_dir: PathBuf,
+    pub save_dir: PathBuf,
 }
 
 fn read_lpl_document(path: &Path) -> Result<Value, RomxError> {
@@ -308,14 +330,35 @@ fn supported_platform(value: Option<&Value>) -> Option<&str> {
     let value = value?.as_str()?;
     matches!(
         value,
-        "gb" | "gbc" | "gba" | "nes" | "snes" | "nds" | "3ds" | "genesis"
+        "gb" | "gbc"
+            | "gba"
+            | "nes"
+            | "snes"
+            | "n64"
+            | "nds"
+            | "3ds"
+            | "genesis"
+            | "sms"
+            | "gg"
+            | "pce"
+            | "playstation"
+            | "ps2"
+            | "psp"
+            | "gamecube"
+            | "wii"
+            | "arcade"
+            | "scummvm"
+            | "dos"
+            | "amiga"
     )
     .then_some(value)
 }
 
 fn supported_payload_format(value: Option<&Value>) -> Option<&str> {
     let value = value?.as_str()?;
-    SUPPORTED_FORMATS.contains(&value).then_some(value)
+    SUPPORTED_FORMAT_EXTENSIONS
+        .contains(&value)
+        .then_some(value)
 }
 
 fn lplx_metadata_value<'a>(item: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
@@ -402,6 +445,7 @@ fn manifest_lplx_item(
     item: &PlannedLplItem,
     expected_filename: &str,
     output_filename: Option<&str>,
+    identity: Option<&RomxIdentity>,
 ) -> Value {
     let mut manifest_item = Map::new();
     manifest_item.insert(
@@ -419,6 +463,14 @@ fn manifest_lplx_item(
         Value::String(item.source_path.clone()),
     );
     manifest_item.insert("label".into(), Value::String(item.label.clone()));
+    if let Some(identity) = identity {
+        manifest_item.insert("romx_id".into(), Value::String(identity.romx_id.clone()));
+        manifest_item.insert("entry_id".into(), Value::String(identity.entry_id.clone()));
+        manifest_item.insert(
+            "payload_sha256".into(),
+            Value::String(identity.payload_sha256.clone()),
+        );
+    }
     if let Some(retroarch) = item.retroarch.as_object() {
         for (key, value) in retroarch {
             if is_official_lpl_item_field(key) && key != "path" && key != "label" {
@@ -508,11 +560,22 @@ fn platform_for(payload_format: &str, playlist_name: &str) -> &'static str {
         "gb" => "gb",
         "gbc" => "gbc",
         "gba" => "gba",
-        "nes" | "fds" => "nes",
+        "nes" | "unf" | "unif" | "fds" => "nes",
         "sfc" | "smc" => "snes",
         "nds" => "nds",
-        "3ds" | "cci" | "cia" => "3ds",
+        "3ds" | "cci" | "cxi" | "app" => "3ds",
+        "z64" | "n64" | "v64" => "n64",
         "md" | "gen" | "smd" | "bin" => "genesis",
+        "sms" => "sms",
+        "gg" => "gg",
+        "pce" => "pce",
+        "iso" | "cso" | "zso" | "chd" | "pbp" | "cdi" | "cue" | "ccd" | "mds" | "toc" | "wav"
+        | "flac" | "img" | "mdf" | "sbi" | "sub" | "ecm" => "playstation",
+        "gcm" => "gamecube",
+        "wbfs" | "rvz" | "wia" | "wad" => "wii",
+        "prx" => "psp",
+        "elf" => "arcade",
+        "msu" | "pcm" => "snes",
         _ => "gb",
     }
 }
@@ -535,7 +598,8 @@ fn platform_from_database_name(database: &str) -> Option<&'static str> {
 }
 
 fn lpl_platform(item: &Map<String, Value>, payload_format: &str, playlist: &str) -> String {
-    supported_platform(lplx_metadata_value(item, "platform"))
+    supported_platform(item.get("platform"))
+        .or_else(|| supported_platform(lplx_metadata_value(item, "platform")))
         .or_else(|| {
             item.get("db_name")
                 .and_then(Value::as_str)
@@ -628,7 +692,7 @@ pub fn plan_lpl_import(
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_lowercase();
-        if !SUPPORTED_FORMATS.contains(&payload_format.as_str()) {
+        if !SUPPORTED_FORMAT_EXTENSIONS.contains(&payload_format.as_str()) {
             if options.skip_missing {
                 skipped += 1;
                 continue;
@@ -835,6 +899,10 @@ where
                 platform_id: platform_id_for_name(&item.platform),
                 entry_format_id: format_id_for_extension(&item.payload_format),
                 launch_format_id: launch_format_id_for_extension(&item.payload_format),
+                mutable_capacity: options.mutable_capacity,
+                mutable_entry_capacity: options.mutable_entry_capacity,
+                mutable_save_bundles: options.mutable_save_bundles.clone(),
+                mutable_region: options.mutable_region.clone(),
                 ..Default::default()
             };
             pack_path_with_metadata_options(
@@ -844,12 +912,14 @@ where
                 &output_path,
                 &pack_options,
             )?;
+            let identity = identity_from_path(&output_path).ok();
             let committed = on_output(&output_path)?;
             if let Some(committed_path) = committed.as_deref() {
                 manifest_items.push(manifest_lplx_item(
                     item,
                     &expected_filename,
                     committed_path.file_name().and_then(|value| value.to_str()),
+                    identity.as_ref(),
                 ));
             }
             Ok(committed)
@@ -895,14 +965,26 @@ where
 }
 
 fn collect_romx_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), RomxError> {
-    for entry in fs::read_dir(directory)? {
-        let path = entry?.path();
-        if path.is_dir() {
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by(|left, right| {
+        left.file_name()
+            .to_string_lossy()
+            .as_bytes()
+            .cmp(right.file_name().to_string_lossy().as_bytes())
+    });
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
             collect_romx_files(&path, output)?;
-        } else if path
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("romx"))
+        } else if metadata.is_file()
+            && path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("romx"))
         {
             output.push(path);
         }
@@ -984,13 +1066,13 @@ fn safe_filename(label: &str) -> String {
 }
 
 fn planned_romx_filename(item: &PlannedLplItem) -> String {
-    let stem = item
+    let filename = item
         .rom_path
-        .file_stem()
+        .file_name()
         .and_then(|value| value.to_str())
         .map(safe_filename)
         .unwrap_or_else(|| "untitled".into());
-    format!("{stem}.romx")
+    format!("{filename}.romx")
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), RomxError> {
@@ -999,8 +1081,10 @@ fn write_json(path: &Path, value: &Value) -> Result<(), RomxError> {
     }
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
-    fs::write(path, bytes)?;
-    Ok(())
+    super::write_atomic_stream(path, true, |file| {
+        file.write_all(&bytes)?;
+        Ok(())
+    })
 }
 
 fn export_sources(source: &Path) -> Result<Vec<PathBuf>, RomxError> {
@@ -1103,6 +1187,10 @@ where
             .join(&playlist)
             .join(&options.cover_set)
     });
+    let save_dir = options
+        .save_dir
+        .clone()
+        .unwrap_or_else(|| output_root.join("saves").join(&playlist));
     let lpl_path = options.lpl_path.clone().unwrap_or_else(|| {
         output_root
             .join("playlists")
@@ -1110,6 +1198,7 @@ where
     });
     fs::create_dir_all(&rom_dir)?;
     fs::create_dir_all(&cover_dir)?;
+    fs::create_dir_all(&save_dir)?;
     let prefix = options
         .lpl_rom_prefix
         .clone()
@@ -1142,7 +1231,20 @@ where
                 .and_then(|value| value.to_str())
                 .map(safe_filename)
                 .unwrap_or_else(|| "untitled".into());
-            let rom_target = rom_dir.join(format!("{source_stem}.{payload_format}"));
+            // New ROMX files keep the original payload extension in their
+            // name (for example `game.gba.romx`).  Do not append the format a
+            // second time while exporting them (`game.gba.gba`).  Older
+            // containers named `game.romx` still receive the format suffix.
+            let rom_filename = if Path::new(&source_stem)
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case(payload_format))
+            {
+                source_stem.clone()
+            } else {
+                format!("{source_stem}.{payload_format}")
+            };
+            let rom_target = rom_dir.join(&rom_filename);
             let staged_rom = temporary_output_path(&rom_target, options.temporary_output);
             fs::write(&staged_rom, &document.rom)?;
             let Some(committed_rom) = on_output(&staged_rom)? else {
@@ -1175,6 +1277,38 @@ where
             } else {
                 None
             };
+            let save_game_dir = save_dir.join(safe_filename(rom_filename));
+            let save_objects = read_mutable_save_objects(romx_path)?.objects;
+            for object in save_objects {
+                if is_cancelled() {
+                    return Err(RomxError::Cancelled);
+                }
+                let single_file = object.files.len() == 1
+                    && !object.files[0].path.contains('/')
+                    && !object.files[0].path.eq_ignore_ascii_case("PARAM.SFO");
+                for file in object.files {
+                    let target = if single_file {
+                        let extension = Path::new(&file.path)
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            .filter(|value| !value.is_empty())
+                            .map(|value| format!(".{value}"))
+                            .unwrap_or_default();
+                        save_game_dir.join(format!("{}{extension}", object.key))
+                    } else {
+                        save_game_dir.join(&object.key).join(&file.path)
+                    };
+                    let staged = temporary_output_path(&target, options.temporary_output);
+                    if let Some(parent) = staged.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&staged, file.bytes)?;
+                    // SAVE files are independent outputs. A conflict choice
+                    // of "skip" only skips this file; the ROM and LPL item
+                    // remain exportable.
+                    let _ = on_output(&staged)?;
+                }
+            }
             let item_path = joined_lpl_path(&prefix, rom_filename);
             let lookup_crc = document
                 .metadata
@@ -1270,5 +1404,6 @@ where
         lpl_path: committed_lpl,
         rom_dir,
         cover_dir,
+        save_dir,
     })
 }

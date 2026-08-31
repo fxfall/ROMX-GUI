@@ -5,10 +5,15 @@ slint::include_modules!();
 use image::ImageReader;
 use rfd::FileDialog;
 use romx_core::{
-    application_version, classify_gb_payload, export_lpl_with_output_handling, format_extension,
-    import_lpl_with_error_handling, plan_lpl_import, platform_name_from_id,
-    read_metadata_cover_path, read_path, ExportLplOptions, ImportLplPlan, LPLX_METADATA_KEY,
-    ROMX_LPLX_METADATA_FIELDS, SPEC_VERSION,
+    application_version, check_frontend_compatibility, classify_gb_payload, crc32_path,
+    detect_save_bundles, download_libretro_thumbnail, export_lpl_with_output_handling,
+    format_extension, format_id_for_extension, identity_from_path, import_lpl_with_error_handling,
+    inspect_payload_profile, libretro_lookup_candidates, libretro_match_mode, normalize_crc32,
+    plan_lpl_import, platform_name_from_id, read_metadata_cover_path, read_mutable_region,
+    read_mutable_save_objects, read_path, recommended_mutable_capacity,
+    recommended_mutable_capacity_for_save_bytes, recommended_mutable_entry_capacity, EmbeddedCover,
+    ExportLplOptions, ImportLplPlan, LibretroLookup, MutableSaveBundle, LPLX_METADATA_KEY,
+    ROMX_LPLX_METADATA_FIELDS, SPEC_VERSION, SUPPORTED_FORMAT_EXTENSIONS,
 };
 use serde_json::{Map, Value};
 use slint::{Image, ModelRc, SharedPixelBuffer, SharedString, VecModel};
@@ -34,9 +39,7 @@ use objc2_app_kit::{NSColor, NSView};
 #[cfg(target_os = "macos")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-const ROM_EXTENSIONS: &[&str] = &[
-    "gb", "gbc", "gba", "nes", "fds", "sfc", "smc", "nds", "3ds", "cci", "md", "gen", "smd", "bin",
-];
+const ROM_EXTENSIONS: &[&str] = SUPPORTED_FORMAT_EXTENSIONS;
 const ROMX_EXTENSIONS: &[&str] = &["romx"];
 struct LocaleCatalog {
     languages: Vec<HashMap<String, String>>,
@@ -141,7 +144,13 @@ struct LplWorkspace {
     pending: Option<PendingConversion>,
     single_conflict: Option<PendingSingleConflict>,
     romx_cover_path: Option<PathBuf>,
+    existing_mutable_region: Option<Vec<u8>>,
+    embedded_covers: Vec<EmbeddedCover>,
     romx_metadata: Option<Value>,
+    current_payload_format: Option<String>,
+    online_metadata: Map<String, Value>,
+    online_match: Arc<Mutex<Option<OnlineMatchState>>>,
+    online_match_generation: Arc<AtomicUsize>,
     plan_cache: Option<ImportLplPlan>,
     plan_path_index: Option<HashMap<String, usize>>,
     rom_entries: Vec<PathBuf>,
@@ -209,6 +218,18 @@ struct PreviewTask {
     window: slint::Weak<MainWindow>,
 }
 
+struct OnlineMatchEntry {
+    key: String,
+    value: Value,
+    candidate_index: usize,
+}
+
+struct OnlineMatchState {
+    entries: Vec<OnlineMatchEntry>,
+    selected: Vec<bool>,
+    cover: Option<Vec<u8>>,
+}
+
 fn start_preview_worker() -> Sender<PreviewTask> {
     let (sender, receiver) = mpsc::channel::<PreviewTask>();
     thread::spawn(move || {
@@ -272,12 +293,17 @@ struct PendingConversion {
     lpl_path: PathBuf,
     save_path: PathBuf,
     cover_target: Option<(u32, u32)>,
+    mutable_capacity: u64,
 }
 
 struct SingleConversion {
     lpl_path: PathBuf,
     payload_path: Option<PathBuf>,
     cover_target: Option<(u32, u32)>,
+    mutable_capacity: u64,
+    mutable_entry_capacity: u32,
+    mutable_save_bundles: Vec<MutableSaveBundle>,
+    mutable_region: Option<Vec<u8>>,
     save_path: PathBuf,
     output_path: PathBuf,
     replace: bool,
@@ -312,7 +338,13 @@ impl LplWorkspace {
             pending: None,
             single_conflict: None,
             romx_cover_path: None,
+            existing_mutable_region: None,
+            embedded_covers: Vec::new(),
             romx_metadata: None,
+            current_payload_format: None,
+            online_metadata: Map::new(),
+            online_match: Arc::new(Mutex::new(None)),
+            online_match_generation: Arc::new(AtomicUsize::new(0)),
             plan_cache: None,
             plan_path_index: None,
             rom_entries: Vec::new(),
@@ -336,7 +368,15 @@ impl LplWorkspace {
         self.pending = None;
         self.single_conflict = None;
         self.romx_cover_path = None;
+        self.existing_mutable_region = None;
+        self.embedded_covers.clear();
         self.romx_metadata = None;
+        self.current_payload_format = None;
+        self.online_metadata.clear();
+        self.online_match_generation.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut state) = self.online_match.lock() {
+            *state = None;
+        }
         self.plan_cache = None;
         self.plan_path_index = None;
         self.rom_entries.clear();
@@ -353,7 +393,15 @@ impl LplWorkspace {
         if let Some(path) = self.romx_cover_path.take() {
             let _ = fs::remove_file(path);
         }
+        self.existing_mutable_region = None;
+        self.embedded_covers.clear();
         self.romx_metadata = None;
+        self.current_payload_format = None;
+        self.online_metadata.clear();
+        self.online_match_generation.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut state) = self.online_match.lock() {
+            *state = None;
+        }
     }
 
     fn next_single_path(&mut self) -> PathBuf {
@@ -420,20 +468,51 @@ fn final_output_name(staged: &Path) -> Option<String> {
         .map(|value| value.strip_suffix(".tmp").unwrap_or(value).to_owned())
 }
 
+fn backup_target(path: &Path) -> PathBuf {
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    (1..)
+        .map(|index| path.with_file_name(format!(".{filename}.romx-backup-{index}")))
+        .find(|candidate| !candidate.exists())
+        .unwrap_or_else(|| path.with_file_name(format!(".{filename}.romx-backup")))
+}
+
 fn commit_staged(staged: &Path, target: &Path, replace: bool) -> Result<PathBuf, String> {
     if !replace && target.exists() {
         return Err(format!("Output file already exists: {}", target.display()));
     }
-    if replace && target.exists() {
-        fs::remove_file(target)
-            .map_err(|error| format!("Failed to remove the old output: {error}"))?;
-    }
+    let backup = if replace && target.exists() {
+        let backup = backup_target(target);
+        fs::rename(target, &backup)
+            .map_err(|error| format!("Failed to stage the old output: {error}"))?;
+        Some(backup)
+    } else {
+        None
+    };
     if let Err(rename_error) = fs::rename(staged, target) {
-        fs::copy(staged, target).map_err(|copy_error| {
-            format!("Failed to commit output: {rename_error}; copy also failed: {copy_error}")
-        })?;
-        fs::remove_file(staged)
-            .map_err(|error| format!("Failed to clean up the staged output: {error}"))?;
+        let copied = fs::copy(staged, target);
+        if copied.is_ok() {
+            fs::remove_file(staged)
+                .map_err(|error| format!("Failed to clean up the staged output: {error}"))?;
+        } else {
+            if let Some(backup) = &backup {
+                let _ = fs::rename(backup, target);
+            }
+            return Err(format!(
+                "Failed to commit output: {rename_error}; copy also failed: {}",
+                copied.expect_err("copy error is present")
+            ));
+        }
+    }
+    if let Some(backup) = backup {
+        if let Err(error) = fs::remove_file(&backup) {
+            return Err(format!(
+                "Output committed, but backup cleanup failed ({}): {error}",
+                backup.display()
+            ));
+        }
     }
     Ok(target.to_owned())
 }
@@ -452,13 +531,22 @@ fn path_stem(path: &str) -> String {
         .to_owned()
 }
 
+fn path_file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("untitled")
+        .to_owned()
+}
+
 fn payload_format(path: &str) -> Result<String, String> {
     let format = Path::new(path)
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_lowercase();
-    if ROM_EXTENSIONS.contains(&format.as_str()) {
+    if format_id_for_extension(&format) != 0 {
         Ok(format)
     } else {
         Err(format!(
@@ -778,11 +866,22 @@ fn platform_for_path(path: &str) -> &'static str {
         "gb" => "gb",
         "gbc" => "gbc",
         "gba" => "gba",
-        "nes" | "fds" => "nes",
+        "nes" | "unf" | "unif" | "fds" => "nes",
         "sfc" | "smc" => "snes",
         "nds" => "nds",
-        "3ds" | "cci" | "cia" => "3ds",
+        "3ds" | "cci" | "cxi" | "app" => "3ds",
+        "z64" | "n64" | "v64" => "n64",
         "md" | "gen" | "smd" | "bin" => "genesis",
+        "sms" => "sms",
+        "gg" => "gg",
+        "pce" => "pce",
+        "iso" | "cso" | "zso" | "chd" | "pbp" | "cdi" | "cue" | "ccd" | "mds" | "toc" | "wav"
+        | "flac" | "img" | "mdf" | "sbi" | "sub" | "ecm" => "playstation",
+        "gcm" => "gamecube",
+        "wbfs" | "rvz" | "wia" | "wad" => "wii",
+        "prx" => "psp",
+        "elf" => "arcade",
+        "msu" | "pcm" => "snes",
         _ => "gba",
     }
 }
@@ -790,8 +889,47 @@ fn platform_for_path(path: &str) -> &'static str {
 fn supported_platform(value: &str) -> bool {
     matches!(
         value,
-        "gb" | "gbc" | "gba" | "nes" | "snes" | "nds" | "3ds" | "genesis"
+        "gb" | "gbc"
+            | "gba"
+            | "nes"
+            | "snes"
+            | "n64"
+            | "nds"
+            | "3ds"
+            | "genesis"
+            | "sms"
+            | "gg"
+            | "pce"
+            | "playstation"
+            | "ps2"
+            | "psp"
+            | "gamecube"
+            | "wii"
+            | "arcade"
+            | "scummvm"
+            | "dos"
+            | "amiga"
+            | "ps1"
+            | "fds"
+            | "gamegear"
+            | "genesis32x"
+            | "pcecd"
+            | "segacd"
+            | "saturn"
+            | "dreamcast"
     )
+}
+
+fn update_identity_mode(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
+    let platform = window.get_platform();
+    let format = workspace.borrow().current_payload_format.clone();
+    let mode = libretro_match_mode(&platform, format.as_deref()).unwrap_or_default();
+    window.set_identity_mode(mode.into());
+}
+
+fn set_identity_fields(window: &MainWindow, value: &Value) {
+    window.set_custom_crc(metadata_text(value, "crc32").into());
+    window.set_custom_serial(metadata_text(value, "serial").into());
 }
 
 fn set_metadata_form(window: &MainWindow, value: &Value) {
@@ -823,6 +961,435 @@ fn set_metadata_form(window: &MainWindow, value: &Value) {
     window.set_developer(metadata_text(value, "developer").into());
     window.set_release_date(metadata_text(value, "release_date").into());
     window.set_origin(origin.into());
+    set_identity_fields(window, value);
+}
+
+fn values_model(values: Vec<String>) -> ModelRc<SharedString> {
+    ModelRc::from(Rc::new(VecModel::from(
+        values
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<SharedString>>(),
+    )))
+}
+
+fn bools_model(values: Vec<bool>) -> ModelRc<bool> {
+    ModelRc::from(Rc::new(VecModel::from(values)))
+}
+
+fn lookup_value_text(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Array(values) => values
+            .iter()
+            .map(lookup_value_text)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Null => String::new(),
+        _ => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+fn online_field_name(window: &MainWindow, key: &str) -> String {
+    let fallback = match key {
+        "name" => "Name",
+        "description" => "Description",
+        "developer" => "Developer",
+        "publisher" => "Publisher",
+        "serial" => "Serial",
+        "crc" => "CRC32",
+        "genre" => "Genre",
+        "region" | "country" => "Country",
+        "__cover" => "Online Cover",
+        _ => key,
+    };
+    localized_text(window, &format!("online_field_{key}"), fallback)
+}
+
+fn online_match_labels(window: &MainWindow, entries: &[OnlineMatchEntry]) -> Vec<String> {
+    let multiple = entries.iter().any(|entry| entry.candidate_index > 0);
+    entries
+        .iter()
+        .map(|entry| {
+            let prefix = if multiple {
+                format!("#{} ", entry.candidate_index + 1)
+            } else {
+                String::new()
+            };
+            if entry.key == "__cover" {
+                format!("{prefix}{}", online_field_name(window, "__cover"))
+            } else {
+                format!(
+                    "{prefix}{}: {}",
+                    online_field_name(window, &entry.key),
+                    lookup_value_text(&entry.value)
+                )
+            }
+        })
+        .collect()
+}
+
+fn refresh_online_match_text(window: &MainWindow) {
+    window.set_match_title(
+        localized_text(window, "online_match_result", "Online Match Result").into(),
+    );
+    let count = window.get_match_record_count();
+    if count >= 0 {
+        let message = if count == 0 {
+            localized_text(window, "no_online_match", "No matching record was found.")
+        } else {
+            localized_text(
+                window,
+                "online_match_found",
+                "Matched {count} record(s). Select the fields to write.",
+            )
+            .replace("{count}", &count.to_string())
+        };
+        window.set_match_message(message.into());
+    }
+}
+
+fn lookup_entries(lookups: &[LibretroLookup], cover_available: bool) -> Vec<OnlineMatchEntry> {
+    let keys = [
+        "name",
+        "description",
+        "developer",
+        "publisher",
+        "serial",
+        "crc",
+        "genre",
+        "region",
+        "country",
+    ];
+    let mut entries = Vec::new();
+    for (candidate_index, lookup) in lookups.iter().enumerate() {
+        let Some(record) = lookup.record.as_object() else {
+            continue;
+        };
+        for key in keys {
+            let Some(value) = record.get(key) else {
+                continue;
+            };
+            if lookup_value_text(value).is_empty() {
+                continue;
+            }
+            entries.push(OnlineMatchEntry {
+                key: key.to_owned(),
+                value: value.clone(),
+                candidate_index,
+            });
+        }
+    }
+    if cover_available {
+        entries.push(OnlineMatchEntry {
+            key: "__cover".to_owned(),
+            value: Value::Null,
+            candidate_index: 0,
+        });
+    }
+    entries
+}
+
+fn show_online_match(
+    window: &MainWindow,
+    match_store: &Arc<Mutex<Option<OnlineMatchState>>>,
+    result: Result<(Vec<LibretroLookup>, Option<Vec<u8>>), String>,
+) {
+    window.set_online_match_running(false);
+    match result {
+        Ok((lookups, cover)) => {
+            let cover_available = cover.is_some();
+            let cover_preview = cover
+                .as_deref()
+                .and_then(|bytes| decode_preview_bytes(bytes).ok())
+                .map(|preview| decoded_preview_to_slint(&preview));
+            let entries = lookup_entries(&lookups, cover_available);
+            let labels = online_match_labels(window, &entries);
+            let count = lookups.len();
+            let message = if count == 0 {
+                localized_text(window, "no_online_match", "No matching record was found.")
+            } else {
+                localized_text(
+                    window,
+                    "online_match_found",
+                    "Matched {count} record(s). Select the fields to write.",
+                )
+                .replace("{count}", &count.to_string())
+            };
+            let selected = vec![true; entries.len()];
+            if let Ok(mut state) = match_store.lock() {
+                *state = Some(OnlineMatchState {
+                    entries,
+                    selected: selected.clone(),
+                    cover,
+                });
+            }
+            window.set_match_title(
+                localized_text(window, "online_match_result", "Online Match Result").into(),
+            );
+            window.set_match_record_count(count as i32);
+            window.set_match_message(message.into());
+            window.set_match_fields(values_model(labels));
+            window.set_match_field_selected(bools_model(selected));
+            window.set_match_cover_preview(cover_preview.unwrap_or_default());
+            window.set_match_cover_available(cover_available);
+            window.set_match_visible(true);
+        }
+        Err(error) => {
+            if let Ok(mut state) = match_store.lock() {
+                *state = Some(OnlineMatchState {
+                    entries: Vec::new(),
+                    selected: Vec::new(),
+                    cover: None,
+                });
+            }
+            window.set_match_title(
+                localized_text(window, "online_match_result", "Online Match Result").into(),
+            );
+            window.set_match_record_count(-1);
+            window.set_match_message(format!("Online match failed: {error}").into());
+            window.set_match_fields(values_model(Vec::new()));
+            window.set_match_field_selected(bools_model(Vec::new()));
+            window.set_match_cover_preview(Image::default());
+            window.set_match_cover_available(false);
+            window.set_match_visible(true);
+        }
+    }
+}
+
+fn online_match(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
+    let rom_path = window.get_rom_path();
+    if rom_path.trim().is_empty() {
+        set_status(
+            window,
+            "choose_game_and_save_path_first",
+            "Choose a game file first",
+        );
+        return;
+    }
+    let (platform, payload_format, cache_dir) = {
+        let state = workspace.borrow();
+        let platform = if supported_platform(window.get_platform().trim()) {
+            window.get_platform().trim().to_owned()
+        } else {
+            platform_for_path(&rom_path).to_owned()
+        };
+        let payload_format = state.current_payload_format.clone().or_else(|| {
+            Path::new(rom_path.trim())
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+        });
+        let cache_dir = state.temp_dir.join("libretro-cache");
+        (platform, payload_format, cache_dir)
+    };
+    let mut metadata = Map::new();
+    let name = window.get_display_title();
+    if !name.trim().is_empty() {
+        metadata.insert("name".into(), Value::String(name.trim().to_owned()));
+    }
+    let crc_value = window.get_custom_crc();
+    if !crc_value.trim().is_empty() {
+        match normalize_crc32(crc_value.trim()) {
+            Ok(crc) => {
+                metadata.insert("crc32".into(), Value::String(crc));
+            }
+            Err(error) => {
+                set_status(
+                    window,
+                    format!("Invalid custom CRC32: {error}"),
+                    format!("Invalid custom CRC32: {error}"),
+                );
+                return;
+            }
+        }
+    }
+    let serial = window.get_custom_serial();
+    if !serial.trim().is_empty() {
+        metadata.insert("serial".into(), Value::String(serial.trim().to_owned()));
+    }
+    let metadata = Value::Object(metadata);
+    let weak = window.as_weak();
+    let match_store = workspace.borrow().online_match.clone();
+    let match_generation = workspace.borrow().online_match_generation.clone();
+    let request_id = match_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    window.set_online_match_running(true);
+    set_status(window, "online_matching", "Matching online...");
+    thread::spawn(move || {
+        let result = libretro_lookup_candidates(
+            &platform,
+            &metadata,
+            None,
+            Some(&cache_dir),
+            payload_format.as_deref(),
+        )
+        .map_err(|error| error.to_string())
+        .map(|lookups| {
+            let cover = lookups
+                .iter()
+                .flat_map(|lookup| {
+                    ["description", "name"].into_iter().filter_map(|key| {
+                        lookup
+                            .record
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .filter(|name| !name.trim().is_empty())
+                    })
+                })
+                .find_map(|name| {
+                    download_libretro_thumbnail(&platform, name, "Named_Boxarts", Some(&cache_dir))
+                        .ok()
+                        .flatten()
+                });
+            (lookups, cover)
+        });
+        let _ = slint::invoke_from_event_loop(move || {
+            if match_generation.load(Ordering::Relaxed) == request_id {
+                if let Some(window) = weak.upgrade() {
+                    show_online_match(&window, &match_store, result);
+                }
+            }
+        });
+    });
+}
+
+fn apply_online_match_value(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    key: &str,
+    value: &Value,
+) {
+    match key {
+        "name" => window.set_display_title(lookup_value_text(value).into()),
+        "developer" => window.set_developer(lookup_value_text(value).into()),
+        "serial" => window.set_custom_serial(lookup_value_text(value).into()),
+        "crc" => {
+            if let Some(value) = value.as_str() {
+                if let Ok(value) = normalize_crc32(value) {
+                    window.set_custom_crc(value.into());
+                }
+            }
+        }
+        "genre" => {
+            let metadata = serde_json::json!({"genre": value});
+            window.set_genre(metadata_genre_text(&metadata).into());
+        }
+        "region" | "country" => {
+            let country = lookup_value_text(value);
+            window.set_origin(country.clone().into());
+            workspace
+                .borrow_mut()
+                .online_metadata
+                .insert("origin".into(), Value::String(country));
+        }
+        key => {
+            workspace
+                .borrow_mut()
+                .online_metadata
+                .insert(key.to_owned(), value.clone());
+        }
+    }
+}
+
+fn store_online_cover(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    cover: &[u8],
+) -> bool {
+    let path = {
+        let state = workspace.borrow();
+        if let Err(error) = fs::create_dir_all(&state.temp_dir)
+            .and_then(|_| fs::write(state.temp_dir.join("online-match-cover.png"), cover))
+        {
+            set_status(
+                window,
+                format!("Failed to save online cover: {error}"),
+                format!("Online cover save failed: {error}"),
+            );
+            return false;
+        }
+        state.temp_dir.join("online-match-cover.png")
+    };
+    workspace.borrow_mut().romx_cover_path = Some(path.clone());
+    window.set_cover_path(path.to_string_lossy().into_owned().into());
+    request_preview_path(window, workspace, Some(&path));
+    true
+}
+
+fn apply_online_match(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, write_all: bool) {
+    let match_store = workspace.borrow().online_match.clone();
+    let pending = match_store.lock().ok().and_then(|mut state| state.take());
+    let Some(pending) = pending else {
+        window.set_match_visible(false);
+        return;
+    };
+    let OnlineMatchState {
+        entries,
+        selected,
+        cover,
+    } = pending;
+    let updates = entries
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| write_all || selected.get(*index).copied().unwrap_or(false))
+        .map(|(_, entry)| (entry.key, entry.value))
+        .collect::<Vec<_>>();
+    for (key, value) in updates {
+        if key == "__cover" {
+            if let Some(cover) = cover.as_deref() {
+                let _ = store_online_cover(window, workspace, cover);
+            }
+        } else {
+            apply_online_match_value(window, workspace, &key, &value);
+        }
+    }
+    window.set_match_visible(false);
+    set_status(
+        window,
+        "online_match_written",
+        "Selected online metadata was written",
+    );
+}
+
+fn toggle_online_match_field(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    index: i32,
+    checked: bool,
+) {
+    let match_store = workspace.borrow().online_match.clone();
+    if let Ok(mut state) = match_store.lock() {
+        if let Some(state) = state.as_mut() {
+            if let Some(value) = state.selected.get_mut(index.max(0) as usize) {
+                *value = checked;
+            }
+            window.set_match_field_selected(bools_model(state.selected.clone()));
+        }
+    };
+}
+
+fn select_all_online_match_fields(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
+    let match_store = workspace.borrow().online_match.clone();
+    if let Ok(mut state) = match_store.lock() {
+        if let Some(state) = state.as_mut() {
+            state.selected.fill(true);
+            window.set_match_field_selected(bools_model(state.selected.clone()));
+        }
+    };
+}
+
+fn refresh_online_match_labels(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
+    let match_store = workspace.borrow().online_match.clone();
+    let labels = match match_store.lock() {
+        Ok(state) => state
+            .as_ref()
+            .map(|state| online_match_labels(window, &state.entries)),
+        Err(_) => None,
+    };
+    if let Some(labels) = labels {
+        window.set_match_fields(values_model(labels));
+    }
 }
 
 fn build_metadata_with_base(
@@ -856,7 +1423,38 @@ fn build_metadata_with_base(
     };
     object.insert("name".into(), Value::String(label));
 
+    let platform_value = window.get_platform();
+    let platform = platform_value.trim();
+    object.insert(
+        "platform".into(),
+        Value::String(if supported_platform(platform) {
+            platform.to_owned()
+        } else {
+            platform_for_path(&window.get_rom_path()).to_owned()
+        }),
+    );
+    if let Ok(format) = payload_format(&window.get_rom_path()) {
+        object.insert("payload_format".into(), Value::String(format));
+    } else if let Some(format) = source.get("payload_format").and_then(Value::as_str) {
+        object.insert("payload_format".into(), Value::String(format.to_owned()));
+    }
     object.insert("genre".into(), parse_genre(&window.get_genre()));
+    let custom_crc_value = window.get_custom_crc();
+    let custom_crc = custom_crc_value.trim();
+    if custom_crc.is_empty() {
+        object.remove("crc32");
+    } else {
+        let normalized = normalize_crc32(custom_crc)
+            .map_err(|error| format!("Custom CRC32 is invalid: {error}"))?;
+        object.insert("crc32".into(), Value::String(normalized));
+    }
+    let custom_serial_value = window.get_custom_serial();
+    let custom_serial = custom_serial_value.trim();
+    if custom_serial.is_empty() {
+        object.remove("serial");
+    } else {
+        object.insert("serial".into(), Value::String(custom_serial.to_owned()));
+    }
     let developer_value = window.get_developer();
     let developer = developer_value.trim();
     if developer.is_empty() {
@@ -900,13 +1498,19 @@ fn copy_metadata_to_lpl_item(item: &mut Map<String, Value>, metadata: &Value) {
         return;
     };
     let mut display_name = None;
+    let mut custom_crc = None;
     for (key, value) in metadata {
         match key.as_str() {
             "name" => {
                 display_name = Some(value.clone());
                 set_lplx_metadata_value(item, key, value.clone());
             }
-            key if key != "crc32" && ROMX_LPLX_METADATA_FIELDS.contains(&key) => {
+            "crc32" => {
+                if let Some(value) = value.as_str().filter(|value| !value.is_empty()) {
+                    custom_crc = Some(format!("{value}|crc"));
+                }
+            }
+            key if ROMX_LPLX_METADATA_FIELDS.contains(&key) => {
                 set_lplx_metadata_value(item, key, value.clone());
             }
             "x-retroarch" => {
@@ -951,6 +1555,9 @@ fn copy_metadata_to_lpl_item(item: &mut Map<String, Value>, metadata: &Value) {
     }
     if let Some(display_name) = display_name {
         item.insert("label".into(), display_name);
+    }
+    if let Some(custom_crc) = custom_crc {
+        item.insert("crc32".into(), Value::String(custom_crc));
     }
     let metadata_object = lplx_metadata_object_mut(item);
     metadata_object
@@ -1005,12 +1612,26 @@ fn create_single_lpl(
         workspace.borrow().romx_cover_path.clone()
     };
     let base_metadata = workspace.borrow().romx_metadata.clone();
-    let metadata = match build_metadata_with_base(window, base_metadata.as_ref()) {
+    let mut metadata = match build_metadata_with_base(window, base_metadata.as_ref()) {
         Ok(metadata) => metadata,
         Err(error) => {
             return Err(format!("Metadata generation failed: {error}"));
         }
     };
+    if let Value::Object(object) = &mut metadata {
+        let extras = workspace.borrow().online_metadata.clone();
+        for (key, value) in extras {
+            if ROMX_LPLX_METADATA_FIELDS.contains(&key.as_str())
+                && !matches!(
+                    key.as_str(),
+                    "name" | "genre" | "developer" | "origin" | "release_date" | "serial" | "crc32"
+                )
+            {
+                object.insert(key, value);
+            }
+        }
+        object.insert("schema_version".into(), Value::String(SPEC_VERSION.into()));
+    }
     let mut item = Map::new();
     item.insert(
         "path".into(),
@@ -1052,6 +1673,76 @@ fn create_single_lpl(
     Ok(lpl_path)
 }
 
+fn store_embedded_cover(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    cover: &[u8],
+    filename: &str,
+) -> bool {
+    let path = {
+        let mut state = workspace.borrow_mut();
+        if let Err(error) = fs::create_dir_all(&state.temp_dir)
+            .and_then(|_| fs::write(state.temp_dir.join(filename), cover))
+        {
+            set_status(
+                window,
+                format!("Failed to save embedded cover: {error}"),
+                format!("Embedded cover save failed: {error}"),
+            );
+            return false;
+        }
+        let path = state.temp_dir.join(filename);
+        state.romx_cover_path = Some(path.clone());
+        path
+    };
+    request_preview_path(window, workspace, Some(&path));
+    true
+}
+
+fn clear_embedded_cover_choices(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
+    let old_path = {
+        let mut state = workspace.borrow_mut();
+        state.embedded_covers.clear();
+        state.romx_cover_path.take()
+    };
+    if let Some(path) = old_path {
+        let _ = fs::remove_file(path);
+    }
+    window.set_embedded_cover_options(values_model(Vec::new()));
+    window.set_embedded_cover_index(-1);
+}
+
+fn select_embedded_cover(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, index: i32) {
+    if index < 0 {
+        return;
+    }
+    let cover = workspace
+        .borrow()
+        .embedded_covers
+        .get(index as usize)
+        .cloned();
+    if let Some(cover) = cover {
+        let _ = store_embedded_cover(window, workspace, &cover.bytes, "embedded-cover.png");
+    }
+}
+
+fn set_embedded_cover_choices(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    covers: Vec<EmbeddedCover>,
+) {
+    let labels = covers.iter().map(|cover| cover.name.clone()).collect();
+    workspace.borrow_mut().embedded_covers = covers;
+    window.set_embedded_cover_options(values_model(labels));
+    let index = if workspace.borrow().embedded_covers.is_empty() {
+        -1
+    } else {
+        0
+    };
+    window.set_embedded_cover_index(index);
+    select_embedded_cover(window, workspace, index);
+}
+
 fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     let dialog = FileDialog::new()
         .set_title("Choose game ROM")
@@ -1068,10 +1759,24 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     };
     workspace.borrow_mut().clear_romx_cover();
     if had_romx_state {
-        window.set_cover_path("".into());
         window.set_cover_preview(Image::default());
-        window.set_metadata_path("".into());
     }
+    window.set_online_match_running(false);
+    window.set_match_visible(false);
+    window.set_display_title("".into());
+    window.set_genre("".into());
+    window.set_platform("gba".into());
+    window.set_developer("".into());
+    window.set_release_date("".into());
+    window.set_origin("".into());
+    window.set_custom_crc("".into());
+    window.set_custom_serial("".into());
+    window.set_cover_path("".into());
+    window.set_metadata_path("".into());
+    window.set_romx_diagnostic("".into());
+    window.set_cover_preview(Image::default());
+    window.set_embedded_cover_options(values_model(Vec::new()));
+    window.set_embedded_cover_index(-1);
     window.set_rom_path(path_string.clone().into());
     if is_romx {
         match read_metadata_cover_path(&path) {
@@ -1081,6 +1786,12 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
                     .clone()
                     .unwrap_or_else(|| Value::Object(Map::new()));
                 workspace.borrow_mut().romx_metadata = Some(metadata.clone());
+                workspace.borrow_mut().current_payload_format = document
+                    .entries
+                    .iter()
+                    .find(|entry| entry.entrypoint)
+                    .and_then(|entry| format_extension(entry.format_id))
+                    .map(str::to_owned);
                 set_metadata_form(window, &metadata);
                 window.set_platform(
                     platform_name_from_id(document.footer.platform_id)
@@ -1113,10 +1824,34 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
                 } else {
                     window.set_cover_preview(Image::default());
                 }
+                if read_mutable_save_objects(&path).is_ok() {
+                    if let Ok(raw_region) = read_mutable_region(&path) {
+                        workspace.borrow_mut().existing_mutable_region = raw_region;
+                    }
+                }
+                update_identity_mode(window, workspace);
+                let identity = identity_from_path(&path)
+                    .map(|identity| format!("ROMX ID {}", identity.romx_id))
+                    .unwrap_or_else(|error| format!("ROMX identity unavailable: {error}"));
+                let mutable = read_mutable_save_objects(&path)
+                    .map(|region| {
+                        format!(
+                            "{} mutable SAVE object(s), {} free slot(s), {} free bytes",
+                            region.objects.len(),
+                            region.free_slots,
+                            region.free_bytes
+                        )
+                    })
+                    .unwrap_or_else(|error| format!("mutable SAVE inspection failed: {error}"));
+                window.set_romx_diagnostic(format!("{identity}\n{mutable}").into());
                 set_status(
                     window,
-                    format!("Loaded ROMX: {path_string}. Edit metadata and convert when ready"),
-                    format!("ROMX loaded: {path_string}; edit metadata and convert to update"),
+                    format!(
+                        "Loaded ROMX: {path_string}. {identity}; {mutable}. Edit metadata and convert when ready"
+                    ),
+                    format!(
+                        "已加载 ROMX：{path_string}。{identity}；{mutable}。可编辑元数据后转换更新"
+                    ),
                 );
             }
             Err(error) => {
@@ -1129,10 +1864,59 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
             }
         }
     } else {
-        if window.get_display_title().trim().is_empty() {
-            window.set_display_title(path_stem(&path_string).into());
+        match inspect_payload_profile(&path) {
+            Ok(profile) => {
+                workspace.borrow_mut().current_payload_format =
+                    Some(profile.payload_format.clone());
+                let embedded = Value::Object(profile.metadata.clone());
+                set_metadata_form(window, &embedded);
+                let embedded_name = metadata_text(&embedded, "name");
+                window.set_display_title(
+                    if embedded_name.is_empty() {
+                        path_stem(&path_string)
+                    } else {
+                        embedded_name
+                    }
+                    .into(),
+                );
+                window.set_platform(profile.platform.into());
+                set_embedded_cover_choices(window, workspace, profile.covers);
+                if workspace.borrow().embedded_covers.is_empty() {
+                    if let Some(cover) = profile.cover.as_deref() {
+                        let _ =
+                            store_embedded_cover(window, workspace, cover, "embedded-cover.png");
+                    }
+                }
+                update_identity_mode(window, workspace);
+                let weak = window.as_weak();
+                let expected_path = path.clone();
+                thread::spawn(move || {
+                    let result = crc32_path(&expected_path);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak.upgrade() {
+                            if window.get_rom_path().trim() == expected_path.to_string_lossy()
+                                && window.get_identity_mode() == "crc32"
+                            {
+                                if let Ok(crc) = result {
+                                    window.set_custom_crc(crc.into());
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+            Err(error) => {
+                workspace.borrow_mut().current_payload_format = payload_format(&path_string).ok();
+                window.set_display_title(path_stem(&path_string).into());
+                window.set_platform(platform_for_path(&path_string).into());
+                update_identity_mode(window, workspace);
+                set_status(
+                    window,
+                    format!("Selected ROM; embedded inspection skipped: {error}"),
+                    format!("ROM selected; embedded inspection skipped: {error}"),
+                );
+            }
         }
-        window.set_platform(platform_for_path(&path_string).into());
     }
     if !is_romx {
         set_status(
@@ -1152,6 +1936,7 @@ fn choose_cover(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
         return;
     };
     let path_string = path.to_string_lossy().into_owned();
+    clear_embedded_cover_choices(window, workspace);
     window.set_cover_path(path_string.clone().into());
     request_preview_path(window, workspace, Some(&path));
     set_status(
@@ -1161,7 +1946,7 @@ fn choose_cover(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     );
 }
 
-fn choose_metadata(window: &MainWindow) {
+fn choose_metadata(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     let Some(path) = FileDialog::new()
         .set_title("Choose metadata JSON")
         .add_filter("JSON", &["json"])
@@ -1174,6 +1959,7 @@ fn choose_metadata(window: &MainWindow) {
         Ok(metadata) => {
             window.set_metadata_path(path_string.clone().into());
             set_metadata_form(window, &metadata);
+            update_identity_mode(window, workspace);
             set_status(
                 window,
                 format!("Loaded metadata: {path_string}"),
@@ -1204,6 +1990,51 @@ fn choose_directory(window: &MainWindow) {
     );
 }
 
+fn choose_mutable_save_directory(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
+    let Some(path) = FileDialog::new()
+        .set_title("Choose local save directory")
+        .pick_folder()
+    else {
+        return;
+    };
+    let path_string = path.to_string_lossy().into_owned();
+    let platform = window.get_platform().to_string();
+    let payload_format = workspace
+        .borrow()
+        .current_payload_format
+        .clone()
+        .or_else(|| payload_format(&window.get_rom_path()).ok())
+        .unwrap_or_default();
+    let inventory = match romx_core::inspect_mutable_path(&path, &platform, &payload_format) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            set_status(
+                window,
+                format!("Failed to inspect save directory: {error}"),
+                format!("存档目录检查失败：{error}"),
+            );
+            return;
+        }
+    };
+    window.set_mutable_save_path(path_string.clone().into());
+    let english = format!(
+        "Selected save directory: {path_string} ({} save object(s), {} file(s), {} bytes)",
+        inventory.count, inventory.files, inventory.bytes
+    );
+    let chinese = format!(
+        "已选择存档目录：{path_string}（{} 个存档对象、{} 个文件，共 {} 字节）",
+        inventory.count, inventory.files, inventory.bytes
+    );
+    window.set_romx_diagnostic(
+        format!(
+            "SAVE objects: {} · files: {} · bytes: {}",
+            inventory.count, inventory.files, inventory.bytes
+        )
+        .into(),
+    );
+    set_status(window, english, chinese);
+}
+
 fn read_json_file(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
@@ -1213,11 +2044,13 @@ fn write_json_file(path: &Path, value: &Value) -> Result<(), Box<dyn std::error:
         fs::create_dir_all(parent)?;
     }
     let temporary = path.with_extension("lplx.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(path);
-        fs::rename(&temporary, path).map_err(|_| error)?;
-    }
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    let mut file = fs::File::create(&temporary)?;
+    std::io::Write::write_all(&mut file, &bytes)?;
+    std::io::Write::flush(&mut file)?;
+    file.sync_all()?;
+    commit_staged(&temporary, path, true).map_err(std::io::Error::other)?;
     Ok(())
 }
 
@@ -1294,7 +2127,7 @@ fn build_workspace_cover_index(image_dir: &str) -> WorkspaceCoverIndex {
             entries
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())
-                .filter(|path| path.is_file())
+                .filter(|path| is_regular_file(path))
                 .filter(|path| {
                     path.extension()
                         .and_then(|value| value.to_str())
@@ -1488,6 +2321,8 @@ fn preflight_lpl(path: &Path) -> Result<String, String> {
     let mut invalid_covers = Vec::new();
     let mut unsupported = Vec::new();
     let mut duplicates = Vec::new();
+    let mut frontend_errors = Vec::new();
+    let mut frontend_warnings = Vec::new();
     let mut seen = std::collections::HashMap::<String, usize>::new();
     for (position, value) in items.iter().enumerate() {
         let index = position + 1;
@@ -1515,6 +2350,41 @@ fn preflight_lpl(path: &Path) -> Result<String, String> {
         {
             unsupported.push(format!("#{index}: .{extension}"));
         }
+        let platform = item
+            .get("platform")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                item.get(LPLX_METADATA_KEY)
+                    .and_then(Value::as_object)
+                    .and_then(|metadata| metadata.get("platform"))
+                    .and_then(Value::as_str)
+            })
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| platform_for_path(rom_text).to_owned());
+        let core_path = item
+            .get("core_path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("detect"))
+            .map(Path::new);
+        let core_name = item
+            .get("core_name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("detect"));
+        let compatibility =
+            check_frontend_compatibility(&platform, extension, core_path, core_name);
+        frontend_errors.extend(
+            compatibility
+                .errors
+                .into_iter()
+                .map(|error| format!("#{index}: {error}")),
+        );
+        frontend_warnings.extend(
+            compatibility
+                .warnings
+                .into_iter()
+                .map(|warning| format!("#{index}: {warning}")),
+        );
         let cover = ["cover_path", "thumbnail_path", "cover", "thumbnail"]
             .into_iter()
             .filter_map(|key| item.get(key).and_then(Value::as_str))
@@ -1553,11 +2423,15 @@ fn preflight_lpl(path: &Path) -> Result<String, String> {
     report.push(format!("Duplicate files: {}", duplicates.len()));
     report.push(format!("Invalid covers: {}", invalid_covers.len()));
     report.push(format!("Unsupported formats: {}", unsupported.len()));
+    report.push(format!("Frontend errors: {}", frontend_errors.len()));
+    report.push(format!("Frontend warnings: {}", frontend_warnings.len()));
     for (title, values) in [
         ("Missing ROMs", missing_roms),
         ("Duplicate files", duplicates),
         ("Invalid covers", invalid_covers),
         ("Unsupported formats", unsupported),
+        ("Frontend errors", frontend_errors),
+        ("Frontend warnings", frontend_warnings),
     ] {
         if !values.is_empty() {
             report.push(format!(
@@ -1575,11 +2449,13 @@ fn begin_preflight(
     lpl_path: PathBuf,
     save_path: PathBuf,
     cover_target: Option<(u32, u32)>,
+    mutable_capacity: u64,
 ) {
     workspace.borrow_mut().pending = Some(PendingConversion {
         lpl_path,
         save_path,
         cover_target,
+        mutable_capacity,
     });
     window.set_preflight_stage(0);
     window.set_preflight_report("".into());
@@ -1778,6 +2654,7 @@ fn start_pending_conversion(window: &MainWindow, workspace: &Rc<RefCell<LplWorks
             skip_missing: true,
             temporary_output: true,
             cover_target: pending.cover_target,
+            mutable_capacity: pending.mutable_capacity,
             ..Default::default()
         };
         let conflict_mode = Arc::new(Mutex::new(OutputConflictMode::Ask));
@@ -1865,14 +2742,14 @@ fn start_pending_conversion(window: &MainWindow, workspace: &Rc<RefCell<LplWorks
         } else {
             result
         };
-        let final_result = result.and_then(|report| {
+        let final_result = result.map(|report| {
             // The GUI output directory contains only the converted ROMX
             // files. Core still creates a temporary manifest internally for
             // export compatibility, but it is not part of GUI output.
             let _ = fs::remove_file(&report.manifest_path);
             let collision_skipped = collision_skipped.load(Ordering::Relaxed);
             let imported = report.imported;
-            Ok((report, imported, collision_skipped))
+            (report, imported, collision_skipped)
         });
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(window) = weak.upgrade() {
@@ -1929,7 +2806,7 @@ fn lpl_file_entries(path: &str, kind: LplFileListKind) -> Vec<PathBuf> {
         Ok(entries) => entries
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| path.is_file())
+            .filter(|path| is_regular_file(path))
             .filter(|path| match kind {
                 LplFileListKind::Rom => path
                     .extension()
@@ -2230,76 +3107,11 @@ fn select_lpl_output(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>,
         return;
     }
 
-    match read_metadata_cover_path(path) {
-        Ok(document) => {
-            let metadata = document.metadata.as_ref();
-            let title = {
-                let label = metadata_string(metadata, "label");
-                if label.is_empty() {
-                    path_stem(&path_string)
-                } else {
-                    label
-                }
-            };
-            let platform = platform_name_from_id(document.footer.platform_id)
-                .unwrap_or("ROMX")
-                .to_owned();
-            let payload_format = document
-                .entries
-                .iter()
-                .find(|entry| entry.entrypoint)
-                .and_then(|entry| format_extension(entry.format_id))
-                .unwrap_or("romx")
-                .to_owned();
-            let description = metadata_string(metadata, "description");
-            let mut info = format!(
-                "{} · ROM {} bytes · cover: {}",
-                &platform,
-                document.footer.rom.size,
-                if document.cover.is_some() {
-                    "yes"
-                } else {
-                    "no"
-                }
-            );
-            if !description.is_empty() {
-                info.push_str(&format!("\n{}", description));
-            }
-            window.set_lpl_detail_title(title.into());
-            window.set_lpl_detail_format(
-                if payload_format.is_empty() {
-                    "ROMX".to_owned()
-                } else {
-                    format!("ROMX · {payload_format}")
-                }
-                .into(),
-            );
-            window.set_lpl_detail_info(info.into());
-            if let Some(cover) = document.cover.as_deref() {
-                request_preview_bytes(window, workspace, preview_path_key(path), cover);
-            } else {
-                window.set_cover_preview(Image::default());
-            }
-            set_status(window, "romx_selected", "ROMX selected");
-        }
-        Err(error) => {
-            window.set_lpl_detail_title(
-                localized_text(window, "romx_read_failed", "Failed to read ROMX").into(),
-            );
-            window.set_lpl_detail_format("-".into());
-            window.set_lpl_detail_info(format!("{error}").into());
-            window.set_cover_preview(Image::default());
-            set_status(
-                window,
-                format!("ROMX read failed: {error}"),
-                format!("ROMX read failed: {error}"),
-            );
-        }
-    }
+    show_romx_preview(window, workspace, path, false);
 }
 
 fn is_romx_file(path: &Path) -> bool {
-    path.is_file()
+    is_regular_file(path)
         && path
             .extension()
             .and_then(|value| value.to_str())
@@ -2310,21 +3122,35 @@ fn is_romx_file(path: &Path) -> bool {
             })
 }
 
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+}
+
 fn collect_unpack_romx_files(path: &Path, output: &mut Vec<PathBuf>) {
     if is_romx_file(path) {
         output.push(path.to_owned());
         return;
     }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return;
+    }
     let Ok(entries) = fs::read_dir(path) else {
         return;
     };
-    for entry in entries.filter_map(Result::ok) {
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.file_name()
+            .to_string_lossy()
+            .as_bytes()
+            .cmp(right.file_name().to_string_lossy().as_bytes())
+    });
+    for entry in entries {
         let candidate = entry.path();
-        if candidate.is_dir() {
-            collect_unpack_romx_files(&candidate, output);
-        } else if is_romx_file(&candidate) {
-            output.push(candidate);
-        }
+        collect_unpack_romx_files(&candidate, output);
     }
 }
 
@@ -2339,7 +3165,12 @@ fn unpack_romx_entries(window: &MainWindow) -> Vec<PathBuf> {
     entries
 }
 
-fn preview_unpack_romx(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, path: &Path) {
+fn show_romx_preview(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    path: &Path,
+    include_save_summary: bool,
+) {
     let path_string = path.to_string_lossy().into_owned();
     match read_metadata_cover_path(path) {
         Ok(document) => {
@@ -2361,15 +3192,29 @@ fn preview_unpack_romx(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>
                 .unwrap_or("ROMX")
                 .to_owned();
             let description = metadata_string(metadata, "description");
+            let save_info = if include_save_summary {
+                read_mutable_save_objects(path)
+                    .map(|region| {
+                        format!(
+                            " · SAVE {} object(s), {} free slot(s)",
+                            region.objects.len(),
+                            region.free_slots
+                        )
+                    })
+                    .unwrap_or_else(|error| format!(" · SAVE unavailable: {error}"))
+            } else {
+                String::new()
+            };
             let mut info = format!(
-                "{} · ROM {} bytes · cover: {}",
-                &platform,
+                "{} · ROM {} bytes · cover: {}{}",
+                platform,
                 document.footer.rom.size,
                 if document.cover.is_some() {
                     "yes"
                 } else {
                     "no"
-                }
+                },
+                save_info
             );
             if !description.is_empty() {
                 info.push_str(&format!("\n{description}"));
@@ -2405,6 +3250,10 @@ fn preview_unpack_romx(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>
             );
         }
     }
+}
+
+fn preview_unpack_romx(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, path: &Path) {
+    show_romx_preview(window, workspace, path, true);
 }
 
 fn refresh_unpack_preview(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
@@ -2461,6 +3310,7 @@ fn choose_unpack_source(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace
 enum UnpackDirectoryKind {
     Rom,
     Cover,
+    Save,
     Lpl,
 }
 
@@ -2504,7 +3354,8 @@ fn default_unpack_paths(
     lpl_value: &str,
     rom_value: &str,
     cover_value: &str,
-) -> (String, PathBuf, PathBuf, PathBuf, PathBuf) {
+    save_value: &str,
+) -> (String, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
     let playlist = unpack_playlist_name(input);
     let content_root = if !lpl_value.is_empty() {
         content_root_from_lpl_dir(Path::new(lpl_value))
@@ -2528,7 +3379,19 @@ fn default_unpack_paths(
     } else {
         PathBuf::from(cover_value)
     };
-    (playlist, content_root, lpl_dir, rom_dir, cover_dir)
+    let save_dir = if save_value.is_empty() {
+        content_root.join("saves").join(&playlist)
+    } else {
+        PathBuf::from(save_value)
+    };
+    (
+        playlist,
+        content_root,
+        lpl_dir,
+        rom_dir,
+        cover_dir,
+        save_dir,
+    )
 }
 
 fn choose_unpack_directory(window: &MainWindow, kind: UnpackDirectoryKind) {
@@ -2542,14 +3405,16 @@ fn choose_unpack_directory(window: &MainWindow, kind: UnpackDirectoryKind) {
     match kind {
         UnpackDirectoryKind::Rom => window.set_unpack_rom_dir(value.clone().into()),
         UnpackDirectoryKind::Cover => window.set_unpack_cover_dir(value.clone().into()),
+        UnpackDirectoryKind::Save => window.set_unpack_save_dir(value.clone().into()),
         UnpackDirectoryKind::Lpl => {
             window.set_unpack_lpl_dir(value.clone().into());
             let input_value = window.get_unpack_input_path();
             if !input_value.trim().is_empty() {
-                let (_, _, _, default_rom, default_cover) =
-                    default_unpack_paths(Path::new(input_value.trim()), &value, "", "");
+                let (_, _, _, default_rom, default_cover, default_save) =
+                    default_unpack_paths(Path::new(input_value.trim()), &value, "", "", "");
                 window.set_unpack_rom_dir(default_rom.to_string_lossy().into_owned().into());
                 window.set_unpack_cover_dir(default_cover.to_string_lossy().into_owned().into());
+                window.set_unpack_save_dir(default_save.to_string_lossy().into_owned().into());
             }
         }
     }
@@ -2597,11 +3462,13 @@ fn start_unpack_conversion(
     let lpl_value = window.get_unpack_lpl_dir();
     let rom_value = window.get_unpack_rom_dir();
     let cover_value = window.get_unpack_cover_dir();
-    let (playlist, content_root, lpl_dir, rom_dir, cover_dir) = default_unpack_paths(
+    let save_value = window.get_unpack_save_dir();
+    let (playlist, content_root, lpl_dir, rom_dir, cover_dir, save_dir) = default_unpack_paths(
         &input,
         lpl_value.trim(),
         rom_value.trim(),
         cover_value.trim(),
+        save_value.trim(),
     );
     let custom_rom_path = window.get_unpack_lpl_rom_path().trim().to_owned();
     let custom_cover_path = window.get_unpack_lpl_cover_path().trim().to_owned();
@@ -2610,6 +3477,7 @@ fn start_unpack_conversion(
         lpl_path: Some(lpl_dir.join(format!("{playlist}.lpl"))),
         rom_dir: Some(rom_dir),
         cover_dir: Some(cover_dir),
+        save_dir: Some(save_dir),
         lpl_rom_prefix: (!custom_rom_path.is_empty()).then_some(custom_rom_path),
         lpl_cover_prefix: (!custom_cover_path.is_empty()).then_some(custom_cover_path),
         temporary_output: true,
@@ -2710,16 +3578,18 @@ fn start_unpack_conversion(
                         set_status(
                             &window,
                             format!(
-                                "Extraction complete: {} succeeded, {} skipped, LPL: {}",
+                                "Extraction complete: {} succeeded, {} skipped, LPL: {}, SAVE: {}",
                                 report.exported,
                                 report.skipped,
-                                report.lpl_path.display()
+                                report.lpl_path.display(),
+                                report.save_dir.display()
                             ),
                             format!(
-                                "Extraction complete: {} succeeded, {} skipped, LPL: {}",
+                                "解包完成：成功 {}，跳过 {}，LPL：{}，存档：{}",
                                 report.exported,
                                 report.skipped,
-                                report.lpl_path.display()
+                                report.lpl_path.display(),
+                                report.save_dir.display()
                             ),
                         );
                     }
@@ -2791,9 +3661,22 @@ fn remove_lplx_metadata_value(item: &mut Map<String, Value>, key: &str) {
 
 fn lpl_item_metadata(item: &Map<String, Value>) -> Value {
     let mut metadata = Map::new();
-    for key in ["name", "genre", "developer", "release_date", "origin"] {
+    for key in [
+        "name",
+        "genre",
+        "developer",
+        "release_date",
+        "origin",
+        "serial",
+    ] {
         if let Some(value) = lpl_item_value(item, key) {
             metadata.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(value) = lpl_item_value(item, "crc32").and_then(Value::as_str) {
+        let crc = value.split('|').next().unwrap_or(value);
+        if !crc.is_empty() {
+            metadata.insert("crc32".into(), Value::String(crc.to_owned()));
         }
     }
     if !metadata.contains_key("name") {
@@ -2830,6 +3713,7 @@ fn set_edit_cover(
     workspace: &Rc<RefCell<LplWorkspace>>,
     cover_path: Option<&Path>,
 ) {
+    clear_embedded_cover_choices(window, workspace);
     if let Some(path) = cover_path {
         window.set_cover_path(path.to_string_lossy().into_owned().into());
         request_preview_path(window, workspace, Some(path));
@@ -2914,7 +3798,23 @@ fn begin_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     window.set_rom_path(rom_path.into());
     window.set_metadata_path("".into());
     window.set_save_path(window.get_lpl_save_path());
+    {
+        let mut state = workspace.borrow_mut();
+        state.current_payload_format = Path::new(&window.get_rom_path())
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase);
+        state.online_metadata.clear();
+        state
+            .online_match_generation
+            .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut matches) = state.online_match.lock() {
+            *matches = None;
+        };
+    }
+    window.set_match_visible(false);
     set_metadata_form(window, &metadata);
+    update_identity_mode(window, workspace);
     if !supported_platform(&metadata_text(&metadata, "platform")) {
         window.set_platform(platform_for_path(&window.get_rom_path()).into());
     }
@@ -3009,6 +3909,33 @@ fn update_lpl_edit_file(
             Value::String(window.get_release_date().trim().to_owned()),
         );
     }
+    let custom_crc_value = window.get_custom_crc();
+    let custom_crc = custom_crc_value.trim();
+    if custom_crc.is_empty() {
+        item.remove("crc32");
+    } else {
+        let normalized = normalize_crc32(custom_crc)
+            .map_err(|error| format!("Custom CRC32 is invalid: {error}"))?;
+        item.insert("crc32".into(), Value::String(format!("{normalized}|crc")));
+    }
+    let custom_serial_value = window.get_custom_serial();
+    let custom_serial = custom_serial_value.trim();
+    if custom_serial.is_empty() {
+        remove_lplx_metadata_value(item, "serial");
+    } else {
+        set_lpl_item_value(item, "serial", Value::String(custom_serial.to_owned()));
+    }
+    let online_extras = workspace.borrow().online_metadata.clone();
+    for (key, value) in online_extras {
+        if ROMX_LPLX_METADATA_FIELDS.contains(&key.as_str())
+            && !matches!(
+                key.as_str(),
+                "name" | "genre" | "developer" | "origin" | "release_date" | "serial" | "crc32"
+            )
+        {
+            set_lpl_item_value(item, &key, value);
+        }
+    }
     let cover_path = if window.get_cover_path().trim().is_empty() {
         set_lpl_cover_path(item, None);
         None
@@ -3087,6 +4014,18 @@ fn return_from_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace
         let _ = fs::remove_file(edit_path.with_extension("lplx.tmp"));
     }
     workspace.borrow_mut().current_index = None;
+    {
+        let mut state = workspace.borrow_mut();
+        state.current_payload_format = None;
+        state.online_metadata.clear();
+        state
+            .online_match_generation
+            .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut matches) = state.online_match.lock() {
+            *matches = None;
+        };
+    }
+    window.set_match_visible(false);
     window.set_editing_lpl_file(false);
     window.set_active_page(0);
     window.set_pack_subpage(1);
@@ -3182,12 +4121,30 @@ fn convert_lpl(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
         set_status(window, "temporary_lpl_missing", "Temporary LPL is missing");
         return;
     };
+    let _ = cached_lpl_plan(window, workspace);
+    let mutable_capacity = if window.get_reserve_mutable() {
+        workspace
+            .borrow()
+            .plan_cache
+            .as_ref()
+            .map(|plan| {
+                plan.items
+                    .iter()
+                    .map(|item| recommended_mutable_capacity(&item.platform, &item.payload_format))
+                    .max()
+                    .unwrap_or(romx_core::RECOMMENDED_UNKNOWN_CARTRIDGE_MUTABLE_CAPACITY)
+            })
+            .unwrap_or(romx_core::RECOMMENDED_UNKNOWN_CARTRIDGE_MUTABLE_CAPACITY)
+    } else {
+        0
+    };
     begin_preflight(
         window,
         workspace,
         work_path,
         PathBuf::from(save_path.trim()),
         None,
+        mutable_capacity,
     );
 }
 
@@ -3202,7 +4159,7 @@ fn remove_single_temp(path: &Path, payload_path: Option<&Path>) {
 fn prepare_single_input(
     window: &MainWindow,
     workspace: &Rc<RefCell<LplWorkspace>>,
-) -> Result<(String, PathBuf, Option<PathBuf>), String> {
+) -> Result<(String, PathBuf, Option<PathBuf>, Option<u64>), String> {
     let input_path = absolute_path(Path::new(window.get_rom_path().trim()));
     let is_romx = input_path
         .extension()
@@ -3223,7 +4180,8 @@ fn prepare_single_input(
         } else {
             format
         };
-        return Ok((format, input_path, None));
+        workspace.borrow_mut().current_payload_format = Some(format.clone());
+        return Ok((format, input_path, None, None));
     }
 
     let document =
@@ -3235,6 +4193,20 @@ fn prepare_single_input(
         .and_then(|entry| format_extension(entry.format_id))
         .ok_or_else(|| "ROMX entry format is not registered".to_owned())?;
     let declared_format = entry_format.to_owned();
+    // Keep the payload's logical basename when materializing a ROMX entry.
+    // The temporary file is the physical source for the packer, but its
+    // basename is also used by ROMX's RIDX writer.  Using a fixed
+    // `temp-romx-payload.*` name leaked an internal implementation detail into
+    // the generated container.
+    let entry_filename = document
+        .entries
+        .iter()
+        .find(|entry| entry.entrypoint)
+        .and_then(|entry| Path::new(&entry.path).file_name())
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("payload.{declared_format}"));
     let format = if matches!(declared_format.as_str(), "gb" | "gbc") {
         classify_gb_payload(&document.rom, Some(&declared_format))
             .map_err(|error| format!("Failed to read the ROM inside ROMX: {error}"))?
@@ -3242,16 +4214,22 @@ fn prepare_single_input(
     } else {
         declared_format
     };
+    workspace.borrow_mut().current_payload_format = Some(format.clone());
     let payload_path = {
         let state = workspace.borrow();
         fs::create_dir_all(&state.temp_dir)
             .map_err(|error| format!("Failed to create the temporary directory: {error}"))?;
-        let path = state.temp_dir.join(format!("temp-romx-payload.{format}"));
+        let path = state.temp_dir.join(entry_filename);
         fs::write(&path, &document.rom)
             .map_err(|error| format!("Failed to extract the ROM from ROMX: {error}"))?;
         path
     };
-    Ok((format, payload_path.clone(), Some(payload_path)))
+    Ok((
+        format,
+        payload_path.clone(),
+        Some(payload_path),
+        Some(document.footer.mutable_capacity),
+    ))
 }
 
 fn run_single_conversion(
@@ -3263,6 +4241,10 @@ fn run_single_conversion(
         lpl_path: temporary_lpl,
         payload_path: temporary_payload,
         cover_target,
+        mutable_capacity,
+        mutable_entry_capacity,
+        mutable_save_bundles,
+        mutable_region,
         save_path,
         output_path,
         replace,
@@ -3310,6 +4292,10 @@ fn run_single_conversion(
             &romx_core::ImportLplOptions {
                 temporary_output: true,
                 cover_target,
+                mutable_capacity,
+                mutable_entry_capacity,
+                mutable_save_bundles,
+                mutable_region,
                 ..Default::default()
             },
             &mut progress_callback,
@@ -3393,13 +4379,14 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
         );
         return;
     }
-    let (_format, source_path, temporary_payload) = match prepare_single_input(window, workspace) {
-        Ok(value) => value,
-        Err(error) => {
-            set_status(window, &error, &error);
-            return;
-        }
-    };
+    let (format, source_path, temporary_payload, existing_mutable_capacity) =
+        match prepare_single_input(window, workspace) {
+            Ok(value) => value,
+            Err(error) => {
+                set_status(window, &error, &error);
+                return;
+            }
+        };
     let cover_target = match resolution(window) {
         Ok(target) => target,
         Err(error) => {
@@ -3409,6 +4396,74 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
             set_status(window, &error, &error);
             return;
         }
+    };
+    let recommended_capacity =
+        recommended_mutable_capacity(window.get_platform().as_str(), &format);
+    let mutable_save_path = window.get_mutable_save_path();
+    let mutable_region = if mutable_save_path.trim().is_empty() {
+        workspace.borrow().existing_mutable_region.clone()
+    } else {
+        None
+    };
+    let save_source = if mutable_save_path.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(mutable_save_path.trim()))
+    };
+    let mutable_save_bundles = if let Some(save_source) = save_source {
+        match detect_save_bundles(&save_source, window.get_platform().as_str(), &format) {
+            Ok(bundles) => bundles,
+            Err(error) => {
+                if let Some(payload_path) = temporary_payload.as_deref() {
+                    let _ = fs::remove_file(payload_path);
+                }
+                set_status(
+                    window,
+                    format!("Failed to inspect save directory: {error}"),
+                    format!("存档目录检查失败：{error}"),
+                );
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let save_inventory =
+        mutable_save_bundles
+            .iter()
+            .fold((0usize, 0u64), |(count, bytes), bundle| {
+                let bundle_bytes = bundle
+                    .files
+                    .iter()
+                    .filter_map(|file| {
+                        fs::metadata(&file.source)
+                            .ok()
+                            .map(|metadata| metadata.len())
+                    })
+                    .sum::<u64>();
+                (count.saturating_add(1), bytes.saturating_add(bundle_bytes))
+            });
+    // Preserve an existing reservation even when the user is only editing
+    // metadata/cover.  A checked reservation can grow it to the current
+    // platform recommendation, but an edit must never silently shrink it.
+    let mutable_capacity = if mutable_region.is_some() {
+        existing_mutable_capacity.unwrap_or(0)
+    } else if window.get_reserve_mutable() {
+        recommended_mutable_capacity_for_save_bytes(
+            recommended_capacity,
+            save_inventory.0,
+            save_inventory.1,
+        )
+        .max(existing_mutable_capacity.unwrap_or(0))
+    } else {
+        existing_mutable_capacity.unwrap_or(0)
+    };
+    let mutable_entry_capacity = if mutable_region.is_some() {
+        0
+    } else if window.get_reserve_mutable() {
+        recommended_mutable_entry_capacity(save_inventory.0)
+    } else {
+        0
     };
     let temporary_lpl = match create_single_lpl(window, workspace, &source_path) {
         Ok(path) => path,
@@ -3421,12 +4476,25 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
         }
     };
     let save_path = PathBuf::from(save_path.trim());
-    let output_path = save_path.join(format!("{}.romx", path_stem(&rom_path)));
+    let original_name = path_file_name(&rom_path);
+    let output_name = if original_name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("romx"))
+    {
+        original_name
+    } else {
+        format!("{original_name}.romx")
+    };
+    let output_path = save_path.join(output_name);
     if output_path.exists() {
         workspace.borrow_mut().single_conflict = Some(PendingSingleConflict {
             lpl_path: temporary_lpl,
             payload_path: temporary_payload,
             cover_target,
+            mutable_capacity,
+            mutable_entry_capacity,
+            mutable_save_bundles,
+            mutable_region: mutable_region.clone(),
             save_path,
             output_path: output_path.clone(),
             replace: false,
@@ -3442,6 +4510,10 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
             lpl_path: temporary_lpl,
             payload_path: temporary_payload,
             cover_target,
+            mutable_capacity,
+            mutable_entry_capacity,
+            mutable_save_bundles,
+            mutable_region,
             save_path,
             output_path,
             replace: false,
@@ -3510,12 +4582,24 @@ fn convert_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) 
         }
     };
     set_edit_cover(window, workspace, cover_path.as_deref());
+    // Editing an LPL item is also a ROMX-producing path.  The mutable
+    // reservation checkbox is intentionally hidden while editing, so do not
+    // pass the zero-capacity compact profile here: libromx needs room for
+    // SAVE/CHEAT/STATS objects in every ROMX generated by this workflow.
+    let payload_format = workspace
+        .borrow()
+        .current_payload_format
+        .clone()
+        .unwrap_or_default();
+    let platform = window.get_platform();
+    let mutable_capacity = recommended_mutable_capacity(platform.as_str(), &payload_format);
     begin_preflight(
         window,
         workspace,
         edit_path,
         PathBuf::from(save_path.trim()),
         cover_target,
+        mutable_capacity,
     );
 }
 
@@ -3538,6 +4622,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .text("ready", window.get_language_index())
                         .into(),
                 );
+                refresh_online_match_text(&window);
+                refresh_online_match_labels(&window, &workspace);
                 if window.get_active_page() == 0 && window.get_pack_subpage() == 1 {
                     refresh_lpl_preview(&window, &workspace);
                 } else if window.get_active_page() == 1 {
@@ -3567,6 +4653,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .text("ready", window.get_language_index())
             .into(),
     );
+    update_identity_mode(&window, &lpl_workspace);
     {
         let weak = window.as_weak();
         let workspace = lpl_workspace.clone();
@@ -3587,9 +4674,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
+        window.on_embedded_cover_changed(move |index| {
+            if let Some(window) = weak.upgrade() {
+                select_embedded_cover(&window, &workspace, index);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
         window.on_open_metadata_clicked(move || {
             if let Some(window) = weak.upgrade() {
-                choose_metadata(&window);
+                choose_metadata(&window, &workspace);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
+        window.on_platform_changed(move || {
+            if let Some(window) = weak.upgrade() {
+                update_identity_mode(&window, &workspace);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
+        window.on_online_match_clicked(move || {
+            if let Some(window) = weak.upgrade() {
+                online_match(&window, &workspace);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
+        window.on_match_field_toggled(move |index, checked| {
+            if let Some(window) = weak.upgrade() {
+                toggle_online_match_field(&window, &workspace, index, checked);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
+        window.on_match_select_all_clicked(move || {
+            if let Some(window) = weak.upgrade() {
+                select_all_online_match_fields(&window, &workspace);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
+        window.on_match_write_clicked(move || {
+            if let Some(window) = weak.upgrade() {
+                apply_online_match(&window, &workspace, false);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
+        window.on_match_write_all_clicked(move || {
+            if let Some(window) = weak.upgrade() {
+                apply_online_match(&window, &workspace, true);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
+        window.on_match_cancel_clicked(move || {
+            if let Some(window) = weak.upgrade() {
+                workspace
+                    .borrow()
+                    .online_match_generation
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Ok(mut state) = workspace.borrow().online_match.lock() {
+                    *state = None;
+                }
+                window.set_online_match_running(false);
+                window.set_match_visible(false);
             }
         });
     }
@@ -3598,6 +4766,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window.on_open_save_path_clicked(move || {
             if let Some(window) = weak.upgrade() {
                 choose_directory(&window);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
+        window.on_open_mutable_save_path_clicked(move || {
+            if let Some(window) = weak.upgrade() {
+                choose_mutable_save_directory(&window, &workspace);
             }
         });
     }
@@ -3862,6 +5039,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window.on_open_unpack_cover_dir_clicked(move || {
             if let Some(window) = weak.upgrade() {
                 choose_unpack_directory(&window, UnpackDirectoryKind::Cover);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        window.on_open_unpack_save_dir_clicked(move || {
+            if let Some(window) = weak.upgrade() {
+                choose_unpack_directory(&window, UnpackDirectoryKind::Save);
             }
         });
     }
