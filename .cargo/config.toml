@@ -1,0 +1,8 @@
+# Ship Windows binaries with the MSVC runtime statically linked.  This keeps
+# the distributed GUI self-contained on machines that do not have the Visual
+# C++ Redistributable installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

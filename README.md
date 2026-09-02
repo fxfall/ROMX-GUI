@@ -23,7 +23,8 @@ open "./romx-gui.app"
 ```
 
 The packaged macOS layout is `romx-gui.app`; Linux packages contain one
-`romx-gui` executable and Windows packages contain one `romx-gui.exe`.
+`romx-gui` executable and Windows packages contain one self-contained
+`romx-gui.exe` (the MSVC runtime is statically linked).
 
 The current GUI provides:
 
@@ -149,6 +150,10 @@ native macOS artifacts in `target/release`.
 
 Pushing a `v*` version tag or manually running `.github/workflows/build.yml`
 builds and tests native arm64 and x86_64 packages for macOS, Linux, and Windows.
+On Windows, choose `romx-windows-x86_64.zip` for Intel/AMD 64-bit systems and
+`romx-windows-arm64.zip` for ARM64 systems. The Windows executables statically
+link the MSVC runtime, so installing a separate Visual C++ Redistributable is
+not required.
 The GUI release
 layouts are platform-native: macOS archives contain `romx-gui.app`, Linux
 archives contain the single `romx-gui` executable, and Windows archives contain

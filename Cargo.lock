@@ -3981,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "romx-cli"
-version = "0.2.0-fix1"
+version = "0.2.0-fix2"
 dependencies = [
  "clap",
  "romx-core",
@@ -3991,8 +3991,9 @@ dependencies = [
 
 [[package]]
 name = "romx-core"
-version = "0.2.0-fix1"
+version = "0.2.0-fix2"
 dependencies = [
+ "crc32fast",
  "encoding_rs",
  "image",
  "serde",
@@ -4005,7 +4006,7 @@ dependencies = [
 
 [[package]]
 name = "romx-gui"
-version = "0.2.0-fix1"
+version = "0.2.0-fix2"
 dependencies = [
  "image",
  "objc2 0.5.2",

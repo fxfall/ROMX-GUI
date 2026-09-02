@@ -1,7 +1,7 @@
 use crate::{
-    classify_gb_payload, crc32, format_id_for_extension, identity_from_path,
+    classify_gb_payload, extract_entry_to_path, format_id_for_extension, identity_from_path,
     launch_format_id_for_extension, normalize_cover_path, normalize_crc32,
-    pack_path_with_metadata_options, platform_id_for_name, read_mutable_save_objects, read_path,
+    pack_path_with_metadata_options, platform_id_for_name, read_metadata_cover_path,
     required_metadata, MutableSaveBundle, PackOptions, RomxError, RomxIdentity, SPEC_VERSION,
     SUPPORTED_FORMAT_EXTENSIONS,
 };
@@ -1213,18 +1213,18 @@ where
             return Err(RomxError::Cancelled);
         }
         let result = (|| -> Result<Option<Value>, RomxError> {
-            let document = read_path(romx_path)?;
+            let preview = read_metadata_cover_path(romx_path)?;
             let manifest_item = if source.is_dir() {
                 manifest_lpl_item(source, romx_path)
             } else {
                 None
             };
-            let entry_format_id = document
+            let entry = preview
                 .entries
                 .iter()
                 .find(|entry| entry.entrypoint)
-                .map(|entry| entry.format_id)
-                .unwrap_or(0);
+                .ok_or_else(|| RomxError::Invalid("ROMX entrypoint is missing".into()))?;
+            let entry_format_id = entry.format_id;
             let payload_format = crate::format_extension(entry_format_id).unwrap_or("bin");
             let source_stem = romx_path
                 .file_stem()
@@ -1246,7 +1246,7 @@ where
             };
             let rom_target = rom_dir.join(&rom_filename);
             let staged_rom = temporary_output_path(&rom_target, options.temporary_output);
-            fs::write(&staged_rom, &document.rom)?;
+            let streamed_crc = extract_entry_to_path(romx_path, entry, &staged_rom, true)?;
             let Some(committed_rom) = on_output(&staged_rom)? else {
                 return Ok(None);
             };
@@ -1254,13 +1254,13 @@ where
                 .file_name()
                 .and_then(|value| value.to_str())
                 .ok_or_else(|| RomxError::Invalid("exported ROM filename is invalid".into()))?;
-            let label = document
+            let label = preview
                 .metadata
                 .as_ref()
                 .and_then(|value| value.get("name"))
                 .and_then(Value::as_str)
                 .unwrap_or(&source_stem);
-            let _committed_cover = if let Some(cover) = document.cover.as_deref() {
+            let _committed_cover = if let Some(cover) = preview.cover.as_deref() {
                 // Keep the thumbnail basename identical to the exported ROM
                 // basename. Do not use the metadata label here: labels are
                 // often localized and RetroArch thumbnail lookup is filename
@@ -1272,53 +1272,29 @@ where
                     .unwrap_or_else(|| source_stem.clone());
                 let cover_target = cover_dir.join(format!("{cover_stem}.png"));
                 let staged_cover = temporary_output_path(&cover_target, options.temporary_output);
-                fs::write(&staged_cover, cover)?;
+                super::atomic_extract(&staged_cover, cover)?;
                 on_output(&staged_cover)?
             } else {
                 None
             };
             let save_game_dir = save_dir.join(safe_filename(rom_filename));
-            let save_objects = read_mutable_save_objects(romx_path)?.objects;
-            for object in save_objects {
-                if is_cancelled() {
-                    return Err(RomxError::Cancelled);
-                }
-                let single_file = object.files.len() == 1
-                    && !object.files[0].path.contains('/')
-                    && !object.files[0].path.eq_ignore_ascii_case("PARAM.SFO");
-                for file in object.files {
-                    let target = if single_file {
-                        let extension = Path::new(&file.path)
-                            .extension()
-                            .and_then(|value| value.to_str())
-                            .filter(|value| !value.is_empty())
-                            .map(|value| format!(".{value}"))
-                            .unwrap_or_default();
-                        save_game_dir.join(format!("{}{extension}", object.key))
-                    } else {
-                        save_game_dir.join(&object.key).join(&file.path)
-                    };
-                    let staged = temporary_output_path(&target, options.temporary_output);
-                    if let Some(parent) = staged.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&staged, file.bytes)?;
-                    // SAVE files are independent outputs. A conflict choice
-                    // of "skip" only skips this file; the ROM and LPL item
-                    // remain exportable.
-                    let _ = on_output(&staged)?;
-                }
-            }
+            super::save::extract_mutable_save_objects_from_path(
+                romx_path,
+                &save_game_dir,
+                options.temporary_output,
+                &mut is_cancelled,
+                &mut on_output,
+            )?;
             let item_path = joined_lpl_path(&prefix, rom_filename);
-            let lookup_crc = document
+            let lookup_crc = preview
                 .metadata
                 .as_ref()
                 .and_then(|value| value.get("crc32"))
                 .and_then(Value::as_str)
                 .and_then(|value| normalize_crc32(value).ok())
-                .unwrap_or_else(|| crc32(&document.rom));
+                .unwrap_or(streamed_crc);
             let platform =
-                crate::platform_name_from_id(document.footer.platform_id).unwrap_or_default();
+                crate::platform_name_from_id(preview.footer.platform_id).unwrap_or_default();
             let mut item = Map::new();
             item.insert("path".into(), Value::String(item_path));
             let label = manifest_item

@@ -485,20 +485,17 @@ fn parse_bundle(bytes: &[u8]) -> Result<Vec<MutableSaveFileData>, RomxError> {
 
 /// Read the SAVE namespace from an existing ROMX file without reading its ROM payload separately.
 pub fn read_mutable_save_objects(path: &Path) -> Result<MutableRegionInfo, RomxError> {
-    read_mutable_save_objects_from_bytes(&fs::read(path)?)
-}
-
-pub(crate) fn read_mutable_save_objects_from_bytes(
-    bytes: &[u8],
-) -> Result<MutableRegionInfo, RomxError> {
-    let parsed = crate::parse_container(bytes, false)?;
-    if let Some(metadata) = parsed.metadata {
-        crate::parse_json_strict(metadata)?;
-    }
-    if let Some(cover) = parsed.cover {
-        crate::validate_png_bytes(cover)?;
-    }
-    read_mutable_save_objects_with_capacity(bytes, parsed.footer.mutable_capacity)
+    let mut objects = Vec::new();
+    let mut info = visit_mutable_save_objects_from_path(
+        path,
+        || false,
+        |object| {
+            objects.push(object);
+            Ok(())
+        },
+    )?;
+    info.objects = objects;
+    Ok(info)
 }
 
 pub(crate) fn read_mutable_save_objects_with_capacity(
@@ -522,7 +519,19 @@ pub(crate) fn read_mutable_save_objects_with_capacity(
         return Err(RomxError::Invalid("mutable region is truncated".into()));
     }
     let offset = bytes.len() - FOOTER_SIZE - capacity_usize;
-    let header = &bytes[offset..offset + MUTABLE_HEADER_SIZE];
+    parse_mutable_region(&bytes[offset..offset + capacity_usize], offset as u64)
+}
+
+fn parse_mutable_region(
+    region: &[u8],
+    absolute_offset: u64,
+) -> Result<MutableRegionInfo, RomxError> {
+    let capacity_usize = region.len();
+    let capacity = capacity_usize as u64;
+    if capacity_usize < MUTABLE_HEADER_SIZE {
+        return Err(RomxError::Invalid("mutable region is truncated".into()));
+    }
+    let header = &region[..MUTABLE_HEADER_SIZE];
     if &header[..4] != b"RMUT"
         || read_u16(header, 4)? != 1
         || read_u16(header, 6)? as usize != MUTABLE_HEADER_SIZE
@@ -555,8 +564,8 @@ pub(crate) fn read_mutable_save_objects_with_capacity(
     let mut objects = Vec::new();
     let mut used_ranges = Vec::<(usize, usize)>::new();
     for slot in 0..entry_capacity {
-        let base = offset + MUTABLE_HEADER_SIZE + slot * MUTABLE_ENTRY_SIZE;
-        let entry = &bytes[base..base + MUTABLE_ENTRY_SIZE];
+        let base = MUTABLE_HEADER_SIZE + slot * MUTABLE_ENTRY_SIZE;
+        let entry = &region[base..base + MUTABLE_ENTRY_SIZE];
         if all_zero(entry) {
             continue;
         }
@@ -613,18 +622,15 @@ pub(crate) fn read_mutable_save_objects_with_capacity(
             )));
         }
         used_ranges.push(range);
-        let absolute_data_start = offset
-            .checked_add(data_start)
-            .ok_or_else(|| RomxError::Invalid("mutable SAVE data offset overflows".into()))?;
-        let bundle_end = absolute_data_start
+        let bundle_end = data_start
             .checked_add(data_size as usize)
             .ok_or_else(|| RomxError::Invalid("mutable SAVE data size overflows".into()))?;
-        if bundle_end > offset + capacity_usize {
+        if bundle_end > capacity_usize {
             return Err(RomxError::Invalid(format!(
                 "mutable SAVE object exceeds the mutable region: {key}"
             )));
         }
-        let bundle_bytes = &bytes[absolute_data_start..bundle_end];
+        let bundle_bytes = &region[data_start..bundle_end];
         let files = parse_bundle(bundle_bytes)?;
         let object_crc = read_u32(entry, 0x38)?;
         if crc32_u32(bundle_bytes) != object_crc {
@@ -656,7 +662,7 @@ pub(crate) fn read_mutable_save_objects_with_capacity(
         .map(|(start, end)| end.saturating_sub(*start) as u64)
         .sum::<u64>();
     Ok(MutableRegionInfo {
-        offset: offset as u64,
+        offset: absolute_offset,
         capacity,
         entry_capacity,
         data_capacity,
@@ -693,17 +699,217 @@ pub fn extract_mutable_save_object(
     Ok(root)
 }
 
-/// Extract every logical SAVE object below `output`.
-///
-/// The returned paths are the object roots.  A single-file object is written
-/// as `<key>.<ext>` so a save directory can be rescanned without losing
-/// object boundaries.  Multi-file objects are written as `<key>/...` and keep
-/// their internal relative paths, which is the layout expected by PSP
-/// savedata and directory-based platforms.
-pub fn extract_mutable_save_objects(romx: &Path, output: &Path) -> Result<Vec<PathBuf>, RomxError> {
-    let info = read_mutable_save_objects(romx)?;
-    let mut roots = Vec::with_capacity(info.objects.len());
-    for object in info.objects {
+/// Visit every logical SAVE object from a ROMX file without loading its ROM
+/// payload. The mutable directory and one bundle at a time are kept in
+/// memory; each object is passed to the callback before the next bundle is
+/// read.
+fn visit_mutable_save_objects_from_path<C, F>(
+    romx: &Path,
+    mut is_cancelled: C,
+    mut on_object: F,
+) -> Result<MutableRegionInfo, RomxError>
+where
+    C: FnMut() -> bool,
+    F: FnMut(MutableSaveObject) -> Result<(), RomxError>,
+{
+    let preview = crate::read_metadata_cover_path(romx)?;
+    let capacity = preview.footer.mutable_capacity;
+    let file_size = fs::metadata(romx)?.len();
+    let region_offset = file_size
+        .checked_sub(FOOTER_SIZE as u64 + capacity)
+        .ok_or_else(|| RomxError::Invalid("mutable region is truncated".into()))?;
+    if capacity == 0 {
+        return Ok(MutableRegionInfo {
+            offset: region_offset,
+            capacity: 0,
+            entry_capacity: 0,
+            data_capacity: 0,
+            free_slots: 0,
+            free_bytes: 0,
+            objects: Vec::new(),
+        });
+    }
+    let capacity_usize = usize::try_from(capacity)
+        .map_err(|_| RomxError::Invalid("mutable capacity is too large".into()))?;
+    let mut file = fs::File::open(romx)?;
+    let header = crate::read_file_range(&mut file, region_offset, MUTABLE_HEADER_SIZE)?;
+    if &header[..4] != b"RMUT"
+        || read_u16(&header, 4)? != 1
+        || read_u16(&header, 6)? as usize != MUTABLE_HEADER_SIZE
+        || read_u32(&header, MUTABLE_HEADER_ENTRY_SIZE_OFFSET)? as usize != MUTABLE_ENTRY_SIZE
+    {
+        return Err(RomxError::Invalid(
+            "invalid mutable SAVE directory header".into(),
+        ));
+    }
+    let entry_capacity = read_u32(&header, MUTABLE_HEADER_ENTRY_COUNT_OFFSET)? as usize;
+    let directory_size = entry_capacity
+        .checked_mul(MUTABLE_ENTRY_SIZE)
+        .ok_or_else(|| RomxError::Invalid("mutable directory size overflow".into()))?;
+    if entry_capacity == 0 || directory_size > capacity_usize.saturating_sub(MUTABLE_HEADER_SIZE) {
+        return Err(RomxError::Invalid(
+            "invalid mutable SAVE directory ranges".into(),
+        ));
+    }
+    let data_offset = usize::try_from(read_u64(&header, MUTABLE_HEADER_DATA_OFFSET)?)
+        .map_err(|_| RomxError::Invalid("mutable data offset is too large".into()))?;
+    let data_capacity = read_u64(&header, MUTABLE_HEADER_DATA_SIZE)?;
+    if data_offset < MUTABLE_HEADER_SIZE + directory_size
+        || data_offset > capacity_usize
+        || data_capacity as usize > capacity_usize.saturating_sub(data_offset)
+    {
+        return Err(RomxError::Invalid(
+            "invalid mutable SAVE directory ranges".into(),
+        ));
+    }
+    let stored_crc = read_u32(&header, MUTABLE_HEADER_CRC_OFFSET)?;
+    let mut checked_header = header;
+    checked_header[MUTABLE_HEADER_CRC_OFFSET..MUTABLE_HEADER_CRC_OFFSET + 4].fill(0);
+    if crc32_u32(&checked_header) != stored_crc {
+        return Err(RomxError::Invalid(
+            "mutable SAVE directory header CRC32 mismatch".into(),
+        ));
+    }
+    let directory = crate::read_file_range(
+        &mut file,
+        region_offset + MUTABLE_HEADER_SIZE as u64,
+        directory_size,
+    )?;
+
+    let data_end = data_offset
+        .checked_add(
+            usize::try_from(data_capacity)
+                .map_err(|_| RomxError::Invalid("mutable data capacity is too large".into()))?,
+        )
+        .ok_or_else(|| RomxError::Invalid("mutable data range overflows".into()))?;
+    let mut used_ranges = Vec::<(usize, usize)>::new();
+    let mut object_count = 0usize;
+    for slot in 0..entry_capacity {
+        if is_cancelled() {
+            return Err(RomxError::Cancelled);
+        }
+        let base = slot * MUTABLE_ENTRY_SIZE;
+        let entry = &directory[base..base + MUTABLE_ENTRY_SIZE];
+        if all_zero(entry) {
+            continue;
+        }
+        let is_ment = &entry[..4] == b"MENT";
+        let active = is_ment && read_u16(entry, 4)? == MUTABLE_ENTRY_ACTIVE;
+        let namespace = if is_ment { read_u16(entry, 6)? } else { 0 };
+        if !active || namespace != MUTABLE_NAMESPACE_SAVE {
+            // Unknown namespaces remain opaque. Their valid allocations still
+            // reserve space so a malformed SAVE object cannot overlap them.
+            if active {
+                let data_start = usize::try_from(read_u64(entry, 0x10)?).unwrap_or(usize::MAX);
+                let allocation = usize::try_from(read_u64(entry, 0x18)?).unwrap_or(usize::MAX);
+                if data_start >= data_offset
+                    && data_start <= data_end
+                    && allocation <= data_end - data_start
+                {
+                    used_ranges.push((data_start, data_start + allocation));
+                }
+            }
+            continue;
+        }
+        let key_size = read_u32(entry, 0x0c)? as usize;
+        if key_size == 0 || key_size > MUTABLE_KEY_CAPACITY {
+            return Err(RomxError::Invalid(format!(
+                "invalid mutable SAVE key length in slot {slot}"
+            )));
+        }
+        let key = String::from_utf8(entry[0x40..0x40 + key_size].to_vec())
+            .map_err(|_| RomxError::Invalid("mutable SAVE key is not UTF-8".into()))?;
+        validate_object_key(&key)?;
+        let data_start = usize::try_from(read_u64(entry, 0x10)?)
+            .map_err(|_| RomxError::Invalid("mutable SAVE data offset is too large".into()))?;
+        let data_capacity_entry = read_u64(entry, 0x18)?;
+        let data_capacity_entry_usize = usize::try_from(data_capacity_entry)
+            .map_err(|_| RomxError::Invalid("mutable SAVE data capacity is too large".into()))?;
+        let data_size = read_u64(entry, 0x20)?;
+        let data_size_usize = usize::try_from(data_size)
+            .map_err(|_| RomxError::Invalid("mutable SAVE data size is too large".into()))?;
+        if data_start < data_offset
+            || data_start > data_end
+            || data_capacity_entry_usize > data_end - data_start
+            || data_size > data_capacity_entry
+        {
+            return Err(RomxError::Invalid(format!(
+                "mutable SAVE object range is invalid: {key}"
+            )));
+        }
+        let range = (data_start, data_start + data_capacity_entry_usize);
+        if used_ranges
+            .iter()
+            .any(|(start, end)| range.0 < *end && *start < range.1)
+        {
+            return Err(RomxError::Invalid(format!(
+                "mutable SAVE objects overlap: {key}"
+            )));
+        }
+        used_ranges.push(range);
+        let absolute_data_start = region_offset
+            .checked_add(data_start as u64)
+            .ok_or_else(|| RomxError::Invalid("mutable SAVE data offset overflows".into()))?;
+        let bundle_bytes = crate::read_file_range(&mut file, absolute_data_start, data_size_usize)?;
+        let files = parse_bundle(&bundle_bytes)?;
+        let object_crc = read_u32(entry, 0x38)?;
+        if crc32_u32(&bundle_bytes) != object_crc {
+            return Err(RomxError::Invalid(format!(
+                "mutable SAVE object CRC32 mismatch: {key}"
+            )));
+        }
+        let stored_entry_crc = read_u32(entry, 0x3c)?;
+        let mut checked_entry = entry.to_vec();
+        checked_entry[0x3c..0x40].fill(0);
+        if crc32_u32(&checked_entry) != stored_entry_crc {
+            return Err(RomxError::Invalid(format!(
+                "mutable SAVE directory entry CRC32 mismatch: {key}"
+            )));
+        }
+        let object = MutableSaveObject {
+            slot,
+            key,
+            files,
+            data_size,
+            data_capacity: data_capacity_entry,
+            generation: read_u64(entry, 0x28)?,
+            modified_at: read_u64(entry, 0x30)?,
+            crc32: format!("{object_crc:08x}"),
+        };
+        object_count = object_count.saturating_add(1);
+        on_object(object)?;
+    }
+    let used_capacity = used_ranges
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start) as u64)
+        .sum::<u64>();
+    Ok(MutableRegionInfo {
+        offset: region_offset,
+        capacity,
+        entry_capacity,
+        data_capacity,
+        free_slots: entry_capacity.saturating_sub(object_count),
+        free_bytes: data_capacity.saturating_sub(used_capacity),
+        objects: Vec::new(),
+    })
+}
+
+/// Stream every logical SAVE object from a ROMX file without loading its ROM
+/// payload. The mutable directory and one bundle at a time are kept in
+/// memory; each extracted file is committed before the next bundle is read.
+pub(crate) fn extract_mutable_save_objects_from_path<C, O>(
+    romx: &Path,
+    output: &Path,
+    temporary_output: bool,
+    is_cancelled: C,
+    mut on_output: O,
+) -> Result<Vec<PathBuf>, RomxError>
+where
+    C: FnMut() -> bool,
+    O: FnMut(&Path) -> Result<Option<PathBuf>, RomxError>,
+{
+    let mut roots = Vec::new();
+    visit_mutable_save_objects_from_path(romx, is_cancelled, |object| {
         let root = output.join(&object.key);
         let single_file = object.files.len() == 1
             && !object.files[0].path.contains('/')
@@ -719,22 +925,50 @@ pub fn extract_mutable_save_objects(romx: &Path, output: &Path) -> Result<Vec<Pa
         } else {
             None
         };
-        for file in object.files {
+        for file_data in object.files {
             let destination = single_destination
                 .clone()
-                .unwrap_or_else(|| root.join(&file.path));
-            if let Some(parent) = destination.parent() {
+                .unwrap_or_else(|| root.join(&file_data.path));
+            let staged = if temporary_output {
+                let filename = destination
+                    .file_name()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "save".into());
+                destination.with_file_name(format!("{filename}.tmp"))
+            } else {
+                destination
+            };
+            if let Some(parent) = staged.parent() {
                 fs::create_dir_all(parent)?;
             }
-            crate::write_atomic_stream(&destination, true, |writer| {
+            crate::write_atomic_stream(&staged, true, |writer| {
                 use std::io::Write;
-                writer.write_all(&file.bytes)?;
+                writer.write_all(&file_data.bytes)?;
                 Ok(())
             })?;
+            let _ = on_output(&staged)?;
         }
         roots.push(single_destination.unwrap_or(root));
-    }
+        Ok(())
+    })?;
     Ok(roots)
+}
+
+/// Extract every logical SAVE object below `output`.
+///
+/// The returned paths are the object roots.  A single-file object is written
+/// as `<key>.<ext>` so a save directory can be rescanned without losing
+/// object boundaries.  Multi-file objects are written as `<key>/...` and keep
+/// their internal relative paths, which is the layout expected by PSP
+/// savedata and directory-based platforms.
+pub fn extract_mutable_save_objects(romx: &Path, output: &Path) -> Result<Vec<PathBuf>, RomxError> {
+    extract_mutable_save_objects_from_path(
+        romx,
+        output,
+        false,
+        || false,
+        |path| Ok(Some(path.to_owned())),
+    )
 }
 
 #[cfg(test)]
