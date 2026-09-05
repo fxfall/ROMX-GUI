@@ -42,6 +42,11 @@ export component MainWindow inherits Window {
     in-out property <string> app_version;
 
     in-out property <string> rom_path;
+    // When more than one source file is selected, these are the portable
+    // payload paths stored in the ROMX RIDX.  The selected entry is written
+    // first and becomes the launch descriptor.
+    in-out property <[string]> payload_entries;
+    in-out property <int> payload_entrypoint_index: -1;
     in-out property <string> cover_path;
     in-out property <string> metadata_path;
     in-out property <string> save_path;
@@ -128,6 +133,7 @@ export component MainWindow inherits Window {
     callback language_changed();
     callback platform_changed();
     callback embedded_cover_changed(index: int);
+    callback payload_entrypoint_changed(index: int);
 
     changed language_index => {
         root.language_changed();
@@ -140,6 +146,12 @@ export component MainWindow inherits Window {
     changed embedded_cover_index => {
         if root.embedded_cover_index >= 0 {
             root.embedded_cover_changed(root.embedded_cover_index);
+        }
+    }
+
+    changed payload_entrypoint_index => {
+        if root.payload_entrypoint_index >= 0 {
+            root.payload_entrypoint_changed(root.payload_entrypoint_index);
         }
     }
 
@@ -522,6 +534,27 @@ export component MainWindow inherits Window {
                                         clicked => { root.open_rom_clicked(); }
                                     }
                                 }
+                                if root.payload_entries.length > 1: VerticalBox {
+                                    spacing: 2px;
+                                    Text {
+                                        text: root.translate("payload_entrypoint", root.language_index);
+                                        color: RomxTheme.text-muted;
+                                        height: 20px;
+                                    }
+                                    ComboBox {
+                                        model: root.payload_entries;
+                                        current-index <=> root.payload_entrypoint_index;
+                                        horizontal-stretch: 1;
+                                        min-width: 0px;
+                                        height: 32px;
+                                    }
+                                    Text {
+                                        text: root.translate("payload_entry_hint", root.language_index);
+                                        color: RomxTheme.text-subtle;
+                                        wrap: word-wrap;
+                                        height: 28px;
+                                    }
+                                }
                             }
                             VerticalBox {
                                 spacing: 2px;
@@ -682,7 +715,7 @@ export component MainWindow inherits Window {
                                 height: 34px;
                                 Text { text: root.translate("platform", root.language_index); width: 130px; horizontal-alignment: left; vertical-alignment: center; }
                                 ComboBox {
-                                    model: ["gb", "gbc", "gba", "nes", "snes", "n64", "nds", "3ds", "genesis", "sms", "gg", "pce", "playstation", "ps2", "psp", "gamecube", "wii", "arcade", "scummvm", "dos", "amiga"];
+                                    model: ["gb", "gbc", "gba", "nes", "snes", "n64", "nds", "3ds", "genesis", "mega_drive_32x", "sms", "gg", "pce", "pc_engine_cd", "sega_cd", "saturn", "dreamcast", "playstation", "ps2", "psp", "gamecube", "wii", "arcade", "scummvm", "dos", "amiga"];
                                     current-value <=> root.platform;
                                     horizontal-stretch: 1;
                                     min-width: 0px;

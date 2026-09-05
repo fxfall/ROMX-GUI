@@ -59,7 +59,8 @@ values, and add the language to the Slint language selector.
 
 ## Workspace
 
-- `crates/romx-core`: Rust implementation of the frozen ROMX 0.2.0 container and metadata schema, strict RIDX/footer validation, optional body SHA-256, structural PNG validation, extraction, and LPL conversion. ROMX 0.1.x containers are not read or written on `main`.
+- `crates/romx-core`: safe Rust orchestration for the frozen ROMX 0.2.0 container, metadata/cover workflows, extraction, SAVE handling, and LPL conversion. ROMX wire-format parsing, writing, validation, and save classification are delegated to the vendored `libromx` library through `libromx-sys`; ROMX 0.1.x containers are not read or written on `main`.
+- `crates/libromx-sys`: thin generated bindings and a CMake build wrapper that statically links the fixed `vendor/libromx` submodule (an explicit `ROMX_LIBROMX_DIR` override is available for local library development).
 - `crates/romx-cli`: command-line interface for Core file operations and LPL import/export.
 - `crates/romx-gui`: Slint + Rust desktop GUI. It calls `romx-core` directly and is intended to target macOS, Windows, and Linux.
 
@@ -185,6 +186,12 @@ Pack, inspect, verify, and extract a ROMX file:
 ./target/release/romx pack game.gba metadata.json --cover cover.webp --cover-size 320x320 --output game.romx
 # Optional database identity override; otherwise CRC32 is regenerated from game.gba.
 ./target/release/romx pack game.gba metadata.json --crc32 0123abcd --output game.romx
+# Multi-file descriptor sets keep every sidecar in RIDX for the ROMX VFS.
+./target/release/romx pack-set \
+  --platform saturn --launch-format cue --entrypoint Game.cue \
+  --entry Game.cue=/path/to/Game.cue \
+  --entry 'Track 01.bin=/path/to/Track 01.bin' \
+  --metadata metadata.json --output game.romx
 ./target/release/romx inspect game.romx
 ./target/release/romx validate game.romx
 ./target/release/romx verify game.romx

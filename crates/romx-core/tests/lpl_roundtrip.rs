@@ -1,9 +1,9 @@
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
 use romx_core::{
     detect_save_bundles, export_lpl, format_id_for_extension, import_lpl,
-    import_lpl_with_output_handling, pack_to_path_with_writer_options, plan_lpl_import, read_path,
-    ExportLplOptions, ImportLplOptions, MutableSaveBundle, MutableSaveFile, PackOptions,
-    RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY,
+    import_lpl_with_output_handling, pack_to_path_with_writer_options, plan_lpl_import,
+    platform_id_for_name, read_path, ExportLplOptions, ImportLplOptions, MutableSaveBundle,
+    MutableSaveFile, PackOptions, RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -245,13 +245,13 @@ fn lpl_import_can_reserve_mutable_space_for_frontends() {
         document.footer.mutable_capacity,
         RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY
     );
-    let mutable_offset = report.output_files[0].metadata().unwrap().len()
-        - 128
-        - RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY;
-    let bytes = fs::read(&report.output_files[0]).unwrap();
+    // The mutable region is exposed through libromx's reader API; the test
+    // must not depend on footer/mutable wire offsets or magic values.
+    let reader = romx_core::Reader::open(&report.output_files[0]).unwrap();
+    let info = reader.info().unwrap();
     assert_eq!(
-        &bytes[mutable_offset as usize..mutable_offset as usize + 4],
-        b"RMUT"
+        info.mutable_region.size,
+        RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY
     );
 }
 
@@ -422,6 +422,44 @@ fn lpl_import_accepts_disc_payload_extensions() {
     assert_eq!(
         document.entries[0].format_id,
         format_id_for_extension("iso")
+    );
+}
+
+#[test]
+fn lpl_import_accepts_arcade_zip_payloads_without_rewriting_them() {
+    let root = tempdir().unwrap();
+    let rom_path = root.path().join("arcade.zip");
+    let zip_bytes = b"PK\x03\x04original-arcade-zip";
+    fs::write(&rom_path, zip_bytes).unwrap();
+    let lpl_path = root.path().join("Arcade.lpl");
+    fs::write(
+        &lpl_path,
+        serde_json::to_vec(&json!({
+            "version": "1.5",
+            "items": [{"path": rom_path, "label": "Arcade game"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let plan = plan_lpl_import(&lpl_path, &ImportLplOptions::default()).unwrap();
+    assert_eq!(plan.items[0].payload_format, "zip");
+    assert_eq!(plan.items[0].platform, "arcade");
+
+    let output = root.path().join("romx");
+    let report = import_lpl(&lpl_path, &output, &ImportLplOptions::default()).unwrap();
+    let document = read_path(&report.output_files[0]).unwrap();
+    assert_eq!(document.rom, zip_bytes);
+    assert_eq!(
+        document.entries[0].format_id,
+        format_id_for_extension("zip")
+    );
+    assert_eq!(document.footer.platform_id, platform_id_for_name("arcade"));
+
+    let export = export_lpl(&output, &root.path().join("export"), &Default::default()).unwrap();
+    assert_eq!(
+        fs::read(export.rom_dir.join("arcade.zip")).unwrap(),
+        zip_bytes
     );
 }
 

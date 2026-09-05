@@ -5,14 +5,16 @@ slint::include_modules!();
 use image::ImageReader;
 use rfd::FileDialog;
 use romx_core::{
-    application_version, check_frontend_compatibility, classify_gb_payload, crc32_path,
+    application_version, check_frontend_compatibility, classify_gb_payload_path, crc32_path,
     detect_save_bundles, download_libretro_thumbnail, export_lpl_with_output_handling,
-    format_extension, format_id_for_extension, identity_from_path, import_lpl_with_error_handling,
-    inspect_payload_profile, libretro_lookup_candidates, libretro_match_mode, normalize_crc32,
-    plan_lpl_import, platform_name_from_id, read_metadata_cover_path, read_mutable_region,
-    read_mutable_save_objects, read_path, recommended_mutable_capacity,
-    recommended_mutable_capacity_for_save_bytes, recommended_mutable_entry_capacity, EmbeddedCover,
-    ExportLplOptions, ImportLplPlan, LibretroLookup, MutableSaveBundle, LPLX_METADATA_KEY,
+    extract_payload_to_path, format_extension, format_id_for_extension, identity_from_path,
+    import_lpl_with_error_handling, inspect_payload_profile, launch_format_id_for_extension,
+    libretro_lookup_candidates, libretro_match_mode, normalize_crc32,
+    pack_entries_to_path_with_writer_options, plan_lpl_import, platform_id_for_name,
+    platform_name_from_id, read_metadata_cover_path, read_mutable_save_objects,
+    recommended_mutable_capacity, recommended_mutable_capacity_for_save_bytes,
+    recommended_mutable_entry_capacity, EmbeddedCover, ExportLplOptions, ImportLplPlan,
+    LibretroLookup, MutableSaveBundle, PackEntry, PackOptions, PayloadProfile, LPLX_METADATA_KEY,
     ROMX_LPLX_METADATA_FIELDS, SPEC_VERSION, SUPPORTED_FORMAT_EXTENSIONS,
 };
 use serde_json::{Map, Value};
@@ -144,10 +146,11 @@ struct LplWorkspace {
     pending: Option<PendingConversion>,
     single_conflict: Option<PendingSingleConflict>,
     romx_cover_path: Option<PathBuf>,
-    existing_mutable_region: Option<Vec<u8>>,
+    existing_mutable_source: Option<PathBuf>,
     embedded_covers: Vec<EmbeddedCover>,
     romx_metadata: Option<Value>,
     current_payload_format: Option<String>,
+    payload_entries: Vec<PackEntry>,
     online_metadata: Map<String, Value>,
     online_match: Arc<Mutex<Option<OnlineMatchState>>>,
     online_match_generation: Arc<AtomicUsize>,
@@ -297,16 +300,31 @@ struct PendingConversion {
 }
 
 struct SingleConversion {
-    lpl_path: PathBuf,
-    payload_path: Option<PathBuf>,
+    source: SingleConversionSource,
     cover_target: Option<(u32, u32)>,
     mutable_capacity: u64,
     mutable_entry_capacity: u32,
     mutable_save_bundles: Vec<MutableSaveBundle>,
-    mutable_region: Option<Vec<u8>>,
+    mutable_region_source: Option<PathBuf>,
     save_path: PathBuf,
     output_path: PathBuf,
     replace: bool,
+}
+
+#[derive(Clone)]
+enum SingleConversionSource {
+    Lpl {
+        lpl_path: PathBuf,
+        payload_path: Option<PathBuf>,
+    },
+    PackSet {
+        entries: Vec<PackEntry>,
+        entrypoint: String,
+        metadata_path: PathBuf,
+        cover_path: Option<PathBuf>,
+        platform_id: u16,
+        launch_format_id: u16,
+    },
 }
 
 type PendingSingleConflict = SingleConversion;
@@ -338,10 +356,11 @@ impl LplWorkspace {
             pending: None,
             single_conflict: None,
             romx_cover_path: None,
-            existing_mutable_region: None,
+            existing_mutable_source: None,
             embedded_covers: Vec::new(),
             romx_metadata: None,
             current_payload_format: None,
+            payload_entries: Vec::new(),
             online_metadata: Map::new(),
             online_match: Arc::new(Mutex::new(None)),
             online_match_generation: Arc::new(AtomicUsize::new(0)),
@@ -368,10 +387,11 @@ impl LplWorkspace {
         self.pending = None;
         self.single_conflict = None;
         self.romx_cover_path = None;
-        self.existing_mutable_region = None;
+        self.existing_mutable_source = None;
         self.embedded_covers.clear();
         self.romx_metadata = None;
         self.current_payload_format = None;
+        self.payload_entries.clear();
         self.online_metadata.clear();
         self.online_match_generation.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut state) = self.online_match.lock() {
@@ -390,13 +410,15 @@ impl LplWorkspace {
     }
 
     fn clear_romx_cover(&mut self) {
+        self.preview_generation.fetch_add(1, Ordering::Relaxed);
         if let Some(path) = self.romx_cover_path.take() {
             let _ = fs::remove_file(path);
         }
-        self.existing_mutable_region = None;
+        self.existing_mutable_source = None;
         self.embedded_covers.clear();
         self.romx_metadata = None;
         self.current_payload_format = None;
+        self.payload_entries.clear();
         self.online_metadata.clear();
         self.online_match_generation.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut state) = self.online_match.lock() {
@@ -880,7 +902,7 @@ fn platform_for_path(path: &str) -> &'static str {
         "gcm" => "gamecube",
         "wbfs" | "rvz" | "wia" | "wad" => "wii",
         "prx" => "psp",
-        "elf" => "arcade",
+        "elf" | "zip" => "arcade",
         "msu" | "pcm" => "snes",
         _ => "gba",
     }
@@ -915,6 +937,9 @@ fn supported_platform(value: &str) -> bool {
             | "genesis32x"
             | "pcecd"
             | "segacd"
+            | "mega_drive_32x"
+            | "sega_cd"
+            | "pc_engine_cd"
             | "saturn"
             | "dreamcast"
     )
@@ -1702,6 +1727,7 @@ fn store_embedded_cover(
 fn clear_embedded_cover_choices(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     let old_path = {
         let mut state = workspace.borrow_mut();
+        state.preview_generation.fetch_add(1, Ordering::Relaxed);
         state.embedded_covers.clear();
         state.romx_cover_path.take()
     };
@@ -1743,13 +1769,162 @@ fn set_embedded_cover_choices(
     select_embedded_cover(window, workspace, index);
 }
 
+/// Apply metadata and artwork discovered by romx-core to the shared GUI form.
+///
+/// Keeping this in one place is important because a payload can enter the GUI
+/// through the normal file picker, a multi-entry entrypoint selector, or the
+/// LPL preview.  All of those paths must expose the same embedded 3DS/CCI
+/// metadata and cover choices instead of leaving stale values from the
+/// previously selected item.
+fn apply_payload_profile(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    path: &Path,
+    profile: PayloadProfile,
+) {
+    let PayloadProfile {
+        payload_format,
+        platform,
+        metadata,
+        cover,
+        covers,
+    } = profile;
+    workspace.borrow_mut().current_payload_format = Some(payload_format);
+
+    let embedded = Value::Object(metadata);
+    set_metadata_form(window, &embedded);
+    let embedded_name = metadata_text(&embedded, "name");
+    window.set_display_title(
+        if embedded_name.is_empty() {
+            path.file_stem()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            embedded_name
+        }
+        .into(),
+    );
+    window.set_platform(platform.into());
+
+    // 3DS/CCI SMDH files can expose both the 48x48 and 24x24 icons.  Store the
+    // first choice immediately so the preview is populated even before the
+    // ComboBox callback is delivered by Slint.  The user can then switch to a
+    // different embedded image without re-reading the ROM payload.
+    set_embedded_cover_choices(window, workspace, covers);
+    if workspace.borrow().embedded_covers.is_empty() {
+        if let Some(cover) = cover.as_deref() {
+            let _ = store_embedded_cover(window, workspace, cover, "embedded-cover.png");
+        }
+    }
+    update_identity_mode(window, workspace);
+}
+
+fn is_launch_descriptor(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "cue" | "gdi" | "m3u" | "ccd" | "mds" | "toc"
+    )
+}
+
+fn common_parent(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut parent = paths.first()?.parent()?.to_owned();
+    for path in paths.iter().skip(1) {
+        while !path.starts_with(&parent) {
+            let next = parent.parent()?.to_owned();
+            if next == parent {
+                return None;
+            }
+            parent = next;
+        }
+    }
+    Some(parent)
+}
+
+fn pack_entry_virtual_path(root: Option<&Path>, path: &Path) -> String {
+    let relative = root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .unwrap_or_else(|| path.file_name().map(Path::new).unwrap_or(path));
+    relative
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_owned()
+}
+
+fn make_pack_entries(paths: &[PathBuf], entrypoint_index: usize) -> Result<Vec<PackEntry>, String> {
+    let root = common_parent(paths);
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let path = pack_entry_virtual_path(root.as_deref(), source);
+            if path.is_empty() {
+                return Err(format!(
+                    "Cannot determine a virtual path for {}",
+                    source.display()
+                ));
+            }
+            // Validate the extension in the same way as the single-file
+            // picker.  Sidecar formats such as BIN/IMG/SUB are all part of
+            // SUPPORTED_FORMAT_EXTENSIONS and are inferred by the core.
+            payload_format(&path)?;
+            Ok(PackEntry {
+                path,
+                source: source.clone(),
+                format_id: 0,
+                entrypoint: index == entrypoint_index,
+            })
+        })
+        .collect()
+}
+
 fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     let dialog = FileDialog::new()
         .set_title("Choose game ROM")
         .add_filter("Supported ROM", ROM_EXTENSIONS)
         .add_filter("ROMX", ROMX_EXTENSIONS);
-    let Some(path) = dialog.pick_file() else {
+    let Some(paths) = dialog.pick_files() else {
         return;
+    };
+    if paths.is_empty() {
+        return;
+    }
+    let paths = paths
+        .into_iter()
+        .map(|path| absolute_path(&path))
+        .collect::<Vec<_>>();
+    let is_multi = paths.len() > 1;
+    if is_multi && paths.iter().any(|path| is_romx_file(path)) {
+        set_status(
+            window,
+            "ROMX files can only be selected one at a time",
+            "ROMX files can only be selected one at a time",
+        );
+        return;
+    }
+    let entrypoint_index = if is_multi {
+        paths
+            .iter()
+            .position(|path| is_launch_descriptor(path))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let path = paths[entrypoint_index].clone();
+    let payload_entries = if is_multi {
+        match make_pack_entries(&paths, entrypoint_index) {
+            Ok(entries) => Some(entries),
+            Err(error) => {
+                set_status(window, &error, &error);
+                return;
+            }
+        }
+    } else {
+        None
     };
     let path_string = path.to_string_lossy().into_owned();
     let is_romx = is_romx_file(&path);
@@ -1758,6 +1933,10 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
         state.romx_cover_path.is_some() || state.romx_metadata.is_some()
     };
     workspace.borrow_mut().clear_romx_cover();
+    {
+        let mut state = workspace.borrow_mut();
+        state.payload_entries = payload_entries.clone().unwrap_or_default();
+    }
     if had_romx_state {
         window.set_cover_preview(Image::default());
     }
@@ -1777,6 +1956,17 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     window.set_cover_preview(Image::default());
     window.set_embedded_cover_options(values_model(Vec::new()));
     window.set_embedded_cover_index(-1);
+    window.set_payload_entries(values_model(
+        payload_entries
+            .as_ref()
+            .map(|entries| entries.iter().map(|entry| entry.path.clone()).collect())
+            .unwrap_or_default(),
+    ));
+    window.set_payload_entrypoint_index(if is_multi {
+        entrypoint_index as i32
+    } else {
+        -1
+    });
     window.set_rom_path(path_string.clone().into());
     if is_romx {
         match read_metadata_cover_path(&path) {
@@ -1824,9 +2014,9 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
                 } else {
                     window.set_cover_preview(Image::default());
                 }
-                if read_mutable_save_objects(&path).is_ok() {
-                    if let Ok(raw_region) = read_mutable_region(&path) {
-                        workspace.borrow_mut().existing_mutable_region = raw_region;
+                if let Ok(region) = read_mutable_save_objects(&path) {
+                    if region.capacity != 0 {
+                        workspace.borrow_mut().existing_mutable_source = Some(path.clone());
                     }
                 }
                 update_identity_mode(window, workspace);
@@ -1866,28 +2056,7 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     } else {
         match inspect_payload_profile(&path) {
             Ok(profile) => {
-                workspace.borrow_mut().current_payload_format =
-                    Some(profile.payload_format.clone());
-                let embedded = Value::Object(profile.metadata.clone());
-                set_metadata_form(window, &embedded);
-                let embedded_name = metadata_text(&embedded, "name");
-                window.set_display_title(
-                    if embedded_name.is_empty() {
-                        path_stem(&path_string)
-                    } else {
-                        embedded_name
-                    }
-                    .into(),
-                );
-                window.set_platform(profile.platform.into());
-                set_embedded_cover_choices(window, workspace, profile.covers);
-                if workspace.borrow().embedded_covers.is_empty() {
-                    if let Some(cover) = profile.cover.as_deref() {
-                        let _ =
-                            store_embedded_cover(window, workspace, cover, "embedded-cover.png");
-                    }
-                }
-                update_identity_mode(window, workspace);
+                apply_payload_profile(window, workspace, &path, profile);
                 let weak = window.as_weak();
                 let expected_path = path.clone();
                 thread::spawn(move || {
@@ -1918,13 +2087,70 @@ fn choose_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
             }
         }
     }
-    if !is_romx {
-        set_status(
-            window,
-            format!("Selected ROM: {path_string}"),
-            format!("ROM selected: {path_string}"),
-        );
+    if is_multi {
+        // Descriptor sets do not always expose a useful embedded profile.
+        // Keep the platform inferred from the selected entrypoint as the
+        // editable default, while still allowing the user to choose the
+        // actual console in the metadata form.
+        window.set_platform(platform_for_path(&path_string).into());
+        update_identity_mode(window, workspace);
     }
+    if !is_romx {
+        if is_multi {
+            let count = payload_entries.as_ref().map_or(0, Vec::len);
+            set_status(
+                window,
+                format!("Selected payload set: {count} files; entrypoint: {path_string}"),
+                format!("已选择 payload 集合：{count} 个文件；入口：{path_string}"),
+            );
+        } else {
+            set_status(
+                window,
+                format!("Selected ROM: {path_string}"),
+                format!("ROM selected: {path_string}"),
+            );
+        }
+    }
+}
+
+fn select_payload_entrypoint(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    index: i32,
+) {
+    if index < 0 {
+        return;
+    }
+    let selected = {
+        let mut state = workspace.borrow_mut();
+        let index = index as usize;
+        if index >= state.payload_entries.len() {
+            return;
+        }
+        for (entry_index, entry) in state.payload_entries.iter_mut().enumerate() {
+            entry.entrypoint = entry_index == index;
+        }
+        let source = state.payload_entries[index].source.clone();
+        let virtual_path = state.payload_entries[index].path.clone();
+        state.current_payload_format = payload_format(&virtual_path).ok();
+        (source, virtual_path)
+    };
+    let (source, virtual_path) = selected;
+    let source_string = source.to_string_lossy().into_owned();
+    window.set_rom_path(source_string.clone().into());
+    clear_embedded_cover_choices(window, workspace);
+    if let Ok(profile) = inspect_payload_profile(&source) {
+        apply_payload_profile(window, workspace, &source, profile);
+    } else {
+        window.set_display_title(path_stem(&source_string).into());
+        window.set_platform(platform_for_path(&virtual_path).into());
+        update_identity_mode(window, workspace);
+    }
+    set_status(
+        window,
+        format!("Payload entrypoint selected: {virtual_path}"),
+        format!("已选择 payload 入口文件：{virtual_path}"),
+    );
 }
 
 fn choose_cover(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
@@ -2049,7 +2275,6 @@ fn write_json_file(path: &Path, value: &Value) -> Result<(), Box<dyn std::error:
     let mut file = fs::File::create(&temporary)?;
     std::io::Write::write_all(&mut file, &bytes)?;
     std::io::Write::flush(&mut file)?;
-    file.sync_all()?;
     commit_staged(&temporary, path, true).map_err(std::io::Error::other)?;
     Ok(())
 }
@@ -2653,6 +2878,8 @@ fn start_pending_conversion(window: &MainWindow, workspace: &Rc<RefCell<LplWorks
         let options = romx_core::ImportLplOptions {
             skip_missing: true,
             temporary_output: true,
+            include_identity: false,
+            write_manifest: false,
             cover_target: pending.cover_target,
             mutable_capacity: pending.mutable_capacity,
             ..Default::default()
@@ -2920,6 +3147,7 @@ fn cached_lpl_plan(
 
 fn refresh_lpl_preview(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     refresh_lpl_file_lists(window, workspace);
+    clear_embedded_cover_choices(window, workspace);
     let lpl_path = window.get_lpl_work_path();
     if lpl_path.trim().is_empty() {
         window.set_lpl_detail_title(
@@ -2963,6 +3191,12 @@ fn refresh_lpl_preview(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>
                 .find_map(|item| item.cover_path.as_deref())
             {
                 request_preview_path(window, workspace, Some(cover_path));
+            } else if let Some(item) = plan.items.first() {
+                if let Ok(profile) = inspect_payload_profile(&item.rom_path) {
+                    set_embedded_cover_choices(window, workspace, profile.covers);
+                } else {
+                    window.set_cover_preview(Image::default());
+                }
             } else {
                 window.set_cover_preview(Image::default());
             }
@@ -3035,10 +3269,30 @@ fn select_lpl_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, in
                     .find(|item| paths_equivalent(&item.rom_path, path))
             })
         });
+    // A normal LPL often has no cover path (or points at a missing thumbnail),
+    // while the ROM itself may carry artwork in an SMDH/ICON resource. Probe
+    // that payload as a fallback so selecting a 3DS/CCI entry in the LPL page
+    // behaves the same as selecting it in the single-file page.
+    let cover_path = selected_item
+        .and_then(|item| item.cover_path.as_deref())
+        .filter(|cover| cover.is_file());
+    let embedded_profile = if cover_path.is_none() {
+        inspect_payload_profile(path).ok()
+    } else {
+        None
+    };
     if let Some(item) = selected_item {
         title = item.label.clone();
         format = format!("{} · {}", item.platform, item.payload_format).to_uppercase();
         info = format!("{} · ROM {} bytes", item.platform, size);
+    } else if let Some(profile) = embedded_profile.as_ref() {
+        let metadata = Value::Object(profile.metadata.clone());
+        title = metadata_text(&metadata, "name");
+        if title.is_empty() {
+            title = path_stem(&path_string);
+        }
+        format = format!("{} · {}", profile.platform, profile.payload_format).to_uppercase();
+        info = format!("{} · ROM {} bytes", profile.platform, size);
     }
 
     window.set_lpl_rom_selected(index);
@@ -3046,8 +3300,12 @@ fn select_lpl_rom(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>, in
     window.set_lpl_selected_path(path_string.clone().into());
     let selected_item_index = selected_item.map(|item| item.index as i32).unwrap_or(0);
     window.set_lpl_selected_item_index(selected_item_index);
-    if let Some(cover_path) = selected_item.and_then(|item| item.cover_path.as_deref()) {
+
+    clear_embedded_cover_choices(window, workspace);
+    if let Some(cover_path) = cover_path {
         request_preview_path(window, workspace, Some(cover_path));
+    } else if let Some(profile) = embedded_profile.as_ref() {
+        set_embedded_cover_choices(window, workspace, profile.covers.clone());
     } else {
         window.set_cover_preview(Image::default());
     }
@@ -3762,8 +4020,22 @@ fn begin_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
         );
         return;
     };
-    let metadata = lpl_item_metadata(item);
     let cover_path = lpl_item_cover_path(Path::new(work_path.trim()), item);
+    let embedded_profile = if cover_path.is_none() {
+        inspect_payload_profile(Path::new(rom_path)).ok()
+    } else {
+        None
+    };
+    let mut metadata = lpl_item_metadata(item);
+    if let Some(profile) = embedded_profile.as_ref() {
+        if let Some(metadata_object) = metadata.as_object_mut() {
+            for (key, value) in &profile.metadata {
+                if !metadata_object.contains_key(key) {
+                    metadata_object.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
     let edit_item = item.clone();
     let mut edit_document = document.clone();
     let Some(object) = edit_document.as_object_mut() else {
@@ -3819,6 +4091,9 @@ fn begin_lpl_edit(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
         window.set_platform(platform_for_path(&window.get_rom_path()).into());
     }
     set_edit_cover(window, workspace, cover_path.as_deref());
+    if let Some(profile) = embedded_profile {
+        set_embedded_cover_choices(window, workspace, profile.covers);
+    }
     workspace.borrow_mut().current_index = Some(item_index as usize);
     window.set_editing_lpl_file(true);
     window.set_active_page(0);
@@ -4148,12 +4423,81 @@ fn convert_lpl(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     );
 }
 
-fn remove_single_temp(path: &Path, payload_path: Option<&Path>) {
-    let _ = fs::remove_file(path);
-    let _ = fs::remove_file(path.with_extension("lplx.tmp"));
-    if let Some(payload_path) = payload_path {
-        let _ = fs::remove_file(payload_path);
+fn remove_single_temp(source: &SingleConversionSource) {
+    match source {
+        SingleConversionSource::Lpl {
+            lpl_path,
+            payload_path,
+        } => {
+            let _ = fs::remove_file(lpl_path);
+            let _ = fs::remove_file(lpl_path.with_extension("lplx.tmp"));
+            if let Some(payload_path) = payload_path {
+                let _ = fs::remove_file(payload_path);
+            }
+        }
+        SingleConversionSource::PackSet { metadata_path, .. } => {
+            let _ = fs::remove_file(metadata_path);
+        }
     }
+}
+
+fn staged_pack_set_output(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output.romx");
+    // Keep the caller-visible staging name predictable.  The core writer is
+    // instructed to write directly to this file, and the GUI renames it to
+    // the final `.romx` path immediately after the stream completes.
+    parent.join(format!("{name}.tmp"))
+}
+
+fn current_cover_path(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+) -> Option<PathBuf> {
+    if !window.get_cover_path().trim().is_empty() {
+        Some(absolute_path(Path::new(window.get_cover_path().trim())))
+    } else {
+        workspace.borrow().romx_cover_path.clone()
+    }
+}
+
+fn create_pack_set_metadata(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+) -> Result<PathBuf, String> {
+    let base_metadata = workspace.borrow().romx_metadata.clone();
+    let mut metadata = build_metadata_with_base(window, base_metadata.as_ref())
+        .map_err(|error| format!("Metadata generation failed: {error}"))?;
+    if let Value::Object(object) = &mut metadata {
+        let extras = workspace.borrow().online_metadata.clone();
+        for (key, value) in extras {
+            if ROMX_LPLX_METADATA_FIELDS.contains(&key.as_str())
+                && !matches!(
+                    key.as_str(),
+                    "name" | "genre" | "developer" | "origin" | "release_date" | "serial" | "crc32"
+                )
+            {
+                object.insert(key, value);
+            }
+        }
+        object.insert("schema_version".into(), Value::String(SPEC_VERSION.into()));
+    }
+    let path = {
+        let mut state = workspace.borrow_mut();
+        fs::create_dir_all(&state.temp_dir)
+            .map_err(|error| format!("Failed to create the temporary directory: {error}"))?;
+        let index = state.next_single_index;
+        state.next_single_index = state.next_single_index.saturating_add(1);
+        state
+            .temp_dir
+            .join(format!("temp-single-{index:02}.metadata.json"))
+    };
+    write_json_file(&path, &metadata)
+        .map_err(|error| format!("Failed to write temporary metadata: {error}"))?;
+    Ok(path)
 }
 
 fn prepare_single_input(
@@ -4172,9 +4516,7 @@ fn prepare_single_input(
     if !is_romx {
         let format = payload_format(input_path.to_string_lossy().as_ref())?;
         let format = if matches!(format.as_str(), "gb" | "gbc") {
-            let bytes =
-                fs::read(&input_path).map_err(|error| format!("Failed to read ROM: {error}"))?;
-            classify_gb_payload(&bytes, Some(&format))
+            classify_gb_payload_path(&input_path, Some(&format))
                 .map_err(|error| format!("Failed to read ROM: {error}"))?
                 .to_owned()
         } else {
@@ -4184,13 +4526,14 @@ fn prepare_single_input(
         return Ok((format, input_path, None, None));
     }
 
-    let document =
-        read_path(&input_path).map_err(|error| format!("Failed to read ROMX: {error}"))?;
-    let entry_format = document
+    let preview = read_metadata_cover_path(&input_path)
+        .map_err(|error| format!("Failed to read ROMX: {error}"))?;
+    let entry = preview
         .entries
         .iter()
         .find(|entry| entry.entrypoint)
-        .and_then(|entry| format_extension(entry.format_id))
+        .ok_or_else(|| "ROMX entrypoint is missing".to_owned())?;
+    let entry_format = format_extension(entry.format_id)
         .ok_or_else(|| "ROMX entry format is not registered".to_owned())?;
     let declared_format = entry_format.to_owned();
     // Keep the payload's logical basename when materializing a ROMX entry.
@@ -4198,17 +4541,14 @@ fn prepare_single_input(
     // basename is also used by ROMX's RIDX writer.  Using a fixed
     // `temp-romx-payload.*` name leaked an internal implementation detail into
     // the generated container.
-    let entry_filename = document
-        .entries
-        .iter()
-        .find(|entry| entry.entrypoint)
-        .and_then(|entry| Path::new(&entry.path).file_name())
+    let entry_filename = Path::new(&entry.path)
+        .file_name()
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| format!("payload.{declared_format}"));
     let format = if matches!(declared_format.as_str(), "gb" | "gbc") {
-        classify_gb_payload(&document.rom, Some(&declared_format))
+        classify_gb_payload_path(&input_path, Some(&declared_format))
             .map_err(|error| format!("Failed to read the ROM inside ROMX: {error}"))?
             .to_owned()
     } else {
@@ -4220,7 +4560,7 @@ fn prepare_single_input(
         fs::create_dir_all(&state.temp_dir)
             .map_err(|error| format!("Failed to create the temporary directory: {error}"))?;
         let path = state.temp_dir.join(entry_filename);
-        fs::write(&path, &document.rom)
+        extract_payload_to_path(&input_path, &path, true)
             .map_err(|error| format!("Failed to extract the ROM from ROMX: {error}"))?;
         path
     };
@@ -4228,7 +4568,7 @@ fn prepare_single_input(
         format,
         payload_path.clone(),
         Some(payload_path),
-        Some(document.footer.mutable_capacity),
+        Some(preview.footer.mutable_capacity),
     ))
 }
 
@@ -4238,13 +4578,12 @@ fn run_single_conversion(
     conversion: SingleConversion,
 ) {
     let SingleConversion {
-        lpl_path: temporary_lpl,
-        payload_path: temporary_payload,
+        source,
         cover_target,
         mutable_capacity,
         mutable_entry_capacity,
         mutable_save_bundles,
-        mutable_region,
+        mutable_region_source,
         save_path,
         output_path,
         replace,
@@ -4256,7 +4595,7 @@ fn run_single_conversion(
             format!("Failed to create the temporary output directory: {error}"),
             format!("Temporary output directory failed: {error}"),
         );
-        remove_single_temp(&temporary_lpl, temporary_payload.as_deref());
+        remove_single_temp(&source);
         return;
     }
     let cancel = Arc::new(AtomicBool::new(false));
@@ -4269,89 +4608,151 @@ fn run_single_conversion(
     window.set_conversion_imported(0);
     window.set_conversion_skipped(0);
     thread::spawn(move || {
-        let error_weak = weak.clone();
-        let error_prompt_sender = prompt_sender.clone();
-        let error_cancel = cancel.clone();
-        let mut progress_callback =
-            |current: usize, total: usize, imported: usize, skipped: usize| {
-                let _ = slint::invoke_from_event_loop({
-                    let progress_weak = weak.clone();
-                    move || {
-                        if let Some(window) = progress_weak.upgrade() {
-                            window.set_conversion_current(current as i32);
-                            window.set_conversion_total(total as i32);
-                            window.set_conversion_imported(imported as i32);
-                            window.set_conversion_skipped(skipped as i32);
-                        }
+        let mut mutable_save_bundles = Some(mutable_save_bundles);
+        let mut mutable_region_source = mutable_region_source;
+        let final_result: Result<(usize, usize, usize), romx_core::RomxError> = match &source {
+            SingleConversionSource::Lpl {
+                lpl_path,
+                payload_path: _,
+            } => {
+                let error_weak = weak.clone();
+                let error_prompt_sender = prompt_sender.clone();
+                let error_cancel = cancel.clone();
+                let mut progress_callback =
+                    |current: usize, total: usize, imported: usize, skipped: usize| {
+                        let _ = slint::invoke_from_event_loop({
+                            let progress_weak = weak.clone();
+                            move || {
+                                if let Some(window) = progress_weak.upgrade() {
+                                    window.set_conversion_current(current as i32);
+                                    window.set_conversion_total(total as i32);
+                                    window.set_conversion_imported(imported as i32);
+                                    window.set_conversion_skipped(skipped as i32);
+                                }
+                            }
+                        });
+                    };
+                let result = import_lpl_with_error_handling(
+                    lpl_path,
+                    &temp_output,
+                    &romx_core::ImportLplOptions {
+                        temporary_output: true,
+                        include_identity: false,
+                        write_manifest: false,
+                        cover_target,
+                        mutable_capacity,
+                        mutable_entry_capacity,
+                        mutable_save_bundles: mutable_save_bundles.take().unwrap_or_default(),
+                        mutable_region_source: mutable_region_source.take(),
+                        ..Default::default()
+                    },
+                    &mut progress_callback,
+                    || cancel.load(Ordering::Relaxed),
+                    move |item_index, error| {
+                        request_error_choice(
+                            &error_prompt_sender,
+                            &error_weak,
+                            &error_cancel,
+                            item_index,
+                            error,
+                        )
+                    },
+                );
+                let result = if cancel.load(Ordering::Relaxed) {
+                    Err(romx_core::RomxError::Cancelled)
+                } else {
+                    result
+                };
+                result.and_then(|report| {
+                    let Some(generated_path) = report.output_files.first() else {
+                        let _ = fs::remove_file(&report.manifest_path);
+                        return Err(romx_core::RomxError::Invalid(
+                            "Core did not generate a ROMX file".into(),
+                        ));
+                    };
+                    let generated_name = final_output_name(generated_path).ok_or_else(|| {
+                        romx_core::RomxError::Invalid(
+                            "Core produced an invalid output filename".into(),
+                        )
+                    })?;
+                    if Path::new(&generated_name).extension() != output_path.extension() {
+                        let _ = fs::remove_file(generated_path);
+                        let _ = fs::remove_file(&report.manifest_path);
+                        return Err(romx_core::RomxError::Invalid(
+                            "Core output format does not match the target file".into(),
+                        ));
                     }
-                });
-            };
-        let result = import_lpl_with_error_handling(
-            &temporary_lpl,
-            &temp_output,
-            &romx_core::ImportLplOptions {
-                temporary_output: true,
-                cover_target,
-                mutable_capacity,
-                mutable_entry_capacity,
-                mutable_save_bundles,
-                mutable_region,
-                ..Default::default()
-            },
-            &mut progress_callback,
-            || cancel.load(Ordering::Relaxed),
-            move |item_index, error| {
-                request_error_choice(
-                    &error_prompt_sender,
-                    &error_weak,
-                    &error_cancel,
-                    item_index,
-                    error,
-                )
-            },
-        );
-        let result = if cancel.load(Ordering::Relaxed) {
-            Err(romx_core::RomxError::Cancelled)
-        } else {
-            result
-        };
-        let final_result = result.and_then(|report| {
-            let Some(generated_path) = report.output_files.first() else {
-                let _ = fs::remove_file(&report.manifest_path);
-                return Err(romx_core::RomxError::Invalid(
-                    "Core did not generate a ROMX file".into(),
-                ));
-            };
-            let generated_name = final_output_name(generated_path).ok_or_else(|| {
-                romx_core::RomxError::Invalid("Core produced an invalid output filename".into())
-            })?;
-            if Path::new(&generated_name).extension() != output_path.extension() {
-                let _ = fs::remove_file(generated_path);
-                let _ = fs::remove_file(&report.manifest_path);
-                return Err(romx_core::RomxError::Invalid(
-                    "Core output format does not match the target file".into(),
-                ));
+                    commit_staged(generated_path, &output_path, replace)
+                        .map_err(romx_core::RomxError::Invalid)?;
+                    let _ = fs::remove_file(&report.manifest_path);
+                    Ok((report.total_items, report.imported, report.skipped))
+                })
             }
-            commit_staged(generated_path, &output_path, replace)
-                .map_err(romx_core::RomxError::Invalid)?;
-            let _ = fs::remove_file(&report.manifest_path);
-            Ok((report, output_path))
-        });
-        remove_single_temp(&temporary_lpl, temporary_payload.as_deref());
+            SingleConversionSource::PackSet {
+                entries,
+                entrypoint,
+                metadata_path,
+                cover_path,
+                platform_id,
+                launch_format_id,
+            } => {
+                let staged = staged_pack_set_output(&output_path);
+                let options = PackOptions {
+                    body_sha256: false,
+                    replace_existing: true,
+                    crc32_override: None,
+                    cover_target,
+                    platform_id: *platform_id,
+                    launch_format_id: *launch_format_id,
+                    entry_format_id: 0,
+                    include_entry_crc32: true,
+                    mutable_capacity,
+                    mutable_entry_capacity,
+                    mutable_save_bundles: mutable_save_bundles.take().unwrap_or_default(),
+                    mutable_region_source: mutable_region_source.take(),
+                    mutable_region: None,
+                    output_is_temporary: true,
+                    post_write_validation: false,
+                };
+                let result = pack_entries_to_path_with_writer_options(
+                    entries,
+                    Some(entrypoint),
+                    Some(metadata_path),
+                    cover_path.as_deref(),
+                    &staged,
+                    &options,
+                );
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = fs::remove_file(&staged);
+                    Err(romx_core::RomxError::Cancelled)
+                } else {
+                    result.and_then(|_| {
+                        let committed = commit_staged(&staged, &output_path, replace)
+                            .map_err(romx_core::RomxError::Invalid);
+                        if committed.is_err() {
+                            let _ = fs::remove_file(&staged);
+                        }
+                        committed.map(|_| (1, 1, 0))
+                    })
+                }
+            }
+        };
+        remove_single_temp(&source);
+        let output_path_for_ui = output_path.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(window) = weak.upgrade() {
                 window.set_conversion_running(false);
                 window.set_conflict_visible(false);
                 window.set_error_visible(false);
                 match final_result {
-                    Ok((report, output_path)) => {
-                        window.set_conversion_current(report.total_items as i32);
-                        window.set_conversion_imported(report.imported as i32);
-                        window.set_conversion_skipped(report.skipped as i32);
+                    Ok((total, imported, skipped)) => {
+                        window.set_conversion_current(total as i32);
+                        window.set_conversion_imported(imported as i32);
+                        window.set_conversion_skipped(skipped as i32);
                         set_status(
                             &window,
-                            format!("Conversion complete: {}", output_path.display()),
-                            format!("Conversion complete: {}", output_path.display()),
+                            format!("Conversion complete: {}", output_path_for_ui.display()),
+                            format!("Conversion complete: {}", output_path_for_ui.display()),
                         );
                     }
                     Err(romx_core::RomxError::Cancelled) => {
@@ -4368,6 +4769,155 @@ fn run_single_conversion(
     });
 }
 
+fn convert_pack_set(
+    window: &MainWindow,
+    workspace: &Rc<RefCell<LplWorkspace>>,
+    entries: Vec<PackEntry>,
+) {
+    let Some(entrypoint_entry) = entries.iter().find(|entry| entry.entrypoint) else {
+        set_status(
+            window,
+            "The payload set has no entrypoint",
+            "The payload set has no entrypoint",
+        );
+        return;
+    };
+    let entrypoint = entrypoint_entry.path.clone();
+    let format = match payload_format(&entrypoint) {
+        Ok(format) => format,
+        Err(error) => {
+            set_status(window, &error, &error);
+            return;
+        }
+    };
+    let cover_target = match resolution(window) {
+        Ok(target) => target,
+        Err(error) => {
+            set_status(window, &error, &error);
+            return;
+        }
+    };
+
+    let selected_platform = window.get_platform().trim().to_owned();
+    let platform_name = if supported_platform(&selected_platform) {
+        selected_platform
+    } else {
+        platform_for_path(&entrypoint).to_owned()
+    };
+    let platform_id = platform_id_for_name(&platform_name);
+    let launch_format_id = launch_format_id_for_extension(&format);
+
+    let mutable_save_path = window.get_mutable_save_path();
+    let save_source = if mutable_save_path.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(mutable_save_path.trim()))
+    };
+    let mutable_save_bundles = if let Some(save_source) = save_source {
+        match detect_save_bundles(&save_source, &platform_name, &format) {
+            Ok(bundles) => bundles,
+            Err(error) => {
+                set_status(
+                    window,
+                    format!("Failed to inspect save directory: {error}"),
+                    format!("存档目录检查失败：{error}"),
+                );
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let save_inventory =
+        mutable_save_bundles
+            .iter()
+            .fold((0usize, 0u64), |(count, bytes), bundle| {
+                let bundle_bytes = bundle
+                    .files
+                    .iter()
+                    .filter_map(|file| {
+                        fs::metadata(&file.source)
+                            .ok()
+                            .map(|metadata| metadata.len())
+                    })
+                    .sum::<u64>();
+                (count.saturating_add(1), bytes.saturating_add(bundle_bytes))
+            });
+    let recommended_capacity = recommended_mutable_capacity(&platform_name, &format);
+    let mutable_capacity = if window.get_reserve_mutable() {
+        recommended_mutable_capacity_for_save_bytes(
+            recommended_capacity,
+            save_inventory.0,
+            save_inventory.1,
+        )
+    } else {
+        0
+    };
+    let mutable_entry_capacity = if window.get_reserve_mutable() {
+        recommended_mutable_entry_capacity(save_inventory.0)
+    } else {
+        0
+    };
+    let metadata_path = match create_pack_set_metadata(window, workspace) {
+        Ok(path) => path,
+        Err(error) => {
+            set_status(window, &error, &error);
+            return;
+        }
+    };
+    let cover_path = current_cover_path(window, workspace).filter(|path| path.is_file());
+    let save_path = PathBuf::from(window.get_save_path().trim());
+    let original_name = path_file_name(&window.get_rom_path());
+    let output_name = if original_name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("romx"))
+    {
+        original_name
+    } else {
+        format!("{original_name}.romx")
+    };
+    let output_path = save_path.join(output_name);
+    let source = SingleConversionSource::PackSet {
+        entries,
+        entrypoint,
+        metadata_path,
+        cover_path,
+        platform_id,
+        launch_format_id,
+    };
+    if output_path.exists() {
+        workspace.borrow_mut().single_conflict = Some(PendingSingleConflict {
+            source,
+            cover_target,
+            mutable_capacity,
+            mutable_entry_capacity,
+            mutable_save_bundles,
+            mutable_region_source: None,
+            save_path,
+            output_path: output_path.clone(),
+            replace: false,
+        });
+        window.set_conflict_path(output_path.to_string_lossy().into_owned().into());
+        window.set_conflict_visible(true);
+        return;
+    }
+    run_single_conversion(
+        window,
+        workspace,
+        SingleConversion {
+            source,
+            cover_target,
+            mutable_capacity,
+            mutable_entry_capacity,
+            mutable_save_bundles,
+            mutable_region_source: None,
+            save_path,
+            output_path,
+            replace: false,
+        },
+    );
+}
+
 fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     let rom_path = window.get_rom_path();
     let save_path = window.get_save_path();
@@ -4377,6 +4927,11 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
             "choose_game_and_save_path_first",
             "Choose a game file and output folder first",
         );
+        return;
+    }
+    let payload_entries = workspace.borrow().payload_entries.clone();
+    if payload_entries.len() > 1 {
+        convert_pack_set(window, workspace, payload_entries);
         return;
     }
     let (format, source_path, temporary_payload, existing_mutable_capacity) =
@@ -4400,8 +4955,8 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     let recommended_capacity =
         recommended_mutable_capacity(window.get_platform().as_str(), &format);
     let mutable_save_path = window.get_mutable_save_path();
-    let mutable_region = if mutable_save_path.trim().is_empty() {
-        workspace.borrow().existing_mutable_region.clone()
+    let mutable_region_source = if mutable_save_path.trim().is_empty() {
+        workspace.borrow().existing_mutable_source.clone()
     } else {
         None
     };
@@ -4446,7 +5001,7 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     // Preserve an existing reservation even when the user is only editing
     // metadata/cover.  A checked reservation can grow it to the current
     // platform recommendation, but an edit must never silently shrink it.
-    let mutable_capacity = if mutable_region.is_some() {
+    let mutable_capacity = if mutable_region_source.is_some() {
         existing_mutable_capacity.unwrap_or(0)
     } else if window.get_reserve_mutable() {
         recommended_mutable_capacity_for_save_bytes(
@@ -4458,7 +5013,7 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     } else {
         existing_mutable_capacity.unwrap_or(0)
     };
-    let mutable_entry_capacity = if mutable_region.is_some() {
+    let mutable_entry_capacity = if mutable_region_source.is_some() {
         0
     } else if window.get_reserve_mutable() {
         recommended_mutable_entry_capacity(save_inventory.0)
@@ -4488,13 +5043,15 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
     let output_path = save_path.join(output_name);
     if output_path.exists() {
         workspace.borrow_mut().single_conflict = Some(PendingSingleConflict {
-            lpl_path: temporary_lpl,
-            payload_path: temporary_payload,
+            source: SingleConversionSource::Lpl {
+                lpl_path: temporary_lpl,
+                payload_path: temporary_payload,
+            },
             cover_target,
             mutable_capacity,
             mutable_entry_capacity,
             mutable_save_bundles,
-            mutable_region: mutable_region.clone(),
+            mutable_region_source: mutable_region_source.clone(),
             save_path,
             output_path: output_path.clone(),
             replace: false,
@@ -4507,13 +5064,15 @@ fn convert_single(window: &MainWindow, workspace: &Rc<RefCell<LplWorkspace>>) {
         window,
         workspace,
         SingleConversion {
-            lpl_path: temporary_lpl,
-            payload_path: temporary_payload,
+            source: SingleConversionSource::Lpl {
+                lpl_path: temporary_lpl,
+                payload_path: temporary_payload,
+            },
             cover_target,
             mutable_capacity,
             mutable_entry_capacity,
             mutable_save_bundles,
-            mutable_region,
+            mutable_region_source,
             save_path,
             output_path,
             replace: false,
@@ -4539,7 +5098,7 @@ fn handle_conflict_response(
                 run_single_conversion(window, workspace, pending);
             }
             PromptResponse::Skip | PromptResponse::SkipAll | PromptResponse::Stop => {
-                remove_single_temp(&pending.lpl_path, pending.payload_path.as_deref());
+                remove_single_temp(&pending.source);
                 set_status(window, "output_skipped", "Output skipped");
             }
             _ => {}
@@ -4678,6 +5237,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window.on_embedded_cover_changed(move |index| {
             if let Some(window) = weak.upgrade() {
                 select_embedded_cover(&window, &workspace, index);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let workspace = lpl_workspace.clone();
+        window.on_payload_entrypoint_changed(move |index| {
+            if let Some(window) = weak.upgrade() {
+                select_payload_entrypoint(&window, &workspace, index);
             }
         });
     }

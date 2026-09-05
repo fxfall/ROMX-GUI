@@ -1,5 +1,5 @@
 use crate::{
-    classify_gb_payload, extract_entry_to_path, format_id_for_extension, identity_from_path,
+    classify_gb_payload_path, extract_entry_to_path, format_id_for_extension, identity_from_path,
     launch_format_id_for_extension, normalize_cover_path, normalize_crc32,
     pack_path_with_metadata_options, platform_id_for_name, read_metadata_cover_path,
     required_metadata, MutableSaveBundle, PackOptions, RomxError, RomxIdentity, SPEC_VERSION,
@@ -119,8 +119,17 @@ pub struct ImportLplOptions {
     pub cover_set: String,
     pub skip_missing: bool,
     /// Write generated ROMX and manifest files with a `.tmp` suffix so a
-    /// caller can atomically commit each output after validation.
+    /// caller can atomically commit each output after libromx finishes its
+    /// streaming write and component checks.
     pub temporary_output: bool,
+    /// Include the derived ROMX identity in the import manifest.  Frontends
+    /// that discard the manifest can disable this to avoid a second full read
+    /// of each newly-written payload.
+    pub include_identity: bool,
+    /// Generate the import manifest.  GUI callers that only need the ROMX
+    /// files can disable this to avoid creating a transient manifest in the
+    /// output directory and an extra JSON read/write at the end of a batch.
+    pub write_manifest: bool,
     /// Optional database lookup CRC32 to store in every imported metadata
     /// object. Without it, each ROM's original bytes are hashed.
     pub crc32_override: Option<String>,
@@ -138,6 +147,9 @@ pub struct ImportLplOptions {
     /// Preserve an existing complete mutable region during a single-item
     /// frontend edit. New SAVE bundles are used when this is absent.
     pub mutable_region: Option<Vec<u8>>,
+    /// Existing ROMX source whose mutable region is copied by libromx during
+    /// each generated output. This avoids buffering the complete region.
+    pub mutable_region_source: Option<PathBuf>,
 }
 
 impl Default for ImportLplOptions {
@@ -150,12 +162,15 @@ impl Default for ImportLplOptions {
             cover_set: "Named_Snaps".into(),
             skip_missing: false,
             temporary_output: false,
+            include_identity: true,
+            write_manifest: true,
             crc32_override: None,
             cover_target: None,
             mutable_capacity: 0,
             mutable_entry_capacity: 0,
             mutable_save_bundles: Vec::new(),
             mutable_region: None,
+            mutable_region_source: None,
         }
     }
 }
@@ -575,6 +590,7 @@ fn platform_for(payload_format: &str, playlist_name: &str) -> &'static str {
         "wbfs" | "rvz" | "wia" | "wad" => "wii",
         "prx" => "psp",
         "elf" => "arcade",
+        "zip" => "arcade",
         "msu" | "pcm" => "snes",
         _ => "gb",
     }
@@ -706,16 +722,7 @@ pub fn plan_lpl_import(
             )));
         }
         if matches!(payload_format.as_str(), "gb" | "gbc") {
-            let rom = match fs::read(&rom_path) {
-                Ok(rom) => rom,
-                Err(error) if options.skip_missing => {
-                    skipped += 1;
-                    let _ = error;
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            payload_format = match classify_gb_payload(&rom, Some(&payload_format)) {
+            payload_format = match classify_gb_payload_path(&rom_path, Some(&payload_format)) {
                 Ok(format) => format.to_owned(),
                 Err(error) if options.skip_missing => {
                     skipped += 1;
@@ -903,16 +910,28 @@ where
                 mutable_entry_capacity: options.mutable_entry_capacity,
                 mutable_save_bundles: options.mutable_save_bundles.clone(),
                 mutable_region: options.mutable_region.clone(),
+                mutable_region_source: options.mutable_region_source.clone(),
+                output_is_temporary: options.temporary_output,
+                post_write_validation: !options.temporary_output,
                 ..Default::default()
             };
-            pack_path_with_metadata_options(
+            let pack_result = pack_path_with_metadata_options(
                 &item.rom_path,
                 Some(&metadata),
                 cover.as_deref(),
                 &output_path,
                 &pack_options,
-            )?;
-            let identity = identity_from_path(&output_path).ok();
+            );
+            if let Err(error) = pack_result {
+                if options.temporary_output {
+                    let _ = fs::remove_file(&output_path);
+                }
+                return Err(error);
+            }
+            let identity = options
+                .include_identity
+                .then(|| identity_from_path(&output_path).ok())
+                .flatten();
             let committed = on_output(&output_path)?;
             if let Some(committed_path) = committed.as_deref() {
                 manifest_items.push(manifest_lplx_item(
@@ -944,17 +963,19 @@ where
     } else {
         "manifest.json"
     });
-    let lpl_document = read_lpl_document(lpl_path)?;
-    let settings = official_lpl_settings(&lpl_document);
-    let manifest = json!({
-        "source_lpl": plan.source_lpl.to_string_lossy(),
-        "playlist": plan.playlist,
-        "items": plan.total_items,
-        "imported": output_files.len(),
-        "lpl_settings": settings,
-        "lplx_items": manifest_items,
-    });
-    write_json(&manifest_path, &manifest)?;
+    if options.write_manifest {
+        let lpl_document = read_lpl_document(lpl_path)?;
+        let settings = official_lpl_settings(&lpl_document);
+        let manifest = json!({
+            "source_lpl": plan.source_lpl.to_string_lossy(),
+            "playlist": plan.playlist,
+            "items": plan.total_items,
+            "imported": output_files.len(),
+            "lpl_settings": settings,
+            "lplx_items": manifest_items,
+        });
+        write_json(&manifest_path, &manifest)?;
+    }
     Ok(ImportLplReport {
         total_items: plan.total_items,
         imported: output_files.len(),

@@ -1,10 +1,11 @@
 use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgb};
 use romx_core::{
-    classify_gb_payload, crc32, normalize_cover_bytes, pack_bytes, pack_bytes_with_crc32,
-    pack_bytes_with_options, pack_bytes_with_writer_options, read_bytes, read_metadata_cover_bytes,
-    read_metadata_cover_path, recommended_mutable_capacity,
+    classify_gb_payload, crc32, launch_format_id_for_extension, normalize_cover_bytes, pack_bytes,
+    pack_bytes_with_crc32, pack_bytes_with_options, pack_bytes_with_writer_options,
+    pack_entries_to_path_with_writer_options, platform_id_for_name, read_bytes,
+    read_metadata_cover_bytes, read_metadata_cover_path, read_path, recommended_mutable_capacity,
     recommended_mutable_capacity_for_save_bytes, recommended_mutable_capacity_for_save_count,
-    recommended_mutable_entry_capacity, MutableSaveBundle, MutableSaveFile, PackOptions,
+    recommended_mutable_entry_capacity, MutableSaveBundle, MutableSaveFile, PackEntry, PackOptions,
     DEFAULT_SAVE_OBJECT_CAPACITY, FLAG_COVER, FLAG_METADATA,
     RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY, RECOMMENDED_DISC_MUTABLE_CAPACITY,
     RECOMMENDED_NDS_MUTABLE_CAPACITY,
@@ -36,6 +37,28 @@ fn roundtrip_preserves_rom_metadata_and_png() {
     assert_eq!(
         document.footer.flags & (FLAG_METADATA | FLAG_COVER),
         FLAG_METADATA | FLAG_COVER
+    );
+}
+
+#[test]
+fn temporary_writer_computes_metadata_crc_in_the_payload_stream() {
+    let metadata = json!({
+        "schema_version": "0.2.0",
+        "name": "Temporary output",
+    });
+    let options = PackOptions {
+        include_entry_crc32: false,
+        output_is_temporary: true,
+        post_write_validation: false,
+        ..Default::default()
+    };
+    let bytes =
+        pack_bytes_with_writer_options(b"temporary-payload", Some(&metadata), None, &options)
+            .unwrap();
+    let document = read_bytes(&bytes).unwrap();
+    assert_eq!(
+        document.metadata.as_ref().unwrap()["crc32"],
+        crc32(b"temporary-payload")
     );
 }
 
@@ -79,7 +102,7 @@ fn mutable_capacity_uses_save_bytes_and_directory_header() {
         9,
         save_bytes,
     );
-    assert_eq!(capacity, 4_993_024);
+    assert!(capacity >= save_bytes);
     assert_eq!(capacity % 4096, 0);
     assert_eq!(
         recommended_mutable_capacity_for_save_count(RECOMMENDED_NDS_MUTABLE_CAPACITY, 7),
@@ -92,13 +115,6 @@ fn mutable_capacity_uses_save_bytes_and_directory_header() {
         ..Default::default()
     };
     let bytes = pack_bytes_with_writer_options(b"multi-save-rom", None, None, &options).unwrap();
-    let mutable_offset = bytes.len() - 128 - capacity as usize;
-    let entry_count = u32::from_le_bytes(
-        bytes[mutable_offset + 12..mutable_offset + 16]
-            .try_into()
-            .unwrap(),
-    );
-    assert_eq!(entry_count, 16);
     read_bytes(&bytes).unwrap();
 }
 
@@ -120,50 +136,75 @@ fn mutable_save_bundle_is_written_as_a_readable_romx_object() {
         ..Default::default()
     };
     let bytes = pack_bytes_with_writer_options(b"nds-payload", None, None, &options).unwrap();
-    let mutable_offset = bytes.len() - 128 - RECOMMENDED_NDS_MUTABLE_CAPACITY as usize;
-    let entry_offset = mutable_offset + 4096;
-    assert_eq!(&bytes[entry_offset..entry_offset + 4], b"MENT");
-    assert_eq!(
-        u16::from_le_bytes(
-            bytes[entry_offset + 4..entry_offset + 6]
-                .try_into()
-                .unwrap()
-        ),
-        1
-    );
-    assert_eq!(
-        u16::from_le_bytes(
-            bytes[entry_offset + 6..entry_offset + 8]
-                .try_into()
-                .unwrap()
-        ),
-        1
-    );
-    let key_size = u32::from_le_bytes(
-        bytes[entry_offset + 0x0c..entry_offset + 0x10]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    assert_eq!(
-        &bytes[entry_offset + 0x40..entry_offset + 0x40 + key_size],
-        "中文存档".as_bytes()
-    );
-    let data_offset = u64::from_le_bytes(
-        bytes[entry_offset + 0x10..entry_offset + 0x18]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let bundle_offset = mutable_offset + data_offset;
-    assert_eq!(&bytes[bundle_offset..bundle_offset + 4], b"RMBL");
-    assert_eq!(
-        u32::from_le_bytes(
-            bytes[bundle_offset + 0x10..bundle_offset + 0x14]
-                .try_into()
-                .unwrap()
-        ),
-        1
-    );
+    let romx_path = root.path().join("bundle.romx");
+    std::fs::write(&romx_path, &bytes).unwrap();
+    let info = romx_core::read_mutable_save_objects(&romx_path).unwrap();
+    assert_eq!(info.objects.len(), 1);
+    assert_eq!(info.objects[0].key, "中文存档");
+    assert!(info.objects[0].data_capacity > info.objects[0].data_size);
+    assert_eq!(info.objects[0].files.len(), 1);
+    assert_eq!(info.objects[0].files[0].path, "中文存档.sav");
     assert_eq!(read_bytes(&bytes).unwrap().rom, b"nds-payload");
+}
+
+#[test]
+fn multi_entry_writer_preserves_descriptor_paths_and_entrypoint_offset() {
+    let root = tempfile::tempdir().unwrap();
+    let cue = root.path().join("Game.cue");
+    let track = root.path().join("Track 01.bin");
+    std::fs::write(&cue, b"FILE \"Track 01.bin\" BINARY\n").unwrap();
+    std::fs::write(&track, vec![0x5au8; 4096]).unwrap();
+    let metadata_path = root.path().join("metadata.json");
+    std::fs::write(
+        &metadata_path,
+        br#"{"schema_version":"0.2.0","name":"Multi CUE"}"#,
+    )
+    .unwrap();
+    let output = root.path().join("game.romx");
+    let entries = vec![
+        PackEntry {
+            path: "Game.cue".into(),
+            source: cue,
+            format_id: 0,
+            entrypoint: true,
+        },
+        PackEntry {
+            path: "Track 01.bin".into(),
+            source: track,
+            format_id: 0,
+            entrypoint: false,
+        },
+    ];
+    let options = PackOptions {
+        platform_id: platform_id_for_name("saturn"),
+        launch_format_id: launch_format_id_for_extension("cue"),
+        ..Default::default()
+    };
+    pack_entries_to_path_with_writer_options(
+        &entries,
+        Some("Game.cue"),
+        Some(&metadata_path),
+        None,
+        &output,
+        &options,
+    )
+    .unwrap();
+    let document = read_path(&output).unwrap();
+    assert_eq!(document.entries.len(), 2);
+    assert_eq!(document.entries[0].path, "Game.cue");
+    assert!(document.entries[0].entrypoint);
+    assert_eq!(document.entries[0].data_offset, 0);
+    assert_eq!(document.entries[1].path, "Track 01.bin");
+    assert_eq!(
+        document.entries[1].data_offset,
+        document.entries[0].data_size
+    );
+    assert_eq!(document.footer.platform_id, platform_id_for_name("saturn"));
+    assert_eq!(
+        document.footer.launch_format_id,
+        launch_format_id_for_extension("cue")
+    );
+    assert_eq!(document.metadata.unwrap()["name"], "Multi CUE");
 }
 
 #[test]

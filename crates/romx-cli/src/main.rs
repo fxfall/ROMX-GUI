@@ -1,7 +1,9 @@
 use clap::{Args, Parser, Subcommand};
 use romx_core::{
-    export_lpl, extract_to_dir, import_lpl, inspect_payload_profile, pack_to_path_with_options,
-    read_metadata_cover_path, validate_path, ExportLplOptions, ImportLplOptions,
+    export_lpl, extract_to_dir, import_lpl, inspect_payload_profile,
+    launch_format_id_for_extension, pack_entries_to_path_with_writer_options,
+    pack_to_path_with_options, platform_id_for_name, read_metadata_cover_path, validate_path,
+    ExportLplOptions, ImportLplOptions, PackEntry, PackOptions,
 };
 use serde_json::json;
 use std::error::Error;
@@ -23,6 +25,8 @@ struct Cli {
 enum Command {
     /// Create a ROMX container from a ROM, metadata JSON, and optional cover image.
     Pack(PackArgs),
+    /// Create a ROMX container from a descriptor and one or more sidecar files.
+    PackSet(PackSetArgs),
     /// Print validated ROMX footer and metadata information as JSON.
     Inspect { romx: PathBuf },
     /// Validate the ROMX structure and report component statuses as JSON.
@@ -57,6 +61,50 @@ struct PackArgs {
     /// Override the metadata CRC32 lookup key (8 hexadecimal characters).
     #[arg(long)]
     crc32: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct PackSetArgs {
+    /// Virtual path and source file, repeated as VPATH=SOURCE.
+    #[arg(long = "entry", required = true)]
+    entries: Vec<String>,
+    /// Virtual path of the launch descriptor. Required when more than one
+    /// entry is supplied.
+    #[arg(long)]
+    entrypoint: Option<String>,
+    /// ROMX platform registry name (for example saturn, playstation, gamecube).
+    #[arg(long)]
+    platform: String,
+    /// Launch descriptor registry name (raw, cue, gdi, m3u, ccd, mds, toc).
+    #[arg(long)]
+    launch_format: String,
+    /// ROMX metadata JSON document.
+    #[arg(long)]
+    metadata: Option<PathBuf>,
+    /// Output ROMX path.
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Optional PNG cover; common image formats are normalized by the CLI adapter.
+    #[arg(long)]
+    cover: Option<PathBuf>,
+    /// Normalize the cover to an exact WIDTHxHEIGHT PNG.
+    #[arg(long)]
+    cover_size: Option<String>,
+    /// Override the metadata CRC32 lookup key (8 hexadecimal characters).
+    #[arg(long)]
+    crc32: Option<String>,
+    /// Include immutable body SHA-256 in the footer.
+    #[arg(long)]
+    body_sha256: bool,
+    /// Include CRC32 values for every RIDX entry.
+    #[arg(long, default_value_t = true)]
+    entry_crc32: bool,
+    /// Reserve a mutable region of this many bytes.
+    #[arg(long, default_value_t = 0)]
+    mutable_capacity: u64,
+    /// Reserve this many mutable directory entries.
+    #[arg(long, default_value_t = 0)]
+    mutable_entry_capacity: u32,
 }
 
 #[derive(Debug, Args)]
@@ -156,6 +204,33 @@ fn parse_cover_size(value: Option<&str>) -> Result<Option<(u32, u32)>, Box<dyn E
     Ok(Some((width, height)))
 }
 
+fn parse_entry_assignment(value: &str) -> Result<PackEntry, Box<dyn Error>> {
+    let (path, source) = value
+        .split_once('=')
+        .ok_or("--entry must use VPATH=SOURCE")?;
+    if path.is_empty() || source.is_empty() {
+        return Err("--entry must use non-empty VPATH=SOURCE".into());
+    }
+    Ok(PackEntry {
+        path: path.to_owned(),
+        source: PathBuf::from(source),
+        format_id: 0,
+        entrypoint: false,
+    })
+}
+
+fn parse_launch_format(value: &str) -> Result<u16, Box<dyn Error>> {
+    let normalized = value.trim_start_matches('.').to_ascii_lowercase();
+    let id = match normalized.as_str() {
+        "raw" | "single" | "raw_single_file" => 1,
+        extension => launch_format_id_for_extension(extension),
+    };
+    if id == 1 && !matches!(normalized.as_str(), "raw" | "single" | "raw_single_file") {
+        return Err(format!("unsupported launch format: {value}").into());
+    }
+    Ok(id)
+}
+
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Pack(args) => {
@@ -169,6 +244,54 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 cover_size,
             )?;
             println!("packed ROMX: {}", args.output.display());
+        }
+        Command::PackSet(args) => {
+            let mut entries = args
+                .entries
+                .iter()
+                .map(|value| parse_entry_assignment(value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let entrypoint = args
+                .entrypoint
+                .or_else(|| (entries.len() == 1).then(|| entries[0].path.clone()));
+            let Some(entrypoint) = entrypoint else {
+                return Err("--entrypoint is required when packing multiple entries".into());
+            };
+            for entry in &mut entries {
+                entry.entrypoint = entry.path == entrypoint;
+            }
+            if !entries.iter().any(|entry| entry.entrypoint) {
+                return Err(
+                    format!("entrypoint is not present in --entry list: {entrypoint}").into(),
+                );
+            }
+            let platform_id = platform_id_for_name(&args.platform);
+            if platform_id == 0 {
+                return Err(format!("unknown ROMX platform: {}", args.platform).into());
+            }
+            let launch_format_id = parse_launch_format(&args.launch_format)?;
+            let cover_target = parse_cover_size(args.cover_size.as_deref())?;
+            let options = PackOptions {
+                body_sha256: args.body_sha256,
+                crc32_override: args.crc32,
+                cover_target,
+                platform_id,
+                launch_format_id,
+                entry_format_id: 0,
+                include_entry_crc32: args.entry_crc32,
+                mutable_capacity: args.mutable_capacity,
+                mutable_entry_capacity: args.mutable_entry_capacity,
+                ..Default::default()
+            };
+            pack_entries_to_path_with_writer_options(
+                &entries,
+                Some(&entrypoint),
+                args.metadata.as_deref(),
+                args.cover.as_deref(),
+                &args.output,
+                &options,
+            )?;
+            println!("packed ROMX set: {}", args.output.display());
         }
         Command::Inspect { romx } => {
             let preview = read_metadata_cover_path(&romx)?;
@@ -189,6 +312,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 "body_sha256": hex(&footer.body_sha256),
                 "metadata": preview.metadata,
                 "has_cover": preview.cover.is_some(),
+                "entries": preview.entries.iter().map(|entry| json!({
+                    "path": entry.path,
+                    "format_id": entry.format_id,
+                    "data_offset": entry.data_offset,
+                    "data_size": entry.data_size,
+                    "crc32": entry.crc32,
+                    "entrypoint": entry.entrypoint,
+                })).collect::<Vec<_>>(),
             });
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
@@ -241,11 +372,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 skip_missing: args.skip_missing,
                 crc32_override: args.crc32,
                 temporary_output: false,
+                include_identity: true,
+                write_manifest: true,
                 cover_target: parse_cover_size(args.cover_size.as_deref())?,
                 mutable_capacity: 0,
                 mutable_entry_capacity: 0,
                 mutable_save_bundles: Vec::new(),
                 mutable_region: None,
+                mutable_region_source: None,
             };
             let report = import_lpl(&args.lpl, &args.output, &options)?;
             println!(

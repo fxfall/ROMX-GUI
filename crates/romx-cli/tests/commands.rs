@@ -148,3 +148,46 @@ fn import_and_export_lpl_commands_work() {
         .is_file());
     assert!(exported.join("playlists/00-GB.lpl").is_file());
 }
+
+#[test]
+fn pack_set_command_preserves_multiple_entries() {
+    let root = tempdir().unwrap();
+    let cue = root.path().join("游戏.cue");
+    let track = root.path().join("轨道.bin");
+    let packed = root.path().join("游戏.cue.romx");
+    fs::write(&cue, b"FILE \"track.bin\" BINARY\n  TRACK 01 MODE1/2352\n").unwrap();
+    fs::write(&track, b"disc-track-bytes").unwrap();
+
+    let assignment = format!("disc.cue={}", cue.display());
+    let sidecar = format!("track.bin={}", track.display());
+    let output = Command::new(env!("CARGO_BIN_EXE_romx"))
+        .args([
+            "pack-set",
+            "--entry",
+            &assignment,
+            "--entry",
+            &sidecar,
+            "--entrypoint",
+            "disc.cue",
+            "--platform",
+            "playstation",
+            "--launch-format",
+            "cue",
+            "--output",
+        ])
+        .arg(&packed)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let inspect = romx(&[&packed], &["inspect"]);
+    assert!(inspect.status.success());
+    let info: Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(info["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(info["entries"][0]["path"], Value::String("disc.cue".into()));
+    assert_eq!(info["entries"][0]["entrypoint"], true);
+}

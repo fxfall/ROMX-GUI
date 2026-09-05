@@ -1,0 +1,3 @@
+[submodule "vendor/libromx"]
+	path = vendor/libromx
+	url = https://github.com/fxfall/libromx.git

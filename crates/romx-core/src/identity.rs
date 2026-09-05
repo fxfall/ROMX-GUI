@@ -1,6 +1,7 @@
 //! Stable, derived identities for frontend indexing.
 
-use crate::{crc32_u32, payload_sha256, read_path, RidxEntry, RomxDocument, RomxError};
+use crate::{crc32_u32, payload_sha256, Reader, RidxEntry, RomxDocument, RomxError};
+use libromx_sys as sys;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +66,41 @@ pub fn identity_from_document(document: &RomxDocument) -> Result<RomxIdentity, R
 }
 
 pub fn identity_from_path(path: &Path) -> Result<RomxIdentity, RomxError> {
-    identity_from_document(&read_path(path)?)
+    let reader = Reader::open(path)?;
+    let info = reader.info()?;
+    let entry = reader.entrypoint()?;
+    let report = reader.validate(sys::ROMX_VALIDATE_PAYLOAD_HASHES)?;
+    let crc = if entry.flags & sys::ROMX_RIDX_HAS_CRC32 != 0 {
+        entry.crc32
+    } else {
+        report.computed_payload_crc32
+    };
+    let crc = format!("{crc:08x}");
+    let sha = report.computed_payload_sha256;
+    let sha_hex = hex(&sha);
+    let identity_material = format!(
+        "romx-id-v1\0{}\0{}\0{}\0{}",
+        info.platform_id, entry.format_id, crc, sha_hex
+    );
+    let romx_id = hex(&payload_sha256(identity_material.as_bytes()));
+    let entry_material = format!(
+        "romx-entry-v1\0{}\0{}\0{}\0{}\0{}",
+        info.platform_id,
+        entry.format_id,
+        crate::error::c_field(&entry.path),
+        entry.data_offset,
+        entry.data_size
+    );
+    let entry_id = hex(&payload_sha256(entry_material.as_bytes()));
+    Ok(RomxIdentity {
+        romx_id,
+        entry_id,
+        platform_id: info.platform_id,
+        format_id: entry.format_id,
+        payload_crc32: crc,
+        payload_sha256: sha_hex,
+        entry_path: crate::error::c_field(&entry.path),
+    })
 }
 
 #[cfg(test)]

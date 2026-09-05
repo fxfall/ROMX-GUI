@@ -4,6 +4,7 @@
 //! probe never changes the bytes that are packed; it only supplies defaults
 //! for the GUI/CLI when a source ROM contains its own title, serial, or icon.
 
+use crate::error::{c_field, c_path, check, copy_c_buffer};
 use crate::{format_id_for_extension, validate_png_bytes, RomxError, DEFAULT_MAX_COVER_SIZE};
 use encoding_rs::SHIFT_JIS;
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb, Rgba};
@@ -11,11 +12,16 @@ use serde_json::{Map, Value};
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+
+use libromx_sys as sys;
 
 const MAX_SFO_SIZE: usize = 1024 * 1024;
 const MAX_ISO_DIRECTORY_SIZE: usize = 4 * 1024 * 1024;
 const MEDIA_UNIT_SIZE: u64 = 0x200;
 const MAX_EXEFS_FILE_SIZE: usize = 16 * 1024 * 1024;
+const MAX_3DS_SMDH_SCAN_SIZE: u64 = 32 * 1024 * 1024;
+const SMDH_SCAN_CHUNK_SIZE: usize = 1024 * 1024;
 const SMDH_TITLE_SIZE: usize = 0x200;
 const SMDH_SIZE: usize = 0x36c0;
 const GAMECUBE_FST_HEADER_OFFSET: usize = 0x424;
@@ -51,6 +57,93 @@ pub struct PayloadProfile {
     pub metadata: Map<String, Value>,
     pub cover: Option<Vec<u8>>,
     pub covers: Vec<EmbeddedCover>,
+}
+
+/// A bounded libromx payload probe.  The handle owns any metadata/cover
+/// buffers allocated by C and is released deterministically.  The wrapper is
+/// intentionally !Send/!Sync: probe handles may contain implementation-owned
+/// cursors and are cheap to recreate per worker.
+pub struct Probe {
+    raw: NonNull<sys::romx_probe_t>,
+    path: PathBuf,
+}
+
+fn init<T>() -> T {
+    // Every probe output structure is zero-initializable and carries a
+    // leading struct_size field; callers set that field before invoking C.
+    unsafe { std::mem::zeroed() }
+}
+
+fn set_size<T>(value: &mut T) {
+    unsafe {
+        (value as *mut T as *mut u32).write(
+            u32::try_from(std::mem::size_of::<T>())
+                .expect("libromx ABI structure size must fit in the C u32 field"),
+        )
+    };
+}
+
+impl Probe {
+    pub fn open(path: &Path, format_hint: u16) -> Result<Self, RomxError> {
+        if format_hint == sys::ROMX_FORMAT_UNKNOWN {
+            return Err(RomxError::Invalid(
+                "payload probe format is unspecified".into(),
+            ));
+        }
+        let path_c = c_path(path)?;
+        let mut raw = std::ptr::null_mut();
+        let mut error: sys::romx_error_t = init();
+        let code = unsafe {
+            sys::romx_probe_open_path(path_c.as_ptr(), format_hint, &mut raw, &mut error)
+        };
+        check(code, &error)?;
+        Ok(Self {
+            raw: NonNull::new(raw)
+                .ok_or_else(|| RomxError::Invalid("libromx returned a null probe".into()))?,
+            path: path.to_owned(),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn info(&self) -> Result<sys::romx_probe_info_t, RomxError> {
+        let mut info: sys::romx_probe_info_t = init();
+        set_size(&mut info);
+        let mut error: sys::romx_error_t = init();
+        let code = unsafe { sys::romx_probe_get_info(self.raw.as_ptr(), &mut info, &mut error) };
+        check(code, &error)?;
+        Ok(info)
+    }
+
+    pub fn metadata_json(&self) -> Result<Option<Vec<u8>>, RomxError> {
+        match copy_c_buffer(|buffer, capacity, required, error| unsafe {
+            sys::romx_probe_copy_metadata_json(self.raw.as_ptr(), buffer, capacity, required, error)
+        }) {
+            Ok(value) if value.is_empty() => Ok(None),
+            Ok(value) => Ok(Some(value)),
+            Err(RomxError::Libromx { code, .. }) if code == sys::ROMX_E_UNSUPPORTED => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn cover_png(&self) -> Result<Option<Vec<u8>>, RomxError> {
+        match copy_c_buffer(|buffer, capacity, required, error| unsafe {
+            sys::romx_probe_copy_cover_png(self.raw.as_ptr(), buffer, capacity, required, error)
+        }) {
+            Ok(value) if value.is_empty() => Ok(None),
+            Ok(value) => Ok(Some(value)),
+            Err(RomxError::Libromx { code, .. }) if code == sys::ROMX_E_UNSUPPORTED => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        unsafe { sys::romx_probe_close(self.raw.as_ptr()) };
+    }
 }
 
 pub fn infer_payload_format(path: &Path) -> Result<String, RomxError> {
@@ -93,6 +186,7 @@ fn platform_for_format(format: &str) -> &'static str {
         "wbfs" | "rvz" | "wia" | "wad" => "wii",
         "zso" => "ps2",
         "elf" | "prx" => "psp",
+        "zip" => "arcade",
         _ => "gba",
     }
 }
@@ -366,30 +460,101 @@ fn apply_smdh(info: &mut EmbeddedInfo, smdh: &[u8]) {
 
 fn find_3ds_ncch_base(path: &Path) -> Option<u64> {
     let file_size = fs::metadata(path).ok()?.len();
-    let magic = read_at(path, 0x100, 4).ok()?;
-    if magic == b"NCCH" {
-        return Some(0);
-    }
-    if magic != b"NCSD" {
-        return None;
-    }
-    let partitions = read_exact_at(path, 0x120, 8 * 8).ok()?;
-    for index in 0..8 {
-        let offset_units = u64::from(le_u32(&partitions, index * 8)?);
-        let size_units = u64::from(le_u32(&partitions, index * 8 + 4)?);
-        if offset_units == 0 || size_units == 0 {
+    // Standard NCSD/NCCH images place the magic at 0x100.  A number of tools
+    // also emit a trimmed image with that 0x100-byte prefix removed, so accept
+    // the equivalent header at offset zero as well.  The returned value is the
+    // partition base; `embedded_3ds` checks whether the NCCH header is at
+    // base+0x100 or directly at base.
+    for header_offset in [0x100u64, 0] {
+        let magic = read_at(path, header_offset, 4).ok()?;
+        if magic == b"NCCH" {
+            return Some(0);
+        }
+        if magic != b"NCSD" {
             continue;
         }
-        let offset = offset_units.checked_mul(MEDIA_UNIT_SIZE)?;
-        let size = size_units.checked_mul(MEDIA_UNIT_SIZE)?;
-        if offset.checked_add(size)? > file_size || offset.checked_add(0x104)? > file_size {
+        let Ok(partitions) = read_exact_at(path, header_offset + 0x20, 8 * 8) else {
+            // A malformed standard header must not prevent trying the
+            // alternate trimmed-header layout below.
             continue;
-        }
-        if read_at(path, offset + 0x100, 4).ok()?.as_slice() == b"NCCH" {
-            return Some(offset);
+        };
+        for index in 0..8 {
+            let offset_units = u64::from(le_u32(&partitions, index * 8)?);
+            let size_units = u64::from(le_u32(&partitions, index * 8 + 4)?);
+            if offset_units == 0 || size_units == 0 {
+                continue;
+            }
+            let offset = offset_units.checked_mul(MEDIA_UNIT_SIZE)?;
+            let size = size_units.checked_mul(MEDIA_UNIT_SIZE)?;
+            if size == 0 {
+                continue;
+            }
+            // When only the outer 0x100-byte prefix was removed, partition
+            // offsets in the NCSD table still refer to the untrimmed image.
+            // Try both coordinate systems without scanning the whole payload.
+            for candidate in [offset, offset.saturating_sub(0x100)] {
+                if candidate.checked_add(size)? > file_size {
+                    continue;
+                }
+                let at_header = read_at(path, candidate + 0x100, 4).ok();
+                let at_base = read_at(path, candidate, 4).ok();
+                if at_header.as_deref() == Some(b"NCCH") || at_base.as_deref() == Some(b"NCCH") {
+                    return Some(candidate);
+                }
+            }
         }
     }
     None
+}
+
+/// Recover an SMDH when a producer has damaged or omitted the ExeFS name
+/// table.  The icon is normally near the start of a 3DS partition, so a
+/// bounded sequential scan is enough to handle those files without reading a
+/// multi-gigabyte image into memory or changing its payload bytes.
+fn scan_for_smdh(path: &Path, info: &mut EmbeddedInfo) {
+    let Ok(file_size) = fs::metadata(path).map(|metadata| metadata.len()) else {
+        return;
+    };
+    let scan_limit = file_size.min(MAX_3DS_SMDH_SCAN_SIZE);
+    let Ok(mut file) = fs::File::open(path) else {
+        return;
+    };
+    let mut chunk = vec![0u8; SMDH_SCAN_CHUNK_SIZE];
+    let mut carry = Vec::new();
+    let mut total_read = 0u64;
+    while total_read < scan_limit {
+        let remaining = scan_limit.saturating_sub(total_read);
+        let read_size = remaining.min(chunk.len() as u64) as usize;
+        let Ok(count) = file.read(&mut chunk[..read_size]) else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        let scan_start = total_read.saturating_sub(carry.len() as u64);
+        let mut scan = Vec::with_capacity(carry.len() + count);
+        scan.extend_from_slice(&carry);
+        scan.extend_from_slice(&chunk[..count]);
+        for (offset, window) in scan.windows(4).enumerate() {
+            if window != b"SMDH" {
+                continue;
+            }
+            let absolute = scan_start.saturating_add(offset as u64);
+            if absolute.saturating_add(SMDH_SIZE as u64) > file_size {
+                continue;
+            }
+            let Ok(smdh) = read_exact_at(path, absolute, SMDH_SIZE) else {
+                continue;
+            };
+            apply_smdh(info, &smdh);
+            if !info.covers.is_empty() || info.metadata.contains_key("name") {
+                return;
+            }
+        }
+        carry.clear();
+        carry.extend_from_slice(&scan[scan.len().saturating_sub(3)..]);
+        total_read = total_read.saturating_add(count as u64);
+    }
 }
 
 fn embedded_3ds(path: &Path) -> EmbeddedInfo {
@@ -398,33 +563,49 @@ fn embedded_3ds(path: &Path) -> EmbeddedInfo {
         ..Default::default()
     };
     let Some(base) = find_3ds_ncch_base(path) else {
+        scan_for_smdh(path, &mut info);
         return info;
     };
-    let Ok(header) = read_exact_at(path, base + 0x100, 0x100) else {
+    let header_offset = if read_at(path, base + 0x100, 4).ok().as_deref() == Some(b"NCCH") {
+        base + 0x100
+    } else if read_at(path, base, 4).ok().as_deref() == Some(b"NCCH") {
+        base
+    } else {
+        scan_for_smdh(path, &mut info);
+        return info;
+    };
+    let Ok(header) = read_exact_at(path, header_offset, 0x100) else {
+        scan_for_smdh(path, &mut info);
         return info;
     };
     if header.get(..4) != Some(b"NCCH") {
+        scan_for_smdh(path, &mut info);
         return info;
     }
-    if let Ok(product_code) = read_at(path, base + 0x150, 16) {
+    if let Ok(product_code) = read_at(path, header_offset + 0x50, 16) {
         insert_text(&mut info.metadata, "serial", &product_code);
     }
     let Some(exefs_offset) = le_u32(&header, 0xa0) else {
+        scan_for_smdh(path, &mut info);
         return info;
     };
     let Some(exefs_size) = le_u32(&header, 0xa4) else {
+        scan_for_smdh(path, &mut info);
         return info;
     };
     let Some(exefs_start) =
         base.checked_add(u64::from(exefs_offset).saturating_mul(MEDIA_UNIT_SIZE))
     else {
+        scan_for_smdh(path, &mut info);
         return info;
     };
     let exefs_bytes = u64::from(exefs_size).saturating_mul(MEDIA_UNIT_SIZE);
     if exefs_bytes < 0x200 || exefs_bytes > MAX_EXEFS_FILE_SIZE as u64 {
+        scan_for_smdh(path, &mut info);
         return info;
     }
     let Ok(exefs_header) = read_exact_at(path, exefs_start, 0x200) else {
+        scan_for_smdh(path, &mut info);
         return info;
     };
     for index in 0..10 {
@@ -465,6 +646,9 @@ fn embedded_3ds(path: &Path) -> EmbeddedInfo {
         };
         apply_smdh(&mut info, &smdh);
         break;
+    }
+    if info.covers.is_empty() {
+        scan_for_smdh(path, &mut info);
     }
     info
 }
@@ -1041,7 +1225,45 @@ fn embedded_iso(path: &Path) -> EmbeddedInfo {
 }
 
 pub fn extract_embedded_info(path: &Path, payload_format: &str) -> Result<EmbeddedInfo, RomxError> {
-    let mut info = match payload_format {
+    let mut info = EmbeddedInfo::default();
+    let mut probed_cover = None;
+
+    // libromx is the canonical source for payload identities and the probe
+    // formats it implements.  Keep the pure-Rust readers below only as an
+    // additive compatibility layer for formats with extra artwork (for
+    // example 3DS SMDH and GameCube banners) that are not part of the C probe
+    // surface yet.
+    let format_id = format_id_for_extension(payload_format);
+    if format_id != 0 {
+        if let Ok(probe) = Probe::open(path, format_id) {
+            let probe_info = probe.info()?;
+            if let Some(platform) = crate::platform_name_from_id(probe_info.platform_id) {
+                info.platform = Some(platform.to_owned());
+            }
+            if probe_info.flags & sys::ROMX_PROBE_HAS_NAME != 0 {
+                info.metadata
+                    .insert("name".into(), Value::String(c_field(&probe_info.name)));
+            }
+            if probe_info.flags & sys::ROMX_PROBE_HAS_SERIAL != 0 {
+                info.metadata
+                    .insert("serial".into(), Value::String(c_field(&probe_info.serial)));
+            }
+            if let Some(metadata) = probe.metadata_json()? {
+                if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&metadata) {
+                    for (key, value) in fields {
+                        info.metadata.entry(key).or_insert(value);
+                    }
+                }
+            }
+            if let Some(cover) = probe.cover_png()? {
+                if validate_png_bytes(&cover).is_ok() {
+                    probed_cover = Some(cover);
+                }
+            }
+        }
+    }
+
+    let fallback = match payload_format {
         "pbp" => embedded_pbp(path),
         "gcm" => embedded_gamecube(path),
         "iso" if is_gamecube_disc(path) => embedded_gamecube(path),
@@ -1049,9 +1271,26 @@ pub fn extract_embedded_info(path: &Path, payload_format: &str) -> Result<Embedd
         "3ds" | "cci" | "cxi" | "app" => embedded_3ds(path),
         _ => EmbeddedInfo::default(),
     };
+    if info.platform.is_none() {
+        info.platform = fallback.platform;
+    }
+    for (key, value) in fallback.metadata {
+        info.metadata.entry(key).or_insert(value);
+    }
+    for cover in fallback.covers {
+        add_embedded_cover(&mut info, &cover.name, cover.bytes);
+    }
+    if info.covers.is_empty() {
+        if let Some(cover) = probed_cover.or(fallback.cover) {
+            add_embedded_cover(&mut info, "libromx cover", cover);
+        }
+    }
     header_info(path, payload_format, &mut info);
     if payload_format == "nds" && info.covers.is_empty() {
         nds_icon(path, &mut info);
+    }
+    if info.cover.is_none() {
+        info.cover = info.covers.first().map(|cover| cover.bytes.clone());
     }
     Ok(info)
 }
@@ -1210,6 +1449,27 @@ mod tests {
             .covers
             .iter()
             .all(|cover| cover.bytes.starts_with(crate::PNG_SIGNATURE)));
+
+        // Some 3DS tools remove the outer 0x100-byte card prefix while
+        // leaving NCSD partition offsets unchanged. The same payload should
+        // still expose its SMDH metadata and artwork in that representation.
+        let trimmed_path = root.path().join("trimmed.cci");
+        let full = fs::read(&path).unwrap();
+        fs::write(&trimmed_path, &full[0x100..]).unwrap();
+        let trimmed = inspect_payload_profile(&trimmed_path).unwrap();
+        assert_eq!(trimmed.metadata["name"], "Test 3DS");
+        assert_eq!(trimmed.metadata["serial"], "CTR-P-TE");
+        assert_eq!(trimmed.covers.len(), 2);
+
+        // The bounded SMDH fallback also handles an image whose ExeFS entry
+        // name table is unusable but whose icon resource is still present.
+        let mut unindexed = full;
+        unindexed[exefs_base..exefs_base + 8].fill(0);
+        let unindexed_path = root.path().join("unindexed.cci");
+        fs::write(&unindexed_path, unindexed).unwrap();
+        let unindexed = inspect_payload_profile(&unindexed_path).unwrap();
+        assert_eq!(unindexed.metadata["name"], "Test 3DS");
+        assert_eq!(unindexed.covers.len(), 2);
     }
 
     #[test]

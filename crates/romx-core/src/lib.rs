@@ -12,18 +12,25 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::fmt;
 use std::fs;
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use thiserror::Error;
 
+mod error;
+mod extraction;
 mod frontend;
 mod identity;
 mod libretro;
 mod lpl;
+mod mutable;
 mod probe;
+mod reader;
+mod registry;
 mod save;
+mod validation;
+mod writer;
 
+pub use error::RomxError;
 pub use frontend::{check_frontend_compatibility, FrontendCompatibilityReport};
 pub use identity::{identity_from_document, identity_from_path, RomxIdentity};
 pub use libretro::{
@@ -37,16 +44,28 @@ pub use lpl::{
     ImportLplOptions, ImportLplPlan, ImportLplReport, PlannedLplItem, LPLX_METADATA_KEY,
     OFFICIAL_LPL_ITEM_FIELDS, OFFICIAL_LPL_ROOT_FIELDS, ROMX_LPLX_METADATA_FIELDS,
 };
+pub use mutable::{
+    copy_region as copy_mutable_region, write_file as write_mutable_file, MutableBundle,
+    MutableFile,
+};
 pub use probe::{
     extract_embedded_info, infer_payload_format, inspect_payload_profile, EmbeddedCover,
-    EmbeddedInfo, PayloadProfile,
+    EmbeddedInfo, PayloadProfile, Probe,
+};
+pub use reader::{Metadata, PayloadFile, PayloadMapping, Reader, VfsFile};
+pub use registry::{
+    format_name as registry_format_name, platform_name as registry_platform_name,
+    require_known_platform,
 };
 pub use save::{
-    detect_save_bundles, extract_mutable_save_object, extract_mutable_save_objects,
-    inspect_mutable_path, is_supported_save_file, read_mutable_save_objects, save_profile,
-    MutableRegionInfo, MutableSaveFileData, MutableSaveObject, SaveGrouping, SaveInventory,
-    SaveProfile,
+    detect_save_bundles, detect_save_bundles_with_flags, extract_mutable_save_object,
+    extract_mutable_save_objects, inspect_mutable_path, inspect_mutable_path_with_flags,
+    is_supported_save_file, read_mutable_save_objects, save_layout, save_profile,
+    MutableRegionInfo, MutableSaveFileData, MutableSaveObject, SaveCandidate, SaveCandidateFile,
+    SaveCatalog, SaveGrouping, SaveInventory, SaveLayout, SaveProfile, SaveScope, SaveSlot,
+    SaveSourceFormat,
 };
+pub use writer::Writer;
 
 pub const FOOTER_SIZE: usize = 128;
 pub const RIDX_HEADER_SIZE: usize = 64;
@@ -78,6 +97,7 @@ pub const SUPPORTED_FORMAT_EXTENSIONS: &[&str] = &[
     "app", "iso", "cso", "zso", "chd", "pbp", "cdi", "gcm", "wbfs", "rvz", "wia", "wad", "cue",
     "gdi", "m3u", "ccd", "mds", "toc", "bin", "wav", "flac", "img", "mdf", "sbi", "sub", "ecm",
     "z64", "n64", "v64", "md", "gen", "smd", "32x", "sms", "gg", "pce", "elf", "prx", "msu", "pcm",
+    "zip",
 ];
 
 pub const RECOMMENDED_CARTRIDGE_MUTABLE_CAPACITY: u64 = 512 * 1024;
@@ -88,19 +108,8 @@ pub const RECOMMENDED_PS2_MUTABLE_CAPACITY: u64 = 32 * 1024 * 1024;
 pub const RECOMMENDED_DIRECTORY_SAVE_MUTABLE_CAPACITY: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_MUTABLE_ENTRY_CAPACITY: u32 = 8;
 pub const DEFAULT_SAVE_OBJECT_CAPACITY: u64 = 512 * 1024;
-const CARTRIDGE_MUTABLE_OVERHEAD: u64 = 256 * 1024;
-const NDS_MUTABLE_OVERHEAD: u64 = 2 * 1024 * 1024;
-const MUTABLE_ENTRY_SIZE: u64 = RIDX_ENTRY_SIZE as u64;
-const MUTABLE_HEADER_SIZE: u64 = 4096;
 const MUTABLE_ALIGNMENT: u64 = 4096;
-const MUTABLE_KEY_CAPACITY: usize = 448;
-const MUTABLE_BUNDLE_HEADER_SIZE: u64 = 64;
-const MUTABLE_BUNDLE_ENTRY_SIZE: u64 = 64;
-const MUTABLE_BUNDLE_PATH_CAPACITY: usize = 1024;
-// Keep a small per-object margin so a later libromx write can change a
-// bundle path (for example from a user supplied Chinese filename to the
-// frontend's canonical `<rom-stem>.sav`) without consuming a new slot.
-const MUTABLE_SAVE_OBJECT_HEADROOM: u64 = 64 * 1024;
+const MUTABLE_BUNDLE_OVERHEAD_RESERVE: u64 = 4096;
 
 /// One file stored inside a ROMX SAVE bundle.
 ///
@@ -121,6 +130,21 @@ pub struct MutableSaveBundle {
     pub files: Vec<MutableSaveFile>,
 }
 
+/// One immutable payload file in a multi-entry ROMX container.
+///
+/// The entrypoint must be marked explicitly.  Its bytes are written first at
+/// absolute payload offset zero; every other entry keeps the supplied
+/// normalized virtual path so descriptor formats such as CUE/GDI/M3U can
+/// resolve their sidecars through the ROMX VFS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackEntry {
+    pub path: String,
+    pub source: PathBuf,
+    /// Zero lets the writer infer the registered format from `path`.
+    pub format_id: u16,
+    pub entrypoint: bool,
+}
+
 /// Return the mutable directory slot count needed for a save directory.
 ///
 /// ROMX mutable directories use eight-slot allocation units.  Two additional
@@ -137,29 +161,25 @@ pub fn recommended_mutable_entry_capacity(save_count: usize) -> u32 {
 
 /// Calculate a mutable capacity from the measured local SAVE bytes.
 ///
-/// ROMX 0.2.0's guidance reserves the detected save capacity plus a profile
-/// overhead and the mutable header/directory.  The platform recommendation is
-/// still a floor, so a normal NDS save set (for example seven 512 KiB saves)
-/// remains within the standard 16 MiB reservation instead of multiplying that
-/// reservation once per file.
+/// The wire-level bundle/header sizing is owned by libromx. This helper only
+/// applies an application-level growth margin and the platform floor; callers
+/// that have a `SaveCatalog` should use its measurement API when available.
 pub fn recommended_mutable_capacity_for_save_bytes(
     base: u64,
     save_count: usize,
     save_bytes: u64,
 ) -> u64 {
     let estimated_bytes = DEFAULT_SAVE_OBJECT_CAPACITY.saturating_mul(save_count as u64);
-    let detected_capacity = save_bytes.max(estimated_bytes);
-    let overhead = if base == RECOMMENDED_NDS_MUTABLE_CAPACITY {
-        NDS_MUTABLE_OVERHEAD
-    } else {
-        CARTRIDGE_MUTABLE_OVERHEAD
-    };
-    let entry_capacity = u64::from(recommended_mutable_entry_capacity(save_count));
-    let directory_end =
-        MUTABLE_HEADER_SIZE.saturating_add(entry_capacity.saturating_mul(MUTABLE_ENTRY_SIZE));
-    let minimum = detected_capacity
-        .saturating_add(overhead)
-        .saturating_add(directory_end);
+    // Each RMBL object has a header, path table, and alignment padding in
+    // addition to the source files. Keep that overhead in the region budget
+    // so the per-object growth reservation made by libromx cannot consume the
+    // last few blocks of an otherwise sufficient mutable region.
+    let bundle_overhead = MUTABLE_BUNDLE_OVERHEAD_RESERVE.saturating_mul(save_count as u64);
+    let detected_capacity = save_bytes
+        .saturating_add(bundle_overhead)
+        .max(estimated_bytes);
+    let growth_margin = detected_capacity.saturating_div(4).max(4096);
+    let minimum = detected_capacity.saturating_add(growth_margin);
     let capacity = base.max(minimum).max(MIN_MUTABLE_CAPACITY);
     let remainder = capacity % MUTABLE_ALIGNMENT;
     if remainder == 0 {
@@ -214,31 +234,7 @@ pub fn recommended_mutable_capacity(platform: &str, extension: &str) -> u64 {
         },
     }
 }
-const MAGIC: &[u8; 4] = b"ROMX";
-const RIDX_MAGIC: &[u8; 4] = b"RIDX";
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, Error)]
-pub enum RomxError {
-    #[error("I/O error: {0}")]
-    Io(#[from] io::Error),
-    #[error("invalid JSON metadata: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("image processing error: {0}")]
-    Image(#[from] image::ImageError),
-    #[error("invalid ROMX: {0}")]
-    Invalid(String),
-    #[error("ROMX immutable SHA-256 mismatch")]
-    BodyHashMismatch,
-    #[error("metadata is invalid: {0}")]
-    Metadata(String),
-    #[error("cover is invalid: {0}")]
-    Cover(String),
-    #[error("output already exists: {0}")]
-    Exists(PathBuf),
-    #[error("operation cancelled")]
-    Cancelled,
-}
+pub(crate) static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Region {
@@ -386,6 +382,19 @@ pub struct PackOptions {
     /// This keeps namespaces unknown to this crate (for example CHEAT/STATS)
     /// intact during frontend edits.
     pub mutable_region: Option<Vec<u8>>,
+    /// Existing ROMX source whose complete mutable region should be copied
+    /// into the newly-created container. The copy is performed by libromx so
+    /// unknown namespaces and inactive slots remain byte-for-byte intact.
+    pub mutable_region_source: Option<PathBuf>,
+    /// The caller owns this path as a short-lived staging file (normally a
+    /// `.tmp` output).  In this mode the writer does not create a second
+    /// Rust staging path and libromx writes directly to the temporary path.
+    /// Callers must remove the path when a post-write operation fails.
+    pub output_is_temporary: bool,
+    /// Validate a Rust-created staging output before publishing it.  Temporary
+    /// frontend outputs disable this after libromx has completed its own
+    /// structural, metadata, cover, and entry-stream checks.
+    pub post_write_validation: bool,
 }
 impl Default for PackOptions {
     fn default() -> Self {
@@ -402,6 +411,9 @@ impl Default for PackOptions {
             mutable_entry_capacity: 0,
             mutable_save_bundles: Vec::new(),
             mutable_region: None,
+            mutable_region_source: None,
+            output_is_temporary: false,
+            post_write_validation: true,
         }
     }
 }
@@ -599,120 +611,6 @@ pub fn validate_png_bytes(value: &[u8]) -> Result<CoverInfo, RomxError> {
     info.ok_or_else(|| png_error("PNG has no IHDR"))
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, RomxError> {
-    bytes
-        .get(offset..offset + 2)
-        .and_then(|v| v.try_into().ok())
-        .map(u16::from_le_bytes)
-        .ok_or_else(|| RomxError::Invalid("truncated ROMX field".into()))
-}
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, RomxError> {
-    bytes
-        .get(offset..offset + 4)
-        .and_then(|v| v.try_into().ok())
-        .map(u32::from_le_bytes)
-        .ok_or_else(|| RomxError::Invalid("truncated ROMX field".into()))
-}
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, RomxError> {
-    bytes
-        .get(offset..offset + 8)
-        .and_then(|v| v.try_into().ok())
-        .map(u64::from_le_bytes)
-        .ok_or_else(|| RomxError::Invalid("truncated ROMX field".into()))
-}
-fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
-    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
-    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
-    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
-
-impl Footer {
-    pub fn encode(&self) -> [u8; FOOTER_SIZE] {
-        let mut output = [0u8; FOOTER_SIZE];
-        output[..4].copy_from_slice(MAGIC);
-        put_u32(&mut output, 4, VERSION);
-        put_u64(&mut output, 8, self.rom.size);
-        put_u64(&mut output, 0x10, self.metadata.size);
-        put_u64(&mut output, 0x18, self.cover.size);
-        put_u64(&mut output, 0x20, self.mutable_capacity);
-        put_u16(&mut output, 0x28, self.platform_id);
-        put_u16(&mut output, 0x2a, self.launch_format_id);
-        put_u32(&mut output, 0x2c, self.immutable_hash_algorithm);
-        output[0x30..0x50].copy_from_slice(&self.immutable_sha256);
-        output[0x54..].copy_from_slice(&self.reserved);
-        put_u32(&mut output, 0x50, 0);
-        let checksum = crc32_u32(&output);
-        put_u32(&mut output, 0x50, checksum);
-        output
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self, RomxError> {
-        if bytes.len() != FOOTER_SIZE || &bytes[..4] != MAGIC {
-            return Err(RomxError::Invalid("invalid ROMX footer".into()));
-        }
-        if read_u32(bytes, 4)? != VERSION {
-            return Err(RomxError::Invalid(
-                "unsupported ROMX footer wire version".into(),
-            ));
-        }
-        let stored = read_u32(bytes, 0x50)?;
-        let mut check = [0u8; FOOTER_SIZE];
-        check.copy_from_slice(bytes);
-        put_u32(&mut check, 0x50, 0);
-        if crc32_u32(&check) != stored {
-            return Err(RomxError::Invalid("footer CRC32 mismatch".into()));
-        }
-        let reserved: [u8; 44] = bytes[0x54..].try_into().unwrap();
-        if reserved.iter().any(|v| *v != 0) {
-            return Err(RomxError::Invalid(
-                "footer reserved bytes are non-zero".into(),
-            ));
-        }
-        let hash = read_u32(bytes, 0x2c)?;
-        let immutable: [u8; 32] = bytes[0x30..0x50].try_into().unwrap();
-        if hash == HASH_NONE && immutable != [0; 32] || !matches!(hash, HASH_NONE | HASH_SHA256) {
-            return Err(RomxError::Invalid("invalid immutable hash fields".into()));
-        }
-        let payload = read_u64(bytes, 8)?;
-        let metadata = read_u64(bytes, 0x10)?;
-        let cover = read_u64(bytes, 0x18)?;
-        let flags = (if metadata > 0 { FLAG_METADATA } else { 0 })
-            | (if cover > 0 { FLAG_COVER } else { 0 })
-            | (if hash == HASH_SHA256 {
-                FLAG_BODY_SHA256
-            } else {
-                0
-            });
-        Ok(Self {
-            version: VERSION,
-            rom: Region {
-                offset: 0,
-                size: payload,
-            },
-            metadata: Region {
-                offset: 0,
-                size: metadata,
-            },
-            cover: Region {
-                offset: 0,
-                size: cover,
-            },
-            mutable_capacity: read_u64(bytes, 0x20)?,
-            platform_id: read_u16(bytes, 0x28)?,
-            launch_format_id: read_u16(bytes, 0x2a)?,
-            immutable_hash_algorithm: hash,
-            immutable_sha256: immutable,
-            footer_crc32: stored,
-            reserved,
-            flags,
-            body_sha256: immutable,
-        })
-    }
-}
-
 struct StrictValue(Value);
 impl<'de> Deserialize<'de> for StrictValue {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -837,6 +735,25 @@ pub fn classify_gb_payload(
     }
 }
 
+/// Classify a Game Boy payload without loading the complete ROM into memory.
+/// Only the header byte used by [`classify_gb_payload`] is read from disk.
+pub fn classify_gb_payload_path(
+    path: &Path,
+    payload_format: Option<&str>,
+) -> Result<&'static str, RomxError> {
+    let mut header = [0u8; 0x144];
+    let mut read = 0usize;
+    let mut file = fs::File::open(path)?;
+    while read < header.len() {
+        let count = file.read(&mut header[read..])?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+    }
+    classify_gb_payload(&header[..read], payload_format)
+}
+
 pub fn format_id_for_extension(extension: &str) -> u16 {
     match extension
         .trim_start_matches('.')
@@ -896,6 +813,7 @@ pub fn format_id_for_extension(extension: &str) -> u16 {
         "prx" => 0x71,
         "msu" => 0x80,
         "pcm" => 0x81,
+        "zip" => 0x91,
         _ => 0,
     }
 }
@@ -954,6 +872,7 @@ pub fn format_extension(format_id: u16) -> Option<&'static str> {
         0x71 => "prx",
         0x80 => "msu",
         0x81 => "pcm",
+        0x91 => "zip",
         _ => return None,
     })
 }
@@ -970,7 +889,12 @@ pub fn platform_id_for_name(name: &str) -> u16 {
         "sms" => 0x10,
         "gg" => 0x11,
         "genesis" | "md" => 0x12,
-        "pce" => 0x20,
+        "mega_drive_32x" | "32x" => 0x13,
+        "sega_cd" => 0x14,
+        "saturn" => 0x15,
+        "dreamcast" => 0x16,
+        "pce" | "pc_engine" => 0x20,
+        "pc_engine_cd" => 0x21,
         "ps1" | "playstation" => 0x30,
         "ps2" => 0x31,
         "psp" => 0x32,
@@ -996,7 +920,12 @@ pub fn platform_name_from_id(id: u16) -> Option<&'static str> {
         0x10 => "sms",
         0x11 => "gg",
         0x12 => "genesis",
+        0x13 => "mega_drive_32x",
+        0x14 => "sega_cd",
+        0x15 => "saturn",
+        0x16 => "dreamcast",
         0x20 => "pce",
+        0x21 => "pc_engine_cd",
         0x30 => "playstation",
         0x31 => "ps2",
         0x32 => "psp",
@@ -1249,744 +1178,105 @@ fn metadata_bytes(
     Ok(Some(serde_json::to_vec(&value)?))
 }
 
-fn validate_virtual_path(path: &str) -> Result<Vec<u8>, RomxError> {
-    let bytes = path.as_bytes();
-    if bytes.is_empty()
-        || bytes.len() > RIDX_PATH_CAPACITY
-        || path.starts_with('/')
-        || path.ends_with('/')
-        || path.contains('\\')
-        || path.contains('\0')
-        || path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-    {
-        return Err(RomxError::Invalid(format!(
-            "invalid RIDX virtual path: {path}"
-        )));
-    }
-    Ok(bytes.to_vec())
-}
-
-fn format_id_from_path(path: &str) -> u16 {
-    match Path::new(path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "gb" => 1,
-        "gbc" => 2,
-        "gba" => 3,
-        "nes" => 4,
-        "unf" => 5,
-        "unif" => 6,
-        "fds" => 7,
-        "sfc" => 8,
-        "smc" => 9,
-        "nds" => 0x0a,
-        "3ds" => 0x0b,
-        "cci" => 0x0c,
-        "cxi" => 0x0d,
-        "app" => 0x0e,
-        "iso" => 0x10,
-        "cso" => 0x11,
-        "zso" => 0x12,
-        "chd" => 0x13,
-        "pbp" => 0x14,
-        "cdi" => 0x15,
-        "gcm" => 0x16,
-        "wbfs" => 0x17,
-        "rvz" => 0x18,
-        "wia" => 0x19,
-        "wad" => 0x1a,
-        "cue" => 0x20,
-        "gdi" => 0x21,
-        "m3u" => 0x22,
-        "ccd" => 0x23,
-        "mds" => 0x24,
-        "toc" => 0x25,
-        "bin" => 0x30,
-        "wav" => 0x31,
-        "flac" => 0x32,
-        "img" => 0x33,
-        "mdf" => 0x34,
-        "sbi" => 0x40,
-        "sub" => 0x41,
-        "ecm" => 0x42,
-        "z64" => 0x50,
-        "n64" => 0x51,
-        "v64" => 0x52,
-        "md" => 0x60,
-        "gen" => 0x61,
-        "smd" => 0x62,
-        "32x" => 0x63,
-        "sms" => 0x64,
-        "gg" => 0x65,
-        "pce" => 0x66,
-        "elf" => 0x70,
-        "prx" => 0x71,
-        "msu" => 0x80,
-        "pcm" => 0x81,
-        _ => 0,
-    }
-}
-
-fn make_ridx(
-    path: &str,
-    format: u16,
-    size: u64,
-    crc: u32,
-    include_crc: bool,
-) -> Result<Vec<u8>, RomxError> {
-    let path = validate_virtual_path(path)?;
-    if format == 0 {
-        return Err(RomxError::Invalid(
-            "entrypoint format_id must be registered".into(),
+/// Execute a path-oriented libromx operation for an in-memory compatibility
+/// API without retaining a second payload-sized allocation.  The byte APIs
+/// predate the streaming reader/writer handles; staging their input in a
+/// private temporary file keeps the actual container implementation in
+/// libromx while retaining the existing public Rust API.
+fn with_temporary_file<T>(
+    suffix: &str,
+    bytes: &[u8],
+    operation: impl FnOnce(&Path) -> Result<T, RomxError>,
+) -> Result<T, RomxError> {
+    let mut attempts = 0u32;
+    let path = loop {
+        let serial = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = std::env::temp_dir().join(format!(
+            "romx-core-{}-{serial}.{suffix}",
+            std::process::id()
         ));
-    }
-    let mut index = vec![0u8; RIDX_HEADER_SIZE + RIDX_ENTRY_SIZE];
-    index[..4].copy_from_slice(RIDX_MAGIC);
-    put_u16(&mut index, 4, RIDX_VERSION);
-    put_u16(&mut index, 6, RIDX_HEADER_SIZE as u16);
-    put_u32(&mut index, 8, 1);
-    put_u32(&mut index, 12, RIDX_ENTRY_SIZE as u32);
-    let base = RIDX_HEADER_SIZE;
-    put_u32(
-        &mut index,
-        base,
-        ENTRYPOINT | if include_crc { HAS_CRC32 } else { 0 },
-    );
-    put_u16(&mut index, base + 4, format);
-    put_u16(&mut index, base + 6, path.len() as u16);
-    put_u64(&mut index, base + 8, 0);
-    put_u64(&mut index, base + 16, size);
-    put_u32(&mut index, base + 24, if include_crc { crc } else { 0 });
-    index[base + 0x20..base + 0x20 + path.len()].copy_from_slice(&path);
-    put_u32(&mut index, 0x14, 0);
-    let checksum = crc32_u32(&index);
-    put_u32(&mut index, 0x14, checksum);
-    Ok(index)
-}
-
-fn align_mutable_bundle(value: u64) -> Result<u64, RomxError> {
-    value
-        .checked_add(63)
-        .map(|value| value & !63)
-        .ok_or_else(|| RomxError::Invalid("mutable bundle alignment overflow".into()))
-}
-
-fn validate_mutable_save_key(key: &str) -> Result<(), RomxError> {
-    if key.is_empty() {
-        return Err(RomxError::Invalid(
-            "mutable SAVE key must not be empty".into(),
-        ));
-    }
-    if key.len() > MUTABLE_KEY_CAPACITY {
-        return Err(RomxError::Invalid(
-            "mutable SAVE key exceeds the 448-byte limit".into(),
-        ));
-    }
-    if key == "."
-        || key == ".."
-        || key.contains('/')
-        || key.contains('\\')
-        || key.as_bytes().contains(&0)
-    {
-        return Err(RomxError::Invalid(
-            "mutable SAVE key contains a path separator or dot component".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_mutable_bundle_path(path: &str) -> Result<(), RomxError> {
-    if path.is_empty()
-        || path.len() > MUTABLE_BUNDLE_PATH_CAPACITY
-        || path.starts_with('/')
-        || path.ends_with('/')
-        || path.contains('\\')
-        || path.as_bytes().contains(&0)
-    {
-        return Err(RomxError::Invalid(
-            "mutable SAVE bundle path is not portable".into(),
-        ));
-    }
-    for component in path.split('/') {
-        if component.is_empty() || component == "." || component == ".." {
-            return Err(RomxError::Invalid(
-                "mutable SAVE bundle path contains an unsafe component".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-struct PackedMutableSaveBundle {
-    key: String,
-    bytes: Vec<u8>,
-    crc32: u32,
-}
-
-fn build_mutable_save_bundle(
-    bundle: &MutableSaveBundle,
-) -> Result<PackedMutableSaveBundle, RomxError> {
-    validate_mutable_save_key(&bundle.key)?;
-    if bundle.files.len() > u32::MAX as usize {
-        return Err(RomxError::Invalid(
-            "mutable SAVE bundle has too many files".into(),
-        ));
-    }
-
-    struct Input {
-        path: String,
-        source: PathBuf,
-        size: u64,
-        crc32: u32,
-        data_offset: u64,
-    }
-    let mut inputs = Vec::with_capacity(bundle.files.len());
-    for file in &bundle.files {
-        validate_mutable_bundle_path(&file.path)?;
-        let metadata = fs::symlink_metadata(&file.source)?;
-        if !metadata.is_file() {
-            return Err(RomxError::Invalid(format!(
-                "mutable SAVE source is not a regular file: {}",
-                file.source.display()
-            )));
-        }
-        let size = metadata.len();
-        inputs.push(Input {
-            path: file.path.clone(),
-            source: file.source.clone(),
-            size,
-            crc32: 0,
-            data_offset: 0,
-        });
-    }
-    inputs.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
-    for pair in inputs.windows(2) {
-        if pair[0].path.eq_ignore_ascii_case(&pair[1].path) {
-            return Err(RomxError::Invalid(
-                "mutable SAVE bundle paths collide after ASCII case folding".into(),
-            ));
-        }
-    }
-
-    let entry_count = inputs.len() as u64;
-    let path_table_offset = MUTABLE_BUNDLE_HEADER_SIZE
-        .checked_add(
-            entry_count
-                .checked_mul(MUTABLE_BUNDLE_ENTRY_SIZE)
-                .ok_or_else(|| RomxError::Invalid("mutable bundle directory overflow".into()))?,
-        )
-        .ok_or_else(|| RomxError::Invalid("mutable bundle path table overflow".into()))?;
-    let mut path_cursor = path_table_offset;
-    for input in &inputs {
-        path_cursor = path_cursor
-            .checked_add(input.path.len() as u64)
-            .ok_or_else(|| RomxError::Invalid("mutable bundle path table overflow".into()))?;
-    }
-    let data_offset = align_mutable_bundle(path_cursor)?;
-    let mut data_cursor = data_offset;
-    for input in &mut inputs {
-        input.data_offset = data_cursor;
-        data_cursor = data_cursor
-            .checked_add(input.size)
-            .ok_or_else(|| RomxError::Invalid("mutable bundle data overflow".into()))?;
-        data_cursor = align_mutable_bundle(data_cursor)?;
-    }
-    let bundle_size = data_cursor;
-    let output_size = usize::try_from(bundle_size)
-        .map_err(|_| RomxError::Invalid("mutable SAVE bundle is too large".into()))?;
-    let mut output = vec![0u8; output_size];
-
-    output[..4].copy_from_slice(b"RMBL");
-    put_u16(&mut output, 4, 1);
-    put_u16(&mut output, 6, MUTABLE_BUNDLE_HEADER_SIZE as u16);
-    put_u16(&mut output, 8, 1); // ROMX_MUTABLE_NAMESPACE_SAVE
-    put_u16(&mut output, 0x0a, 0);
-    put_u32(&mut output, 0x0c, MUTABLE_BUNDLE_HEADER_SIZE as u32);
-    put_u32(
-        &mut output,
-        0x10,
-        u32::try_from(entry_count)
-            .map_err(|_| RomxError::Invalid("mutable SAVE bundle entry count overflow".into()))?,
-    );
-    put_u32(&mut output, 0x14, 0);
-    put_u64(&mut output, 0x18, MUTABLE_BUNDLE_HEADER_SIZE);
-    put_u64(&mut output, 0x20, path_table_offset);
-    put_u64(&mut output, 0x28, data_offset);
-    put_u64(&mut output, 0x30, bundle_size);
-    put_u32(&mut output, 0x38, 0);
-    let header_crc = crc32_u32(&output[..MUTABLE_BUNDLE_HEADER_SIZE as usize]);
-    put_u32(&mut output, 0x38, header_crc);
-
-    let mut path_cursor = path_table_offset;
-    for (index, input) in inputs.iter().enumerate() {
-        let directory_offset = MUTABLE_BUNDLE_HEADER_SIZE
-            .checked_add((index as u64) * MUTABLE_BUNDLE_ENTRY_SIZE)
-            .ok_or_else(|| RomxError::Invalid("mutable bundle directory overflow".into()))?;
-        let directory_offset = usize::try_from(directory_offset)
-            .map_err(|_| RomxError::Invalid("mutable bundle directory is too large".into()))?;
-        put_u64(&mut output, directory_offset, path_cursor);
-        put_u32(
-            &mut output,
-            directory_offset + 8,
-            u32::try_from(input.path.len())
-                .map_err(|_| RomxError::Invalid("mutable SAVE path is too long".into()))?,
-        );
-        put_u64(&mut output, directory_offset + 0x10, input.data_offset);
-        put_u64(&mut output, directory_offset + 0x18, input.size);
-        // The file CRC is filled after the source is streamed into the
-        // pre-sized bundle below.
-        put_u32(&mut output, directory_offset + 0x20, 0);
-        let path_start = usize::try_from(path_cursor)
-            .map_err(|_| RomxError::Invalid("mutable bundle path table is too large".into()))?;
-        output[path_start..path_start + input.path.len()].copy_from_slice(input.path.as_bytes());
-        path_cursor += input.path.len() as u64;
-    }
-    let mut copy_buffer = vec![0u8; 1024 * 1024];
-    for (index, input) in inputs.iter_mut().enumerate() {
-        let data_start = usize::try_from(input.data_offset)
-            .map_err(|_| RomxError::Invalid("mutable bundle data is too large".into()))?;
-        let data_end = data_start
-            .checked_add(
-                usize::try_from(input.size)
-                    .map_err(|_| RomxError::Invalid("mutable bundle data is too large".into()))?,
-            )
-            .ok_or_else(|| RomxError::Invalid("mutable bundle data is too large".into()))?;
-        let mut source = fs::File::open(&input.source)?;
-        let mut destination = &mut output[data_start..data_end];
-        let mut digest = None;
-        let (copied, checksum) = stream_copy_inner_with_buffer(
-            &mut source,
-            &mut destination,
-            &mut digest,
-            false,
-            &mut copy_buffer,
-        )?;
-        if copied != input.size {
-            return Err(RomxError::Invalid(format!(
-                "mutable SAVE source changed while packing: {}",
-                input.source.display()
-            )));
-        }
-        input.crc32 = checksum;
-        let directory_offset = MUTABLE_BUNDLE_HEADER_SIZE
-            .checked_add((index as u64) * MUTABLE_BUNDLE_ENTRY_SIZE)
-            .ok_or_else(|| RomxError::Invalid("mutable bundle directory overflow".into()))?;
-        let directory_offset = usize::try_from(directory_offset)
-            .map_err(|_| RomxError::Invalid("mutable bundle directory is too large".into()))?;
-        put_u32(&mut output, directory_offset + 0x20, checksum);
-    }
-
-    Ok(PackedMutableSaveBundle {
-        key: bundle.key.clone(),
-        crc32: crc32_u32(&output),
-        bytes: output,
-    })
-}
-
-fn build_mutable_entry(
-    key: &str,
-    data_offset: u64,
-    data_capacity: u64,
-    data_size: u64,
-    data_crc32: u32,
-) -> Result<Vec<u8>, RomxError> {
-    validate_mutable_save_key(key)?;
-    let mut entry = vec![0u8; RIDX_ENTRY_SIZE];
-    entry[..4].copy_from_slice(b"MENT");
-    put_u16(&mut entry, 4, 1); // ACTIVE
-    put_u16(&mut entry, 6, 1); // SAVE namespace
-    put_u32(&mut entry, 8, 0);
-    put_u32(&mut entry, 0x0c, key.len() as u32);
-    put_u64(&mut entry, 0x10, data_offset);
-    put_u64(&mut entry, 0x18, data_capacity);
-    put_u64(&mut entry, 0x20, data_size);
-    put_u64(&mut entry, 0x28, 1); // first generation
-    put_u64(&mut entry, 0x30, 0); // modified time is optional
-    put_u32(&mut entry, 0x38, data_crc32);
-    entry[0x40..0x40 + key.len()].copy_from_slice(key.as_bytes());
-    put_u32(&mut entry, 0x3c, 0);
-    let crc = crc32_u32(&entry);
-    put_u32(&mut entry, 0x3c, crc);
-    Ok(entry)
-}
-
-struct MutableLayout {
-    capacity: u64,
-    entry_capacity: usize,
-    data_offset: u64,
-}
-
-fn mutable_layout(
-    capacity: u64,
-    requested_entry_capacity: u32,
-    save_bundle_count: usize,
-) -> Result<Option<MutableLayout>, RomxError> {
-    if capacity == 0 {
-        if save_bundle_count != 0 {
-            return Err(RomxError::Invalid(
-                "SAVE bundles require a reserved mutable region".into(),
-            ));
-        }
-        return Ok(None);
-    }
-    if !capacity.is_multiple_of(MUTABLE_ALIGNMENT) || capacity < MIN_MUTABLE_CAPACITY {
-        return Err(RomxError::Invalid(
-            "mutable capacity must be a 4096-byte multiple and at least 12288".into(),
-        ));
-    }
-    let count = if requested_entry_capacity == 0 {
-        DEFAULT_MUTABLE_ENTRY_CAPACITY
-    } else {
-        requested_entry_capacity
-    } as usize;
-    if count < DEFAULT_MUTABLE_ENTRY_CAPACITY as usize || !count.is_multiple_of(8) {
-        return Err(RomxError::Invalid(
-            "mutable entry capacity must be a multiple of 8 and at least 8".into(),
-        ));
-    }
-    let directory = RIDX_ENTRY_SIZE
-        .checked_mul(count)
-        .ok_or_else(|| RomxError::Invalid("mutable directory size overflow".into()))?;
-    let data_offset = MUTABLE_HEADER_SIZE
-        .checked_add(directory as u64)
-        .ok_or_else(|| RomxError::Invalid("mutable directory size overflow".into()))?;
-    if capacity < data_offset + MUTABLE_ALIGNMENT {
-        return Err(RomxError::Invalid(
-            "mutable capacity does not leave room for mutable data".into(),
-        ));
-    }
-    if save_bundle_count > count {
-        return Err(RomxError::Invalid(
-            "mutable directory has fewer slots than SAVE bundles".into(),
-        ));
-    }
-    Ok(Some(MutableLayout {
-        capacity,
-        entry_capacity: count,
-        data_offset,
-    }))
-}
-
-fn mutable_header(layout: &MutableLayout) -> Vec<u8> {
-    let mut header = vec![0u8; MUTABLE_HEADER_SIZE as usize];
-    header[..4].copy_from_slice(b"RMUT");
-    put_u16(&mut header, 4, 1);
-    put_u16(&mut header, 6, MUTABLE_HEADER_SIZE as u16);
-    put_u32(&mut header, 8, MUTABLE_ENTRY_SIZE as u32);
-    put_u32(&mut header, 12, layout.entry_capacity as u32);
-    put_u64(&mut header, 16, MUTABLE_HEADER_SIZE);
-    put_u64(
-        &mut header,
-        24,
-        (layout.entry_capacity * RIDX_ENTRY_SIZE) as u64,
-    );
-    put_u64(&mut header, 32, layout.data_offset);
-    put_u64(&mut header, 40, layout.capacity - layout.data_offset);
-    put_u32(&mut header, 0x34, 0);
-    let checksum = crc32_u32(&header);
-    put_u32(&mut header, 0x34, checksum);
-    header
-}
-
-fn write_zeroes<W: Write>(writer: &mut W, mut size: u64) -> Result<(), RomxError> {
-    static ZEROES: [u8; 1024 * 1024] = [0; 1024 * 1024];
-    while size != 0 {
-        let count = usize::try_from(size.min(ZEROES.len() as u64)).unwrap_or(ZEROES.len());
-        writer.write_all(&ZEROES[..count])?;
-        size -= count as u64;
-    }
-    Ok(())
-}
-
-fn write_mutable_region<W: Write>(writer: &mut W, options: &PackOptions) -> Result<(), RomxError> {
-    if let Some(existing) = options.mutable_region.as_deref() {
-        // A preserved region is authoritative; any newly supplied bundles
-        // are intentionally ignored so unknown namespaces remain
-        // byte-for-byte intact, matching the previous writer behavior.
-        if options.mutable_capacity == 0 || existing.len() as u64 != options.mutable_capacity {
-            return Err(RomxError::Invalid(
-                "preserved mutable region does not match mutable_capacity".into(),
-            ));
-        }
-        writer.write_all(existing)?;
-        return Ok(());
-    }
-
-    let Some(layout) = mutable_layout(
-        options.mutable_capacity,
-        options.mutable_entry_capacity,
-        options.mutable_save_bundles.len(),
-    )?
-    else {
-        return Ok(());
-    };
-
-    let packed_bundles = options
-        .mutable_save_bundles
-        .iter()
-        .map(build_mutable_save_bundle)
-        .collect::<Result<Vec<_>, _>>()?;
-    // Keep the uniqueness check independent of input ordering so GUI-created
-    // labels remain deterministic and safe.
-    for (index, left) in packed_bundles.iter().enumerate() {
-        if packed_bundles[index + 1..]
-            .iter()
-            .any(|right| left.key.eq_ignore_ascii_case(&right.key))
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
         {
-            return Err(RomxError::Invalid(
-                "mutable SAVE keys collide after ASCII case folding".into(),
-            ));
-        }
-    }
-
-    let directory_size = layout
-        .entry_capacity
-        .checked_mul(RIDX_ENTRY_SIZE)
-        .ok_or_else(|| RomxError::Invalid("mutable directory size overflow".into()))?;
-    let mut directory = vec![0u8; directory_size];
-    let mut allocations = Vec::with_capacity(packed_bundles.len());
-    let mut data_cursor = layout.data_offset;
-    for (slot_index, bundle) in packed_bundles.iter().enumerate() {
-        let data_capacity = align_mutable_bundle(
-            (bundle.bytes.len() as u64)
-                .checked_add(MUTABLE_SAVE_OBJECT_HEADROOM)
-                .ok_or_else(|| RomxError::Invalid("mutable SAVE object size overflow".into()))?,
-        )?;
-        if data_capacity < bundle.bytes.len() as u64
-            || data_cursor > layout.capacity
-            || data_capacity > layout.capacity - data_cursor
-        {
-            return Err(RomxError::Invalid(
-                "mutable capacity cannot hold the initialized SAVE bundles".into(),
-            ));
-        }
-        let entry = build_mutable_entry(
-            &bundle.key,
-            data_cursor,
-            data_capacity,
-            bundle.bytes.len() as u64,
-            bundle.crc32,
-        )?;
-        let entry_start = RIDX_ENTRY_SIZE
-            .checked_mul(slot_index)
-            .ok_or_else(|| RomxError::Invalid("mutable directory overflow".into()))?;
-        directory[entry_start..entry_start + RIDX_ENTRY_SIZE].copy_from_slice(&entry);
-        allocations.push((data_cursor, data_capacity));
-        data_cursor += data_capacity;
-    }
-
-    writer.write_all(&mutable_header(&layout))?;
-    writer.write_all(&directory)?;
-    for (bundle, (data_start, data_capacity)) in packed_bundles.iter().zip(allocations) {
-        debug_assert!(data_start >= layout.data_offset);
-        writer.write_all(&bundle.bytes)?;
-        write_zeroes(
-            writer,
-            data_capacity.saturating_sub(bundle.bytes.len() as u64),
-        )?;
-    }
-    write_zeroes(writer, layout.capacity.saturating_sub(data_cursor))?;
-    Ok(())
-}
-
-fn stream_copy<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    digest: &mut Option<Sha256>,
-) -> Result<(u64, u32), RomxError> {
-    let mut buffer = vec![0u8; 1024 * 1024];
-    stream_copy_inner_with_buffer(reader, writer, digest, true, &mut buffer)
-}
-
-fn stream_copy_inner_with_buffer<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    digest: &mut Option<Sha256>,
-    require_nonempty: bool,
-    buffer: &mut [u8],
-) -> Result<(u64, u32), RomxError> {
-    let mut size = 0u64;
-    let mut crc = Crc32Hasher::new();
-    loop {
-        let count = reader.read(buffer)?;
-        if count == 0 {
-            break;
-        }
-        let chunk = &buffer[..count];
-        writer.write_all(chunk)?;
-        if let Some(digest) = digest.as_mut() {
-            digest.update(chunk);
-        }
-        crc.update(chunk);
-        size = size
-            .checked_add(count as u64)
-            .ok_or_else(|| RomxError::Invalid("payload size overflow".into()))?;
-    }
-    if require_nonempty && size == 0 {
-        return Err(RomxError::Invalid("ROM payload must not be empty".into()));
-    }
-    Ok((size, crc.finalize()))
-}
-
-fn write_container_stream<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    metadata: Option<&Value>,
-    cover: Option<&[u8]>,
-    options: &PackOptions,
-    path: &str,
-    format: u16,
-) -> Result<Footer, RomxError> {
-    if let Some(cover) = cover {
-        validate_png_bytes(cover)?;
-    }
-    let mut digest = options.body_sha256.then(Sha256::new);
-    let (payload_size, payload_crc) = stream_copy(reader, writer, &mut digest)?;
-    let metadata = metadata_bytes(
-        metadata,
-        cover,
-        &format!("{payload_crc:08x}"),
-        options.crc32_override.as_deref(),
-    )?;
-    let metadata_size = metadata.as_ref().map_or(0, |value| value.len() as u64);
-    let ridx = make_ridx(
-        path,
-        if options.entry_format_id == 0 {
-            format
-        } else {
-            options.entry_format_id
-        },
-        payload_size,
-        payload_crc,
-        options.include_entry_crc32,
-    )?;
-    writer.write_all(&ridx)?;
-    if let Some(digest) = digest.as_mut() {
-        digest.update(&ridx);
-    }
-    let metadata_offset = payload_size + ridx.len() as u64;
-    if let Some(metadata) = metadata.as_deref() {
-        writer.write_all(metadata)?;
-        if let Some(digest) = digest.as_mut() {
-            digest.update(metadata);
-        }
-    }
-    let cover_offset = metadata_offset + metadata_size;
-    if let Some(cover) = cover {
-        writer.write_all(cover)?;
-        if let Some(digest) = digest.as_mut() {
-            digest.update(cover);
-        }
-    }
-    let immutable_end = cover_offset + cover.map_or(0, |value| value.len() as u64);
-    if let Some(existing) = options.mutable_region.as_deref() {
-        if options.mutable_capacity == 0 || existing.len() as u64 != options.mutable_capacity {
-            return Err(RomxError::Invalid(
-                "preserved mutable region does not match mutable_capacity".into(),
-            ));
-        }
-    } else {
-        mutable_layout(
-            options.mutable_capacity,
-            options.mutable_entry_capacity,
-            options.mutable_save_bundles.len(),
-        )?;
-    }
-    let has_mutable = options.mutable_capacity != 0;
-    if has_mutable {
-        let aligned = (immutable_end + 4095) & !4095;
-        if aligned > immutable_end {
-            let padding = aligned - immutable_end;
-            write_zeroes(writer, padding)?;
-            if let Some(digest) = digest.as_mut() {
-                // The immutable alignment bytes are part of the hashed body,
-                // but do not need a temporary allocation.
-                const ZEROES: [u8; 8192] = [0; 8192];
-                let mut remaining = padding;
-                while remaining != 0 {
-                    let count =
-                        usize::try_from(remaining.min(ZEROES.len() as u64)).unwrap_or(ZEROES.len());
-                    digest.update(&ZEROES[..count]);
-                    remaining -= count as u64;
-                }
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                break candidate;
             }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempts < 8 => {
+                attempts += 1;
+            }
+            Err(error) => return Err(error.into()),
         }
-        write_mutable_region(writer, options)?;
-    }
-    let immutable_sha256 = digest
-        .map(|digest| digest.finalize().into())
-        .unwrap_or([0; 32]);
-    let footer = Footer {
-        version: VERSION,
-        rom: Region {
-            offset: 0,
-            size: payload_size,
-        },
-        metadata: Region {
-            offset: metadata_offset,
-            size: metadata_size,
-        },
-        cover: Region {
-            offset: if cover.is_some() { cover_offset } else { 0 },
-            size: cover.map_or(0, |value| value.len() as u64),
-        },
-        mutable_capacity: options.mutable_capacity,
-        platform_id: options.platform_id,
-        launch_format_id: options.launch_format_id,
-        immutable_hash_algorithm: if options.body_sha256 {
-            HASH_SHA256
-        } else {
-            HASH_NONE
-        },
-        immutable_sha256,
-        footer_crc32: 0,
-        reserved: [0; 44],
-        flags: (if metadata_size > 0 { FLAG_METADATA } else { 0 })
-            | (if cover.is_some() { FLAG_COVER } else { 0 })
-            | (if options.body_sha256 {
-                FLAG_BODY_SHA256
-            } else {
-                0
-            })
-            | (if options.include_entry_crc32 {
-                FLAG_ENTRY_CRC32
-            } else {
-                0
-            }),
-        body_sha256: immutable_sha256,
     };
-    writer.write_all(&footer.encode())?;
-    Ok(footer)
+    let result = operation(&path);
+    let cleanup = fs::remove_file(&path);
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(value), Err(_)) => Ok(value),
+        (Err(error), _) => Err(error),
+    }
 }
 
-fn build_container(
+/// Reserve a unique path for a libromx writer.  The placeholder is removed
+/// before invoking C so `replace_existing = false` retains its normal
+/// semantics instead of observing our reservation file as a collision.
+fn with_temporary_output<T>(
+    suffix: &str,
+    operation: impl FnOnce(&Path) -> Result<T, RomxError>,
+) -> Result<T, RomxError> {
+    let mut attempts = 0u32;
+    let path = loop {
+        let serial = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = std::env::temp_dir().join(format!(
+            "romx-core-{}-{serial}.{suffix}",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => {
+                fs::remove_file(&candidate)?;
+                break candidate;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempts < 8 => {
+                attempts += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let result = operation(&path);
+    let _ = fs::remove_file(&path);
+    result
+}
+
+fn pack_bytes_through_writer(
     rom: &[u8],
     metadata: Option<&Value>,
     cover: Option<&[u8]>,
     options: &PackOptions,
 ) -> Result<Vec<u8>, RomxError> {
-    let mut output = Cursor::new(Vec::new());
-    write_container_stream(
-        &mut Cursor::new(rom),
-        &mut output,
-        metadata,
-        cover,
-        options,
-        "payload.bin",
-        if options.entry_format_id == 0 {
-            3
-        } else {
-            options.entry_format_id
-        },
-    )?;
-    Ok(output.into_inner())
+    with_temporary_file("gba", rom, |payload| {
+        with_temporary_output("romx", |output| {
+            let entry = PackEntry {
+                path: "payload.gba".into(),
+                source: payload.to_owned(),
+                format_id: if options.entry_format_id == 0 {
+                    libromx_sys::ROMX_FORMAT_GBA
+                } else {
+                    options.entry_format_id
+                },
+                entrypoint: true,
+            };
+            writer::Writer::write_path_entries(&[entry], metadata, cover, output, options)?;
+            fs::read(output).map_err(RomxError::from)
+        })
+    })
 }
+
 pub fn pack_bytes(
     rom: &[u8],
     metadata: Option<&Value>,
@@ -2015,7 +1305,7 @@ pub fn pack_bytes_with_writer_options(
     let cover = cover
         .map(|value| normalize_cover_bytes(value, options.cover_target))
         .transpose()?;
-    build_container(rom, metadata, cover.as_deref(), options)
+    pack_bytes_through_writer(rom, metadata, cover.as_deref(), options)
 }
 pub fn pack_bytes_with_options(
     rom: &[u8],
@@ -2031,7 +1321,7 @@ pub fn pack_bytes_with_options(
         crc32_override: override_crc.map(str::to_owned),
         ..Default::default()
     };
-    build_container(rom, metadata, cover.as_deref(), &options)
+    pack_bytes_through_writer(rom, metadata, cover.as_deref(), &options)
 }
 fn write_atomic_stream<F>(path: &Path, replace: bool, write_output: F) -> Result<(), RomxError>
 where
@@ -2060,7 +1350,23 @@ where
             .open(&temporary)?;
         write_output(&mut file)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
+        match fs::rename(&temporary, path) {
+            Ok(()) => {}
+            #[cfg(windows)]
+            Err(error) if replace && path.exists() => {
+                // std::fs::rename cannot replace an existing file on
+                // Windows. Remove only the requested destination after the
+                // staged file is durable, then complete the move.
+                fs::remove_file(path)?;
+                fs::rename(&temporary, path).map_err(|rename_error| {
+                    io::Error::new(
+                        rename_error.kind(),
+                        format!("{rename_error}; original rename error: {error}"),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
         Ok::<(), RomxError>(())
     })();
     if result.is_err() {
@@ -2068,6 +1374,12 @@ where
     }
     result
 }
+/// Pack one payload through libromx's streaming writer.
+///
+/// Mutable data must be supplied with [`PackOptions::mutable_region_source`]
+/// or [`PackOptions::mutable_save_bundles`]. The old in-memory
+/// `mutable_region` field is retained solely so downstream callers get an
+/// explicit migration error instead of silently losing their data.
 pub(crate) fn pack_path_with_metadata_options(
     rom: &Path,
     metadata: Option<&Value>,
@@ -2075,38 +1387,81 @@ pub(crate) fn pack_path_with_metadata_options(
     output: &Path,
     options: &PackOptions,
 ) -> Result<(), RomxError> {
-    let entry = rom
+    if options.mutable_region.is_some() {
+        return Err(RomxError::Invalid(
+            "in-memory mutable_region is no longer supported; use mutable_region_source".into(),
+        ));
+    }
+    let name = rom
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("payload.bin")
         .replace('\\', "/");
-    let format = format_id_from_path(&entry);
-    let mut options = options.clone();
-    if options.launch_format_id == 1 {
-        options.launch_format_id = launch_format_id_for_extension(
-            Path::new(&entry)
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default(),
-        );
-    }
-    let cover = cover
-        .map(|value| normalize_cover_bytes_cow(value, options.cover_target))
-        .transpose()?;
-    write_atomic_stream(output, options.replace_existing, |writer| {
-        let mut input = fs::File::open(rom)?;
-        write_container_stream(
-            &mut input,
-            writer,
-            metadata,
-            cover.as_deref(),
-            &options,
-            &entry,
-            format,
-        )?;
-        Ok(())
-    })
+    let entry = PackEntry {
+        path: name,
+        source: rom.to_owned(),
+        format_id: options.entry_format_id,
+        entrypoint: true,
+    };
+    writer::Writer::write_path_entries(&[entry], metadata, cover, output, options).map(|_| ())
 }
+
+/// Pack a descriptor and sidecars through libromx's streaming writer.
+pub fn pack_entries_to_path_with_writer_options(
+    entries: &[PackEntry],
+    entrypoint: Option<&str>,
+    metadata: Option<&Path>,
+    cover: Option<&Path>,
+    output: &Path,
+    options: &PackOptions,
+) -> Result<(), RomxError> {
+    if options.mutable_region.is_some() {
+        return Err(RomxError::Invalid(
+            "in-memory mutable_region is no longer supported; use mutable_region_source".into(),
+        ));
+    }
+    let metadata = metadata
+        .map(|path| parse_json_strict(&fs::read(path)?))
+        .transpose()?;
+    let cover = cover.map(fs::read).transpose()?;
+    if let Some(requested) = entrypoint {
+        if !entries
+            .iter()
+            .any(|entry| entry.entrypoint && entry.path == requested)
+        {
+            return Err(RomxError::Invalid(format!(
+                "requested entrypoint is not marked in entries: {requested}"
+            )));
+        }
+    }
+    writer::Writer::write_path_entries(
+        entries,
+        metadata.as_ref(),
+        cover.as_deref(),
+        output,
+        options,
+    )
+    .map(|_| ())
+}
+
+/// Convenience wrapper for multi-entry files using default writer options.
+pub fn pack_entries_to_path(
+    entries: &[PackEntry],
+    entrypoint: &str,
+    metadata: Option<&Path>,
+    cover: Option<&Path>,
+    output: &Path,
+) -> Result<(), RomxError> {
+    pack_entries_to_path_with_writer_options(
+        entries,
+        Some(entrypoint),
+        metadata,
+        cover,
+        output,
+        &PackOptions::default(),
+    )
+}
+
 pub fn pack_to_path(
     rom: &Path,
     metadata: Option<&Path>,
@@ -2162,600 +1517,42 @@ pub fn pack_to_path_with_options(
     pack_path_with_metadata_options(rom, metadata.as_ref(), cover.as_deref(), output, &options)
 }
 
-fn all_zero(value: &[u8]) -> bool {
-    value.iter().all(|byte| *byte == 0)
-}
-struct Parsed<'a> {
-    footer: Footer,
-    entries: Vec<RidxEntry>,
-    metadata: Option<&'a [u8]>,
-    cover: Option<&'a [u8]>,
-    entrypoint: &'a [u8],
-    immutable_size: usize,
-}
-fn parse_container(bytes: &[u8], verify_entries: bool) -> Result<Parsed<'_>, RomxError> {
-    if bytes.len() < FOOTER_SIZE {
-        return Err(RomxError::Invalid(
-            "file is shorter than the ROMX footer".into(),
-        ));
-    }
-    let footer_offset = bytes.len() - FOOTER_SIZE;
-    let mut footer = Footer::decode(&bytes[footer_offset..])?;
-    let payload_size = footer.rom.size as usize;
-    if payload_size == 0
-        || payload_size
-            .checked_add(RIDX_HEADER_SIZE)
-            .is_none_or(|end| end > footer_offset)
-    {
-        return Err(RomxError::Invalid(
-            "payload size cannot locate a RIDX header".into(),
-        ));
-    }
-    let header = &bytes[payload_size..payload_size + RIDX_HEADER_SIZE];
-    if &header[..4] != RIDX_MAGIC
-        || read_u16(header, 4)? != RIDX_VERSION
-        || read_u16(header, 6)? as usize != RIDX_HEADER_SIZE
-        || read_u32(header, 12)? as usize != RIDX_ENTRY_SIZE
-        || read_u32(header, 16)? != 0
-        || !all_zero(&header[0x18..])
-    {
-        return Err(RomxError::Invalid("invalid RIDX header".into()));
-    }
-    let count = read_u32(header, 8)? as usize;
-    if count == 0 || count > (footer_offset - payload_size - RIDX_HEADER_SIZE) / RIDX_ENTRY_SIZE {
-        return Err(RomxError::Invalid("invalid RIDX entry count".into()));
-    }
-    let index_size = RIDX_HEADER_SIZE + count * RIDX_ENTRY_SIZE;
-    if payload_size + index_size > footer_offset {
-        return Err(RomxError::Invalid("RIDX exceeds immutable content".into()));
-    }
-    let mut index = bytes[payload_size..payload_size + index_size].to_vec();
-    let index_crc = read_u32(&index, 0x14)?;
-    put_u32(&mut index, 0x14, 0);
-    if crc32_u32(&index) != index_crc {
-        return Err(RomxError::Invalid("RIDX CRC32 mismatch".into()));
-    }
-    let mut entries = Vec::with_capacity(count);
-    let mut paths = Vec::with_capacity(count);
-    let mut ranges = Vec::with_capacity(count);
-    let mut entrypoint = None;
-    for position in 0..count {
-        let base = RIDX_HEADER_SIZE + position * RIDX_ENTRY_SIZE;
-        let flags = read_u32(&index, base)?;
-        let format = read_u16(&index, base + 4)?;
-        let path_size = read_u16(&index, base + 6)? as usize;
-        let offset = read_u64(&index, base + 8)?;
-        let size = read_u64(&index, base + 16)?;
-        let value = read_u32(&index, base + 24)?;
-        if flags & !(ENTRYPOINT | HAS_CRC32) != 0
-            || read_u32(&index, base + 28)? != 0
-            || !(1..=RIDX_PATH_CAPACITY).contains(&path_size)
-            || !all_zero(&index[base + 0x20 + path_size..base + RIDX_ENTRY_SIZE])
-        {
-            return Err(RomxError::Invalid("invalid RIDX entry fields".into()));
-        }
-        let path = String::from_utf8(index[base + 0x20..base + 0x20 + path_size].to_vec())
-            .map_err(|_| RomxError::Invalid("RIDX path is not strict UTF-8".into()))?;
-        validate_virtual_path(&path)?;
-        if paths
-            .iter()
-            .any(|value: &String| value.to_lowercase() == path.to_lowercase())
-        {
-            return Err(RomxError::Invalid(
-                "RIDX paths collide after case folding".into(),
-            ));
-        }
-        paths.push(path.clone());
-        if offset > footer.rom.size || size > footer.rom.size - offset {
-            return Err(RomxError::Invalid("RIDX entry exceeds payload".into()));
-        }
-        if size > 0 {
-            ranges.push((offset, offset + size));
-        }
-        let is_entrypoint = flags & ENTRYPOINT != 0;
-        if is_entrypoint {
-            if entrypoint.is_some() || offset != 0 || size == 0 || format == 0 {
-                return Err(RomxError::Invalid(
-                    "entrypoint violates zero-offset or format rules".into(),
-                ));
-            }
-            entrypoint = Some(position);
-        }
-        entries.push(RidxEntry {
-            flags,
-            format_id: format,
-            path,
-            data_offset: offset,
-            data_size: size,
-            crc32: (flags & HAS_CRC32 != 0).then(|| format!("{value:08x}")),
-            entrypoint: is_entrypoint,
-        });
-    }
-    let entrypoint_index = entrypoint
-        .ok_or_else(|| RomxError::Invalid("RIDX must contain exactly one entrypoint".into()))?;
-    ranges.sort_unstable();
-    let mut cursor = 0u64;
-    for (start, end) in ranges {
-        if start < cursor {
-            return Err(RomxError::Invalid("RIDX payload ranges overlap".into()));
-        }
-        if start > cursor && !all_zero(&bytes[cursor as usize..start as usize]) {
-            return Err(RomxError::Invalid(
-                "unindexed payload bytes are non-zero".into(),
-            ));
-        }
-        cursor = end;
-    }
-    if cursor < footer.rom.size && !all_zero(&bytes[cursor as usize..footer.rom.size as usize]) {
-        return Err(RomxError::Invalid(
-            "trailing unindexed payload bytes are non-zero".into(),
-        ));
-    }
-    if count == 1 && (entries[0].data_offset != 0 || entries[0].data_size != footer.rom.size) {
-        return Err(RomxError::Invalid(
-            "single-file payload is not exact and contiguous".into(),
-        ));
-    }
-    let metadata_offset = payload_size + index_size;
-    if footer.metadata.size > DEFAULT_MAX_METADATA_SIZE {
-        return Err(RomxError::Metadata(
-            "metadata exceeds the 1 MiB limit".into(),
-        ));
-    }
-    if footer.cover.size > DEFAULT_MAX_COVER_SIZE {
-        return Err(RomxError::Cover("cover exceeds the 32 MiB limit".into()));
-    }
-    let cover_offset = metadata_offset
-        .checked_add(footer.metadata.size as usize)
-        .ok_or_else(|| RomxError::Invalid("metadata range overflow".into()))?;
-    let immutable_end = cover_offset
-        .checked_add(footer.cover.size as usize)
-        .ok_or_else(|| RomxError::Invalid("cover range overflow".into()))?;
-    let immutable_size = if footer.mutable_capacity != 0 {
-        if footer.mutable_capacity % 4096 != 0
-            || footer.mutable_capacity < MIN_MUTABLE_CAPACITY
-            || footer.mutable_capacity as usize > footer_offset
-        {
-            return Err(RomxError::Invalid("invalid mutable capacity".into()));
-        }
-        let mutable_offset = footer_offset - footer.mutable_capacity as usize;
-        let aligned = (immutable_end + 4095) & !4095;
-        if mutable_offset != aligned || !all_zero(&bytes[immutable_end..mutable_offset]) {
-            return Err(RomxError::Invalid(
-                "invalid immutable alignment padding".into(),
-            ));
-        }
-        if mutable_offset + 4096 > footer_offset
-            || &bytes[mutable_offset..mutable_offset + 4] != b"RMUT"
-        {
-            return Err(RomxError::Invalid("invalid mutable header".into()));
-        }
-        let mut header = bytes[mutable_offset..mutable_offset + 4096].to_vec();
-        let stored = read_u32(&header, 0x34)?;
-        put_u32(&mut header, 0x34, 0);
-        if crc32_u32(&header) != stored {
-            return Err(RomxError::Invalid("mutable header CRC32 mismatch".into()));
-        }
-        mutable_offset
-    } else {
-        if immutable_end != footer_offset {
-            return Err(RomxError::Invalid("unexpected bytes before footer".into()));
-        }
-        footer_offset
-    };
-    footer.metadata.offset = if footer.metadata.size != 0 {
-        metadata_offset as u64
-    } else {
-        0
-    };
-    footer.cover.offset = if footer.cover.size != 0 {
-        cover_offset as u64
-    } else {
-        0
-    };
-    if footer.immutable_hash_algorithm == HASH_SHA256
-        && payload_sha256(&bytes[..immutable_size]) != footer.immutable_sha256
-    {
-        return Err(RomxError::BodyHashMismatch);
-    }
-    if verify_entries {
-        for entry in &entries {
-            if let Some(expected) = &entry.crc32 {
-                let actual = crc32_u32(
-                    &bytes[entry.data_offset as usize
-                        ..(entry.data_offset + entry.data_size) as usize],
-                );
-                if format!("{actual:08x}") != *expected {
-                    return Err(RomxError::Invalid(format!(
-                        "RIDX entry CRC32 mismatch: {}",
-                        entry.path
-                    )));
-                }
-            }
-        }
-    }
-    let entry_offset = entries[entrypoint_index].data_offset as usize;
-    let entry_size = entries[entrypoint_index].data_size as usize;
-    let metadata = (footer.metadata.size != 0)
-        .then(|| &bytes[metadata_offset..metadata_offset + footer.metadata.size as usize]);
-    let cover = (footer.cover.size != 0)
-        .then(|| &bytes[cover_offset..cover_offset + footer.cover.size as usize]);
-    Ok(Parsed {
-        footer,
-        entries,
-        metadata,
-        cover,
-        entrypoint: &bytes[entry_offset..entry_offset + entry_size],
-        immutable_size,
-    })
-}
-fn preview(parsed: Parsed<'_>) -> Result<RomxPreview, RomxError> {
-    let metadata = parsed.metadata.map(parse_json_strict).transpose()?;
-    let cover = parsed
-        .cover
-        .map(|bytes| {
-            validate_png_bytes(bytes)?;
-            Ok::<_, RomxError>(bytes.to_vec())
-        })
-        .transpose()?;
-    Ok(RomxPreview {
-        footer: parsed.footer,
-        metadata,
-        cover,
-        entries: parsed.entries,
-    })
-}
+/// Compatibility wrapper for callers that already hold a complete ROMX
+/// buffer. The actual parsing remains in libromx's reader; the temporary file
+/// only adapts the old byte-oriented API to the streaming path API.
 pub fn read_bytes(bytes: &[u8]) -> Result<RomxDocument, RomxError> {
-    let parsed = parse_container(bytes, false)?;
-    let metadata = parsed.metadata.map(parse_json_strict).transpose()?;
-    let cover = parsed
-        .cover
-        .map(|bytes| {
-            validate_png_bytes(bytes)?;
-            Ok::<_, RomxError>(bytes.to_vec())
-        })
-        .transpose()?;
-    Ok(RomxDocument {
-        footer: parsed.footer,
-        rom: parsed.entrypoint.to_vec(),
-        metadata,
-        cover,
-        entries: parsed.entries,
-    })
+    with_temporary_file("romx", bytes, reader::read_document_path)
 }
+
 pub fn read_path(path: &Path) -> Result<RomxDocument, RomxError> {
-    read_bytes(&fs::read(path)?)
+    reader::read_document_path(path)
 }
+
 pub fn read_metadata_cover_bytes(bytes: &[u8]) -> Result<RomxPreview, RomxError> {
-    preview(parse_container(bytes, false)?)
-}
-
-fn read_file_range(file: &mut fs::File, offset: u64, size: usize) -> Result<Vec<u8>, RomxError> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = vec![0u8; size];
-    file.read_exact(&mut bytes)?;
-    Ok(bytes)
-}
-
-/// Copy a bounded region directly between files while calculating its CRC32.
-/// The caller supplies the exact size from a validated ROMX index, so no
-/// payload-sized allocation is needed during extraction.
-fn stream_file_range<W: Write>(
-    file: &mut fs::File,
-    offset: u64,
-    size: u64,
-    writer: &mut W,
-) -> Result<(u64, u32), RomxError> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut buffer = vec![0u8; 1024 * 1024];
-    let mut remaining = size;
-    let mut copied = 0u64;
-    let mut checksum = Crc32Hasher::new();
-    while remaining != 0 {
-        let request = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
-        let count = file.read(&mut buffer[..request])?;
-        if count == 0 {
-            return Err(RomxError::Invalid("ROMX region is truncated".into()));
-        }
-        let chunk = &buffer[..count];
-        writer.write_all(chunk)?;
-        checksum.update(chunk);
-        copied = copied
-            .checked_add(count as u64)
-            .ok_or_else(|| RomxError::Invalid("ROMX region size overflow".into()))?;
-        remaining -= count as u64;
-    }
-    Ok((copied, checksum.finalize()))
-}
-
-fn read_preview_file(path: &Path) -> Result<RomxPreview, RomxError> {
-    let mut file = fs::File::open(path)?;
-    let file_size = file.metadata()?.len();
-    if file_size < FOOTER_SIZE as u64 {
-        return Err(RomxError::Invalid(
-            "file is shorter than the ROMX footer".into(),
-        ));
-    }
-    let footer_offset = file_size - FOOTER_SIZE as u64;
-    let footer_bytes = read_file_range(&mut file, footer_offset, FOOTER_SIZE)?;
-    let mut footer = Footer::decode(&footer_bytes)?;
-    let payload_size = footer.rom.size;
-    if payload_size == 0 || payload_size + RIDX_HEADER_SIZE as u64 > footer_offset {
-        return Err(RomxError::Invalid(
-            "payload size cannot locate a RIDX header".into(),
-        ));
-    }
-    let header = read_file_range(&mut file, payload_size, RIDX_HEADER_SIZE)?;
-    if &header[..4] != RIDX_MAGIC
-        || read_u16(&header, 4)? != RIDX_VERSION
-        || read_u16(&header, 6)? as usize != RIDX_HEADER_SIZE
-        || read_u32(&header, 12)? as usize != RIDX_ENTRY_SIZE
-        || read_u32(&header, 16)? != 0
-        || !all_zero(&header[0x18..])
-    {
-        return Err(RomxError::Invalid("invalid RIDX header".into()));
-    }
-    let count = read_u32(&header, 8)? as usize;
-    if count == 0 {
-        return Err(RomxError::Invalid("invalid RIDX entry count".into()));
-    }
-    let index_size =
-        RIDX_HEADER_SIZE
-            .checked_add(count.checked_mul(RIDX_ENTRY_SIZE).ok_or_else(|| {
-                RomxError::Invalid("RIDX entry count overflows index size".into())
-            })?)
-            .ok_or_else(|| RomxError::Invalid("RIDX size overflow".into()))?;
-    let index_end = payload_size
-        .checked_add(index_size as u64)
-        .ok_or_else(|| RomxError::Invalid("RIDX range overflow".into()))?;
-    if index_end > footer_offset {
-        return Err(RomxError::Invalid("RIDX exceeds immutable content".into()));
-    }
-    let mut index = read_file_range(&mut file, payload_size, index_size)?;
-    let index_crc = read_u32(&index, 0x14)?;
-    put_u32(&mut index, 0x14, 0);
-    if crc32_u32(&index) != index_crc {
-        return Err(RomxError::Invalid("RIDX CRC32 mismatch".into()));
-    }
-    let mut entries = Vec::with_capacity(count);
-    let mut paths = Vec::<String>::with_capacity(count);
-    let mut entrypoint = None;
-    for position in 0..count {
-        let base = RIDX_HEADER_SIZE + position * RIDX_ENTRY_SIZE;
-        let flags = read_u32(&index, base)?;
-        let format = read_u16(&index, base + 4)?;
-        let path_size = read_u16(&index, base + 6)? as usize;
-        let offset = read_u64(&index, base + 8)?;
-        let size = read_u64(&index, base + 16)?;
-        let value = read_u32(&index, base + 24)?;
-        if flags & !(ENTRYPOINT | HAS_CRC32) != 0
-            || read_u32(&index, base + 28)? != 0
-            || !(1..=RIDX_PATH_CAPACITY).contains(&path_size)
-            || !all_zero(&index[base + 0x20 + path_size..base + RIDX_ENTRY_SIZE])
-            || offset > payload_size
-            || size > payload_size - offset
-        {
-            return Err(RomxError::Invalid("invalid RIDX entry fields".into()));
-        }
-        let path = String::from_utf8(index[base + 0x20..base + 0x20 + path_size].to_vec())
-            .map_err(|_| RomxError::Invalid("RIDX path is not strict UTF-8".into()))?;
-        validate_virtual_path(&path)?;
-        if paths
-            .iter()
-            .any(|value: &String| value.to_lowercase() == path.to_lowercase())
-        {
-            return Err(RomxError::Invalid(
-                "RIDX paths collide after case folding".into(),
-            ));
-        }
-        paths.push(path.clone());
-        let is_entrypoint = flags & ENTRYPOINT != 0;
-        if is_entrypoint {
-            if entrypoint.is_some() || offset != 0 || size == 0 || format == 0 {
-                return Err(RomxError::Invalid(
-                    "entrypoint violates zero-offset or format rules".into(),
-                ));
-            }
-            entrypoint = Some(position);
-        }
-        entries.push(RidxEntry {
-            flags,
-            format_id: format,
-            path,
-            data_offset: offset,
-            data_size: size,
-            crc32: (flags & HAS_CRC32 != 0).then(|| format!("{value:08x}")),
-            entrypoint: is_entrypoint,
-        });
-    }
-    let _entrypoint = entrypoint
-        .ok_or_else(|| RomxError::Invalid("RIDX must contain exactly one entrypoint".into()))?;
-    if count == 1 && (entries[0].data_offset != 0 || entries[0].data_size != payload_size) {
-        return Err(RomxError::Invalid(
-            "single-file payload is not exact and contiguous".into(),
-        ));
-    }
-    let metadata_size = usize::try_from(footer.metadata.size)
-        .map_err(|_| RomxError::Invalid("metadata size is too large".into()))?;
-    if footer.metadata.size > DEFAULT_MAX_METADATA_SIZE {
-        return Err(RomxError::Metadata(
-            "metadata exceeds the 1 MiB limit".into(),
-        ));
-    }
-    let metadata_offset = index_end;
-    let cover_offset = metadata_offset
-        .checked_add(footer.metadata.size)
-        .ok_or_else(|| RomxError::Invalid("metadata range overflow".into()))?;
-    let immutable_end = cover_offset
-        .checked_add(footer.cover.size)
-        .ok_or_else(|| RomxError::Invalid("cover range overflow".into()))?;
-    let _immutable_size = if footer.mutable_capacity != 0 {
-        if footer.mutable_capacity % 4096 != 0
-            || footer.mutable_capacity < MIN_MUTABLE_CAPACITY
-            || footer.mutable_capacity > footer_offset
-        {
-            return Err(RomxError::Invalid("invalid mutable capacity".into()));
-        }
-        let mutable_offset = footer_offset - footer.mutable_capacity;
-        let aligned = (immutable_end + 4095) & !4095;
-        if mutable_offset != aligned {
-            return Err(RomxError::Invalid(
-                "invalid immutable alignment padding".into(),
-            ));
-        }
-        if mutable_offset > immutable_end
-            && !all_zero(&read_file_range(
-                &mut file,
-                immutable_end,
-                (mutable_offset - immutable_end) as usize,
-            )?)
-        {
-            return Err(RomxError::Invalid(
-                "immutable alignment padding is non-zero".into(),
-            ));
-        }
-        let header = read_file_range(&mut file, mutable_offset, 4096)?;
-        let stored = read_u32(&header, 0x34)?;
-        let mut checked = header;
-        put_u32(&mut checked, 0x34, 0);
-        if &checked[..4] != b"RMUT" || crc32_u32(&checked) != stored {
-            return Err(RomxError::Invalid("mutable header CRC32 mismatch".into()));
-        }
-        mutable_offset
-    } else {
-        if immutable_end != footer_offset {
-            return Err(RomxError::Invalid("unexpected bytes before footer".into()));
-        }
-        footer_offset
-    };
-    let cover_size = usize::try_from(footer.cover.size)
-        .map_err(|_| RomxError::Invalid("cover size is too large".into()))?;
-    if footer.cover.size > DEFAULT_MAX_COVER_SIZE {
-        return Err(RomxError::Cover("cover exceeds the 32 MiB limit".into()));
-    }
-    let metadata_bytes = if metadata_size == 0 {
-        None
-    } else {
-        Some(read_file_range(&mut file, metadata_offset, metadata_size)?)
-    };
-    let cover_bytes = if cover_size == 0 {
-        None
-    } else {
-        Some(read_file_range(&mut file, cover_offset, cover_size)?)
-    };
-    let metadata = metadata_bytes
-        .as_deref()
-        .map(parse_json_strict)
-        .transpose()?;
-    let cover = cover_bytes
-        .as_deref()
-        .map(|bytes| {
-            validate_png_bytes(bytes)?;
-            Ok::<_, RomxError>(bytes.to_vec())
-        })
-        .transpose()?;
-    footer.metadata.offset = if footer.metadata.size == 0 {
-        0
-    } else {
-        metadata_offset
-    };
-    footer.cover.offset = if footer.cover.size == 0 {
-        0
-    } else {
-        cover_offset
-    };
-    // Preview intentionally does not hash the payload.
-    Ok(RomxPreview {
-        footer,
-        metadata,
-        cover,
-        entries,
-    })
+    with_temporary_file("romx", bytes, reader::read_preview_path)
 }
 
 pub fn read_metadata_cover_path(path: &Path) -> Result<RomxPreview, RomxError> {
-    read_preview_file(path)
+    reader::read_preview_path(path)
 }
 pub fn validate_bytes(bytes: &[u8]) -> Result<ValidationReport, RomxError> {
-    let parsed = parse_container(bytes, false)?;
-    let mut report = ValidationReport {
-        structure: ValidationStatus::Valid,
-        payload_hashes: if parsed.entries.iter().any(|entry| entry.crc32.is_some()) {
-            ValidationStatus::Valid
-        } else {
-            ValidationStatus::Absent
-        },
-        body_sha256: if parsed.footer.immutable_hash_algorithm == HASH_SHA256 {
-            ValidationStatus::Valid
-        } else {
-            ValidationStatus::Absent
-        },
-        metadata: ValidationStatus::Absent,
-        cover: ValidationStatus::Absent,
-        ..Default::default()
-    };
-    report.computed_payload_crc32 = Some(format!("{:08x}", crc32_u32(parsed.entrypoint)));
-    report.computed_payload_sha256 = payload_sha256(parsed.entrypoint);
-    if let Some(metadata) = parsed.metadata {
-        match parse_json_strict(metadata)
-            .and_then(|value| validate_metadata_template(&value).map(|_| value))
-        {
-            Ok(value) => {
-                report.metadata = ValidationStatus::Valid;
-                report.metadata_result = Some("valid".into());
-                report.metadata_crc32 = if value.get("crc32").is_some() {
-                    Crc32Status::ValidLookup
-                } else {
-                    Crc32Status::Absent
-                };
-            }
-            Err(error) => {
-                report.metadata = ValidationStatus::Invalid;
-                report.metadata_result = Some(error.to_string());
-                report.metadata_crc32 = Crc32Status::Invalid;
-            }
-        }
-    }
-    if let Some(cover) = parsed.cover {
-        match validate_png_bytes(cover) {
-            Ok(info) => {
-                report.cover = ValidationStatus::Valid;
-                report.cover_info = Some(info);
-                report.cover_result = Some("valid".into());
-                report.cover_hashes = ValidationStatus::Valid;
-                report.computed_cover_sha256 = payload_sha256(cover);
-            }
-            Err(error) => {
-                report.cover = ValidationStatus::Invalid;
-                report.cover_result = Some(error.to_string());
-            }
-        }
-    }
-    report.computed_body_sha256 = payload_sha256(&bytes[..parsed.immutable_size]);
-    Ok(report)
+    with_temporary_file("romx", bytes, validate_path)
 }
 pub fn validate_path(path: &Path) -> Result<ValidationReport, RomxError> {
-    validate_bytes(&fs::read(path)?)
+    validation::validate_path(path)
 }
 
 /// Return the complete mutable region, including namespaces that this crate
 /// does not interpret. This is intended for lossless frontend edits.
 pub fn read_mutable_region(path: &Path) -> Result<Option<Vec<u8>>, RomxError> {
-    let preview = read_preview_file(path)?;
-    if preview.footer.mutable_capacity == 0 {
+    let reader = Reader::open(path)?;
+    let info = reader.info()?;
+    if info.mutable_region.size == 0 {
         return Ok(None);
     }
-    let capacity = usize::try_from(preview.footer.mutable_capacity)
-        .map_err(|_| RomxError::Invalid("mutable capacity is too large".into()))?;
-    let file_size = fs::metadata(path)?.len();
-    let region_offset = file_size
-        .checked_sub(FOOTER_SIZE as u64 + capacity as u64)
-        .ok_or_else(|| RomxError::Invalid("mutable region is truncated".into()))?;
-    let mut file = fs::File::open(path)?;
-    if file_size < FOOTER_SIZE as u64 + capacity as u64 {
-        return Err(RomxError::Invalid("mutable region is truncated".into()));
-    }
-    Ok(Some(read_file_range(&mut file, region_offset, capacity)?))
+    reader
+        .read_region(libromx_sys::ROMX_REGION_MUTABLE, info.mutable_region.size)
+        .map(Some)
 }
 
 /// Read the information a frontend needs for an inspect/details screen.
@@ -2763,20 +1560,20 @@ pub fn read_mutable_region(path: &Path) -> Result<Option<Vec<u8>>, RomxError> {
 /// callers can use read_path only when they actually need to extract or
 /// repack the payload.
 pub fn inspect_romx_path(path: &Path) -> Result<RomxInspection, RomxError> {
-    let bytes = fs::read(path)?;
-    let document = read_bytes(&bytes)?;
-    let validation = validate_bytes(&bytes)?;
-    let mutable =
-        save::read_mutable_save_objects_with_capacity(&bytes, document.footer.mutable_capacity)?;
-    let identity = identity_from_document(&document)?;
+    let reader = Reader::open(path)?;
+    let info = reader.info()?;
+    let validation = validation::validate_path(path)?;
+    let mutable = save::read_mutable_save_objects(path)?;
+    let identity = identity_from_path(path)?;
+    let entry_count = reader.entries()?.len();
     Ok(RomxInspection {
         identity,
         validation,
         mutable,
-        payload_size: document.footer.rom.size,
-        entry_count: document.entries.len(),
-        has_metadata: document.metadata.is_some(),
-        has_cover: document.cover.is_some(),
+        payload_size: info.payload.size,
+        entry_count,
+        has_metadata: info.metadata.size != 0,
+        has_cover: info.cover.size != 0,
     })
 }
 fn atomic_extract(path: &Path, bytes: &[u8]) -> Result<(), RomxError> {
@@ -2795,64 +1592,84 @@ pub(crate) fn extract_entry_to_path(
     output: &Path,
     replace: bool,
 ) -> Result<String, RomxError> {
-    let expected_size = entry.data_size;
-    let mut checksum = 0u32;
+    let reader = Reader::open(romx)?;
+    let entries = reader.entries()?;
+    let index = entries
+        .iter()
+        .position(|candidate| {
+            candidate.data_offset == entry.data_offset
+                && candidate.data_size == entry.data_size
+                && error::c_field(&candidate.path) == entry.path
+        })
+        .ok_or_else(|| RomxError::Invalid("ROMX entry is not present in the reader".into()))?;
+    let expected_size = entries[index].data_size;
+    let mut checksum = Crc32Hasher::new();
     write_atomic_stream(output, replace, |writer| {
-        let mut file = fs::File::open(romx)?;
-        let (copied, crc) = stream_file_range(&mut file, entry.data_offset, expected_size, writer)?;
+        let mut digesting = DigestWriter {
+            output: writer,
+            checksum: &mut checksum,
+        };
+        let copied = reader.read_entry_to(entries[index].index, expected_size, &mut digesting)?;
         if copied != expected_size {
             return Err(RomxError::Invalid(
                 "ROMX entry size changed while extracting".into(),
             ));
         }
-        checksum = crc;
         Ok(())
     })?;
-    Ok(format!("{checksum:08x}"))
+    Ok(format!("{:08x}", checksum.finalize()))
+}
+
+struct DigestWriter<'a, W> {
+    output: &'a mut W,
+    checksum: &'a mut Crc32Hasher,
+}
+
+impl<W: Write> Write for DigestWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.output.write_all(bytes)?;
+        self.checksum.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
 }
 
 pub fn extract_payload_to_path(romx: &Path, output: &Path, replace: bool) -> Result<(), RomxError> {
-    let preview = read_preview_file(romx)?;
-    let entry = preview
-        .entries
-        .iter()
-        .find(|entry| entry.entrypoint)
-        .ok_or_else(|| RomxError::Invalid("ROMX entrypoint is missing".into()))?;
-    extract_entry_to_path(romx, entry, output, replace).map(|_| ())
+    extraction::extract_payload(romx, output, replace)
 }
+/// Extract a ROMX container through libromx without decoding the payload into
+/// a Rust buffer.  Metadata and cover remain bounded by the C reader limits;
+/// SAVE objects are delegated to the platform-aware save adapter.
 pub fn extract_to_dir(path: &Path, output: &Path) -> Result<PathBuf, RomxError> {
-    let preview = read_preview_file(path)?;
-    fs::create_dir_all(output)?;
-    let entry = preview
-        .entries
+    let reader = Reader::open(path)?;
+    let entries = reader.entries()?;
+    let entry = entries
         .iter()
-        .find(|entry| entry.entrypoint)
+        .find(|entry| entry.flags & libromx_sys::ROMX_RIDX_ENTRYPOINT != 0)
         .ok_or_else(|| RomxError::Invalid("ROMX entrypoint is missing".into()))?;
-    let name = Path::new(&entry.path)
+    fs::create_dir_all(output)?;
+    let name = error::c_field(&entry.path);
+    let name = Path::new(&name)
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("payload.bin");
     let payload = output.join(name);
-    extract_entry_to_path(path, entry, &payload, true)?;
-    if let Some(metadata) = preview.metadata {
-        atomic_extract(
-            &output.join("metadata.json"),
-            &serde_json::to_vec_pretty(&metadata)?,
-        )?;
+    extraction::extract_payload(path, &payload, true)?;
+    if let Some(metadata) = reader.metadata_json()? {
+        atomic_extract(&output.join("metadata.json"), &metadata)?;
     }
-    if let Some(cover) = preview.cover {
+    if let Some(cover) = reader.cover_bytes()? {
         atomic_extract(&output.join("cover.png"), &cover)?;
     }
-    // SAVE objects are part of the user-facing ROMX payload even though they
-    // live outside the immutable ROM/RIDX regions.  Export them below a
-    // dedicated directory so the result can be fed back to the platform-aware
-    // save scanner or copied into a frontend's save root.
     save::extract_mutable_save_objects_from_path(
         path,
         &output.join("saves"),
         false,
         || false,
-        |path| Ok(Some(path.to_owned())),
+        |save_path| Ok(Some(save_path.to_owned())),
     )?;
     Ok(payload)
 }

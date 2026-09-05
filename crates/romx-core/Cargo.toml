@@ -6,6 +6,7 @@ description = "ROMX 0.2.0 container reader, writer, validator, and extractor"
 license.workspace = true
 
 [dependencies]
+libromx-sys = { path = "../libromx-sys" }
 crc32fast = "1.5"
 encoding_rs = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
