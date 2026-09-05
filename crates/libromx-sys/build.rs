@@ -44,6 +44,12 @@ fn main() {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
         );
+    // Rust's MSVC targets use the static UCRT by default.  Match that choice
+    // for the C library; otherwise CMake's `/MD` default leaves the static
+    // Rust link with unresolved `__imp_*` CRT symbols on Windows.
+    if cfg!(target_os = "windows") {
+        config.static_crt(true);
+    }
     let output = config.build();
 
     // cmake-rs normally emits these directives.  Keep the explicit search
