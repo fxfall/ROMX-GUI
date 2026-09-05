@@ -48,7 +48,10 @@ fn main() {
     // for the C library; otherwise CMake's `/MD` default leaves the static
     // Rust link with unresolved `__imp_*` CRT symbols on Windows.
     if cfg!(target_os = "windows") {
-        config.static_crt(true);
+        config.static_crt(true).define(
+            "CMAKE_MSVC_RUNTIME_LIBRARY",
+            "MultiThreaded$<$<CONFIG:Debug>:Debug>",
+        );
     }
     let output = config.build();
 
